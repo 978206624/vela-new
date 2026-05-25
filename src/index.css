@@ -241,6 +241,13 @@
     --color-badge-bg: rgba(91, 158, 214, 0.10);
     --color-badge-text: #5B9ED6;
 
+    /* 抬升面 / 输入框 / 危险色 — 语义别名。
+       var() 在「使用处」按当前主题解析，因此只需在 :root 定义一次即可自动跟随全部 6 个主题，
+       无需在每个主题块里重复写值（避免漂移）。 */
+    --color-bg-elevated: var(--color-sidebar);
+    --color-input: var(--color-bg);
+    --color-danger: var(--color-error);
+
     /* ===== 尺寸规范 ===== */
     --height-titlebar: 40px;
     --height-statusbar: 28px;
@@ -965,10 +972,10 @@
       0 1px 2px rgba(0, 0, 0, 0.1);
   }
 
-  /* ===== AI 极光光效按钮 — 所有 AI 功能按钮统一使用（Logo 冰蓝→薰衣草紫） ===== */
+  /* ===== AI 极光光效按钮 — 所有 AI 功能按钮统一使用（跟随主题：accent → gold） ===== */
   .ai-glow {
     position: relative;
-    background: linear-gradient(135deg, #D97757, #E0A064);
+    background: linear-gradient(135deg, var(--color-accent), var(--color-gold));
     color: #fff;
     border: none;
     transition: box-shadow var(--transition-normal),
@@ -980,7 +987,7 @@
     position: absolute;
     inset: -3px;
     border-radius: inherit;
-    background: linear-gradient(135deg, rgba(217, 119, 87, 0.5), rgba(224, 160, 100, 0.5), rgba(224, 160, 100, 0.3));
+    background: linear-gradient(135deg, color-mix(in srgb, var(--color-accent) 50%, transparent), color-mix(in srgb, var(--color-gold) 50%, transparent), color-mix(in srgb, var(--color-gold) 30%, transparent));
     filter: blur(8px);
     opacity: 0;
     transition: opacity var(--transition-normal);
@@ -988,7 +995,7 @@
   }
 
   .ai-glow:hover {
-    box-shadow: 0 6px 24px rgba(217, 119, 87, 0.35), 0 0 32px rgba(224, 160, 100, 0.25);
+    box-shadow: 0 6px 24px color-mix(in srgb, var(--color-accent) 35%, transparent), 0 0 32px color-mix(in srgb, var(--color-gold) 25%, transparent);
     transform: translateY(-2px);
   }
 

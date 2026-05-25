@@ -40,7 +40,7 @@ export default function WelcomePage({ onNewProject, onOpenProject, onImportNovel
           <div
             className="ai-glow inline-flex items-center justify-center w-20 h-20 rounded-2xl mb-5"
             style={{
-              boxShadow: '0 8px 32px rgba(126, 200, 227, 0.25), 0 0 60px rgba(155, 142, 200, 0.12)',
+              boxShadow: '0 8px 32px color-mix(in srgb, var(--color-accent) 25%, transparent), 0 0 60px color-mix(in srgb, var(--color-gold) 12%, transparent)',
             }}
           >
             <BookOpen size={36} color="#fff" style={{ position: 'relative', zIndex: 1 }} />
@@ -63,8 +63,8 @@ export default function WelcomePage({ onNewProject, onOpenProject, onImportNovel
               border: '1px solid var(--color-border)',
             }}
             onMouseEnter={e => {
-              e.currentTarget.style.borderColor = 'rgba(126, 200, 227, 0.4)'
-              e.currentTarget.style.boxShadow = '0 4px 20px rgba(126, 200, 227, 0.10)'
+              e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--color-accent) 40%, transparent)'
+              e.currentTarget.style.boxShadow = '0 4px 20px color-mix(in srgb, var(--color-accent) 10%, transparent)'
             }}
             onMouseLeave={e => {
               e.currentTarget.style.borderColor = 'var(--color-border)'
@@ -92,8 +92,8 @@ export default function WelcomePage({ onNewProject, onOpenProject, onImportNovel
               border: '1px solid var(--color-border)',
             }}
             onMouseEnter={e => {
-              e.currentTarget.style.borderColor = 'rgba(201, 167, 108, 0.4)'
-              e.currentTarget.style.boxShadow = '0 4px 20px rgba(201, 167, 108, 0.08)'
+              e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--color-gold) 40%, transparent)'
+              e.currentTarget.style.boxShadow = '0 4px 20px color-mix(in srgb, var(--color-gold) 8%, transparent)'
             }}
             onMouseLeave={e => {
               e.currentTarget.style.borderColor = 'var(--color-border)'
@@ -122,8 +122,8 @@ export default function WelcomePage({ onNewProject, onOpenProject, onImportNovel
               border: '1px solid var(--color-border)',
             }}
             onMouseEnter={e => {
-              e.currentTarget.style.borderColor = 'rgba(134, 193, 120, 0.4)'
-              e.currentTarget.style.boxShadow = '0 4px 20px rgba(134, 193, 120, 0.10)'
+              e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--color-accent) 40%, transparent)'
+              e.currentTarget.style.boxShadow = '0 4px 20px color-mix(in srgb, var(--color-accent) 12%, transparent)'
             }}
             onMouseLeave={e => {
               e.currentTarget.style.borderColor = 'var(--color-border)'
@@ -132,7 +132,7 @@ export default function WelcomePage({ onNewProject, onOpenProject, onImportNovel
           >
             <div
               className="flex items-center justify-center w-10 h-10 rounded-xl transition-transform group-hover:scale-105"
-              style={{ backgroundColor: 'rgba(134, 193, 120, 0.12)', color: 'rgb(134, 193, 120)' }}
+              style={{ backgroundColor: 'color-mix(in srgb, var(--color-accent) 14%, transparent)', color: 'var(--color-accent)' }}
             >
               <FileUp size={20} />
             </div>

@@ -1,7 +1,12 @@
 import { useState, useRef, useEffect } from 'react'
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
 import { Check, X, Columns2, AlignJustify } from 'lucide-react'
-import { useThemeStore } from '../../stores/theme-store'
+import { useThemeStore, type Theme } from '../../stores/theme-store'
+
+/** 暗色主题集合 — Monaco 不读 CSS 变量，只能在 JS 里二选一（vs-dark / light），
+ *  因此必须把所有暗色主题都映射到 vs-dark，否则 forge（默认）/galaxy 会落到白底 light。
+ *  显式标注 Set<Theme>：让 TS 校验成员属于 Theme 联合，防止未来误拼主题名。 */
+const DARK_THEMES = new Set<Theme>(['forge', 'galaxy', 'dark'])
 
 interface MonacoDiffViewerProps {
   /** 原始文本 */
@@ -134,7 +139,7 @@ export default function MonacoDiffViewer({
           original={original}
           modified={modified}
           language="markdown"
-          theme={theme === 'dark' ? 'vs-dark' : 'light'}
+          theme={DARK_THEMES.has(theme) ? 'vs-dark' : 'light'}
           onMount={handleMount}
           options={{
             readOnly: false,

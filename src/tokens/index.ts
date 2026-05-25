@@ -11,6 +11,9 @@ export const tokens = {
   light: {
     color: {
       bg: '#F7F9FC',
+      bgElevated: '#EFF2F7',
+      input: '#F7F9FC',
+      danger: '#f43f5e',
       sidebar: '#EFF2F7',
       panel: '#EFF2F7',
       titlebar: '#F7F9FC',
@@ -89,6 +92,9 @@ export const tokens = {
   galaxy: {
     color: {
       bg: '#0A1628',
+      bgElevated: '#0E1B30',
+      input: '#0A1628',
+      danger: '#fb7185',
       sidebar: '#0E1B30',
       panel: '#0E1B30',
       titlebar: '#0A1628',
@@ -167,6 +173,9 @@ export const tokens = {
   paper: {
     color: {
       bg: '#F5F0E8',
+      bgElevated: '#EDE8E0',
+      input: '#F5F0E8',
+      danger: '#c45b5b',
       sidebar: '#EDE8E0',
       panel: '#EDE8E0',
       titlebar: '#F5F0E8',
@@ -245,6 +254,9 @@ export const tokens = {
   dark: {
     color: {
       bg: '#1E1E1E',
+      bgElevated: '#252526',
+      input: '#1E1E1E',
+      danger: '#F14C4C',
       sidebar: '#252526',
       panel: '#252526',
       titlebar: '#181818',
@@ -323,6 +335,9 @@ export const tokens = {
   forge: {
     color: {
       bg: '#141413',
+      bgElevated: '#1C1B19',
+      input: '#141413',
+      danger: '#D26A52',
       sidebar: '#1C1B19',
       panel: '#1C1B19',
       titlebar: '#141413',
@@ -401,6 +416,9 @@ export const tokens = {
   ivory: {
     color: {
       bg: '#FAF9F5',
+      bgElevated: '#F2EFE7',
+      input: '#FAF9F5',
+      danger: '#D26A52',
       sidebar: '#F2EFE7',
       panel: '#F2EFE7',
       titlebar: '#FAF9F5',
