@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
-import { Save, RefreshCw, Sparkles, Loader2, AlertTriangle, FileText } from 'lucide-react'
+import { Save, RefreshCw, Sparkles, Loader2, AlertTriangle, FileText, PenLine } from 'lucide-react'
 import { renderIcon } from '../panels/sidebar/SidebarShared'
 
 import { useEditorStore } from '../../stores/editor-store'
@@ -33,6 +33,11 @@ function detectStepKey(filePath: string): ArchStepKey | null {
   return null
 }
 
+/** 判断架构内容是否为空（含「待生成」占位） */
+function contentIsEmpty(s: string): boolean {
+  return !s.trim() || s.includes('待生成')
+}
+
 interface Props {
   filePath: string
   content: string
@@ -60,6 +65,9 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
   const [checkingArch, setCheckingArch] = useState(false)
   const [fullArchStatus, setFullArchStatus] = useState<Record<string, boolean>>({})
   const [extracting, setExtracting] = useState(false)
+  // 空状态：未生成内容时展示引导面板；用户点「手动撰写」后切到编辑器
+  const [manualEdit, setManualEdit] = useState(false)
+  const [isEmpty, setIsEmpty] = useState(() => contentIsEmpty(initialContent))
 
   const characterCount = useCharacterStore(s => s.characters.length)
   const isArchRunning = useWorkflowStore(s => s.isTypeRunning('architecture_generation'))
@@ -77,6 +85,7 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
       currentContentRef.current = initialContent
       setEditorContent(initialContent)
       setIsDirty(false)
+      setIsEmpty(contentIsEmpty(initialContent))
     }
   }, [initialContent])
 
@@ -84,6 +93,7 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
   // 内容变化回调：更新 ref，不触发重渲染，避免 content prop 回传导致光标跳末尾
   const handleChange = useCallback((md: string) => {
     currentContentRef.current = md
+    setIsEmpty(contentIsEmpty(md))
     const dirty = md !== savedContentRef.current
     setIsDirty(dirty)
     // 同步 editor-store 的 tab.dirty，供标题栏警示灯、Tab 圆点、关闭确认使用
@@ -133,6 +143,7 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
     currentContentRef.current = newContent
     setEditorContent(newContent)
     setIsDirty(false)
+    setIsEmpty(contentIsEmpty(newContent))
     useEditorStore.getState().markTabSaved(filePath)
     setLoading(false)
   }, [filePath])
@@ -304,18 +315,28 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
         </div>
       </div>
 
-      {/* CodeMirrorEditor document 模式，隐藏底部栏（信息已整合到上方工具栏） */}
+      {/* 内容区：未生成时显示空状态引导，否则进入 Markdown 编辑器 */}
       <div className="flex-1 overflow-hidden">
-        <CodeMirrorEditor
-          mode="document"
-          content={editorContent}
-          filePath={filePath}
-          onChange={handleChange}
-          onSave={handleSave}
-          onCharCountChange={setCharCount}
-          hideStatusBar
-          placeholder="尚未生成内容，点击右上角「AI 生成」或直接在此编辑..."
-        />
+        {isEmpty && !manualEdit ? (
+          <ArchEmptyState
+            meta={meta}
+            checking={checkingArch}
+            generating={isArchRunning}
+            onGenerate={handleOpenDialog}
+            onManual={() => setManualEdit(true)}
+          />
+        ) : (
+          <CodeMirrorEditor
+            mode="document"
+            content={editorContent}
+            filePath={filePath}
+            onChange={handleChange}
+            onSave={handleSave}
+            onCharCountChange={setCharCount}
+            hideStatusBar
+            placeholder="尚未生成内容，点击右上角「AI 生成」或直接在此编辑..."
+          />
+        )}
       </div>
 
       {/* AI 生成确认弹窗 */}
@@ -327,6 +348,68 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
           initialSelectedSteps={[stepKey]}
           onConfirm={handleConfirm}
         />
+      )}
+    </div>
+  )
+}
+
+/** 架构条目未生成时的空状态引导面板 */
+function ArchEmptyState({
+  meta,
+  checking,
+  generating,
+  onGenerate,
+  onManual,
+}: {
+  meta: { iconName: string; label: string; desc: string } | null
+  checking: boolean
+  generating: boolean
+  onGenerate: () => void
+  onManual: () => void
+}) {
+  const label = meta?.label ?? '架构内容'
+  return (
+    <div className="h-full flex flex-col items-center justify-center gap-4 px-8 text-center select-none">
+      <div
+        className="flex items-center justify-center w-16 h-16 rounded-2xl"
+        style={{ backgroundColor: 'var(--color-hover)' }}
+      >
+        <span style={{ color: 'var(--color-text-secondary)', opacity: 0.85 }}>
+          {meta ? renderIcon(meta.iconName, 28) : <FileText size={28} />}
+        </span>
+      </div>
+
+      <div className="space-y-1.5">
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+          {generating ? `正在生成「${label}」…` : `还没有「${label}」`}
+        </h3>
+        <p className="text-xs leading-relaxed mx-auto" style={{ color: 'var(--color-text-muted)', maxWidth: 340 }}>
+          {generating ? (
+            'AI 正在依据小说配置撰写，完成后会自动显示在这里。'
+          ) : (
+            <>
+              {meta?.desc ?? '本节用于记录故事架构。'}
+              <br />
+              让 AI 依据小说配置一键生成，也可以手动撰写。
+            </>
+          )}
+        </p>
+      </div>
+
+      {generating ? (
+        <Loader2 size={18} className="animate-spin" style={{ color: 'var(--color-accent)' }} />
+      ) : (
+        <div className="flex items-center gap-2 mt-1">
+          {meta && (
+            <Button variant="ai" size="sm" onClick={onGenerate} disabled={checking}>
+              {checking ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+              AI 生成
+            </Button>
+          )}
+          <Button variant="ghost" size="sm" onClick={onManual}>
+            <PenLine size={13} /> 手动撰写
+          </Button>
+        </div>
       )}
     </div>
   )

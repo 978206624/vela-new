@@ -43,7 +43,10 @@ export function Select({ value, onValueChange, options, placeholder, className, 
           className,
         )}
       >
-        <RadixSelect.Value placeholder={placeholder} />
+        {/* Radix Select.Value 会丢弃 className，故用外层 span 承载截断：长值（如 AI 兜底的列表外枚举）超出时省略号 */}
+        <span className="min-w-0 flex-1 truncate text-left">
+          <RadixSelect.Value placeholder={placeholder} />
+        </span>
         <RadixSelect.Icon>
           <ChevronDown size={13} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
         </RadixSelect.Icon>
@@ -54,7 +57,7 @@ export function Select({ value, onValueChange, options, placeholder, className, 
           position="popper"
           sideOffset={4}
           className={cn(
-            'z-[60] max-h-[280px] min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-lg',
+            'z-[60] max-h-[280px] min-w-[var(--radix-select-trigger-width)] max-w-[min(18rem,var(--radix-select-content-available-width))] overflow-hidden rounded-lg',
             'border border-[var(--color-border)] bg-[var(--color-panel)] shadow-lg',
           )}
         >
@@ -65,14 +68,14 @@ export function Select({ value, onValueChange, options, placeholder, className, 
                 value={opt.value}
                 disabled={opt.disabled}
                 className={cn(
-                  'relative flex cursor-pointer select-none items-center rounded-md py-1.5 pl-7 pr-2 text-xs',
+                  'relative flex cursor-pointer select-none items-start rounded-md py-1.5 pl-7 pr-2 text-xs leading-snug break-words',
                   'text-[var(--color-text)] outline-none',
                   'data-[highlighted]:bg-[var(--color-hover)] data-[highlighted]:text-[var(--color-text)]',
                   'data-[state=checked]:text-[var(--color-accent)] data-[state=checked]:font-medium',
                   'data-[disabled]:cursor-not-allowed data-[disabled]:opacity-40',
                 )}
               >
-                <RadixSelect.ItemIndicator className="absolute left-2 inline-flex items-center">
+                <RadixSelect.ItemIndicator className="absolute left-2 top-2 inline-flex items-center">
                   <Check size={12} style={{ color: 'var(--color-accent)' }} />
                 </RadixSelect.ItemIndicator>
                 <RadixSelect.ItemText>{opt.label}</RadixSelect.ItemText>

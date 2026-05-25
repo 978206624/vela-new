@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react'
-import { Save, Sparkles, Info, Loader2 } from 'lucide-react'
+import { Save, Sparkles, Info, Loader2, ChevronRight, Link2 } from 'lucide-react'
 import { useProjectStore } from '../../stores/project-store'
 import { useLLMStore } from '../../stores/llm-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
@@ -9,6 +9,7 @@ import { Button } from '../ui/Button'
 import { Input } from '../ui/Input'
 import { Textarea } from '../ui/Textarea'
 import { Select } from '../ui/Select'
+import { cn } from '../../lib/utils'
 import GenerateConfigDialog from '../dialogs/GenerateConfigDialog'
 
 /** 小说配置编辑器 — Tab 内的可视化配置面板 */
@@ -27,6 +28,15 @@ export default function NovelConfigEditor() {
 
   // 各区块的独立生成状态
   const [generatingField, setGeneratingField] = useState<GeneratableField | null>(null)
+
+  // 折叠状态：叙事内容字段默认收起，仅展开「核心大纲」作为入口
+  const [openSections, setOpenSections] = useState<Set<string>>(() => new Set(['coreOutline']))
+  const toggleSection = (key: string) => setOpenSections(prev => {
+    const next = new Set(prev)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    return next
+  })
 
   // 直接从 Store 读取配置 — 单一数据源，无需 local state 镜像
   const config = currentProject?.novelConfig ?? null
@@ -74,6 +84,8 @@ export default function NovelConfigEditor() {
     }
     if (generatingField) return // 防止并发
 
+    // 生成前自动展开对应区块，让用户看到结果
+    setOpenSections(prev => new Set(prev).add(fieldKey))
     setGeneratingField(fieldKey)
     try {
       const { GenerateFieldCommand } = await import('../../services/workflows/commands/generate-field.command')
@@ -120,9 +132,10 @@ export default function NovelConfigEditor() {
         </div>
 
         {/* 配置表单 */}
-        <div className="space-y-5">
-          {/* 基本信息 */}
-          <Section title="基本信息">
+        <div className="space-y-3">
+          {/* 基本设定 — 元信息常驻区 */}
+          <div className="p-4 rounded-xl bg-[var(--color-sidebar)] border border-[var(--color-border)]">
+            <h3 className="text-sm font-semibold text-[var(--color-text)] mb-3">基本设定</h3>
             <div className="grid grid-cols-3 gap-4">
               <Field label="类型">
                 <Select
@@ -213,56 +226,65 @@ export default function NovelConfigEditor() {
                 />
               </Field>
             </div>
-          </Section>
+          </div>
 
-          {/* 核心大纲 */}
-          <Section
-            title="核心大纲"
+          {/* 叙事内容 — 可折叠区块 */}
+          <CollapsibleSection            title="核心大纲"
             desc="一段话概括整个故事：谁/在哪/要做什么。也是 AI 一键填充时的灵感输入"
+            syncLabel="情节大纲"
+            preview={config.coreOutline}
+            open={openSections.has('coreOutline')}
+            onToggle={() => toggleSection('coreOutline')}
             aiFieldKey="coreOutline"
             generatingField={generatingField}
             onAIGenerate={handleFieldGenerate}
           >
-            <Textarea value={config.coreOutline} onChange={(e) => update('coreOutline', e.target.value)} placeholder="在此输入你的创作想法，或让 AI 根据这段话一键生成全部配置..." rows={4} />
-          </Section>
+            <Textarea value={config.coreOutline} onChange={(e) => update('coreOutline', e.target.value)} placeholder="在此输入你的创作想法，或让 AI 根据这段话一键生成全部配置..." rows={12} />
+          </CollapsibleSection>
 
-          {/* 世界观设定 */}
-          <Section
-            title="世界观 / 初始设定"
+          <CollapsibleSection            title="世界观 / 初始设定"
             desc="故事发生的背景、时代、力量体系（架构生成后可由 AI 自动扩展）"
+            syncLabel="世界观"
+            preview={config.worldSetting}
+            open={openSections.has('worldSetting')}
+            onToggle={() => toggleSection('worldSetting')}
             aiFieldKey="worldSetting"
             generatingField={generatingField}
             onAIGenerate={handleFieldGenerate}
           >
-            <Textarea value={config.worldSetting} onChange={(e) => update('worldSetting', e.target.value)} placeholder="描述故事发生的背景、时代、力量体系、社会结构（可简写，AI 生成架构时会自动丰富）..." rows={4} />
-          </Section>
+            <Textarea value={config.worldSetting} onChange={(e) => update('worldSetting', e.target.value)} placeholder="描述故事发生的背景、时代、力量体系、社会结构（可简写，AI 生成架构时会自动丰富）..." rows={12} />
+          </CollapsibleSection>
 
-          {/* 金手指 */}
-          <Section
-            title="金手指 / 核心卖点"
-            desc="主角的差异化优势：获取方式、核心能力、成长路径（架构生成时 AI 会深度扩展）"
-            aiFieldKey="goldenFinger"
-            generatingField={generatingField}
-            onAIGenerate={handleFieldGenerate}
-          >
-            <Textarea value={config.goldenFinger} onChange={(e) => update('goldenFinger', e.target.value)} placeholder="主角的独特优势或故事核心卖点（可简写，架构生成时AI会深度扩展）..." rows={3} />
-          </Section>
-
-          {/* 主角人设 */}
-          <Section
-            title="主角人设"
+          <CollapsibleSection            title="主角人设"
             desc="性格特征、背景故事、核心目标（架构生成时 AI 会补全关系网和角色弧光）"
+            syncLabel="角色图谱"
+            preview={config.protagonistProfile}
+            open={openSections.has('protagonistProfile')}
+            onToggle={() => toggleSection('protagonistProfile')}
             aiFieldKey="protagonistProfile"
             generatingField={generatingField}
             onAIGenerate={handleFieldGenerate}
           >
-            <Textarea value={config.protagonistProfile} onChange={(e) => update('protagonistProfile', e.target.value)} placeholder="主角的性格特征、背景故事、核心目标..." rows={4} />
-          </Section>
+            <Textarea value={config.protagonistProfile} onChange={(e) => update('protagonistProfile', e.target.value)} placeholder="主角的性格特征、背景故事、核心目标..." rows={12} />
+          </CollapsibleSection>
 
-          {/* 全局写作要求 */}
-          <Section
-            title="全局写作要求"
+          <CollapsibleSection            title="金手指 / 核心卖点"
+            desc="主角的差异化优势：获取方式、核心能力、成长路径（架构生成时 AI 会深度扩展）"
+            preview={config.goldenFinger}
+            open={openSections.has('goldenFinger')}
+            onToggle={() => toggleSection('goldenFinger')}
+            aiFieldKey="goldenFinger"
+            generatingField={generatingField}
+            onAIGenerate={handleFieldGenerate}
+          >
+            <Textarea value={config.goldenFinger} onChange={(e) => update('goldenFinger', e.target.value)} placeholder="主角的独特优势或故事核心卖点（可简写，架构生成时AI会深度扩展）..." rows={10} />
+          </CollapsibleSection>
+
+          <CollapsibleSection            title="全局写作要求"
             desc="写作风格、禁忌事项、节奏控制等全局规则（AI 填充配置时会自动生成）"
+            preview={config.globalGuidance}
+            open={openSections.has('globalGuidance')}
+            onToggle={() => toggleSection('globalGuidance')}
             aiFieldKey="globalGuidance"
             generatingField={generatingField}
             onAIGenerate={handleFieldGenerate}
@@ -271,14 +293,15 @@ export default function NovelConfigEditor() {
               value={config.globalGuidance}
               onChange={(e) => update('globalGuidance', e.target.value)}
               placeholder="全局的写作风格要求、禁忌事项、特殊规则..."
-              rows={6}
+              rows={16}
             />
-          </Section>
+          </CollapsibleSection>
 
-          {/* 文风配置 */}
-          <Section
-            title="文风配置"
+          <CollapsibleSection            title="文风配置"
             desc="AI 写稿/修稿时会严格遵循这里的风格要求。可手动填写或由 AI 自动生成。"
+            preview={config.writingStyle}
+            open={openSections.has('writingStyle')}
+            onToggle={() => toggleSection('writingStyle')}
             aiFieldKey="writingStyle"
             generatingField={generatingField}
             onAIGenerate={handleFieldGenerate}
@@ -287,14 +310,18 @@ export default function NovelConfigEditor() {
               value={config.writingStyle || ''}
               onChange={(e) => update('writingStyle', e.target.value)}
               placeholder="尚未配置。点击右上角「AI 生成」或手动填写…"
-              rows={6}
+              rows={16}
             />
-          </Section>
+          </CollapsibleSection>
 
-          {/* 参考作品 */}
-          <Section title="参考作品" desc={'参考作品的风格、体系或机制，如："参考《证道》的修炼体系"'}>
-            <Textarea value={config.referenceWorks || ''} onChange={(e) => update('referenceWorks', e.target.value)} placeholder="参考哪些作品的风格、设定或机制？（AI 架构生成时会参考）" rows={2} />
-          </Section>
+          <CollapsibleSection            title="参考作品"
+            desc={'参考作品的风格、体系或机制，如："参考《证道》的修炼体系"'}
+            preview={config.referenceWorks}
+            open={openSections.has('referenceWorks')}
+            onToggle={() => toggleSection('referenceWorks')}
+          >
+            <Textarea value={config.referenceWorks || ''} onChange={(e) => update('referenceWorks', e.target.value)} placeholder="参考哪些作品的风格、设定或机制？（AI 架构生成时会参考）" rows={6} />
+          </CollapsibleSection>
         </div>
       </div>
 
@@ -311,11 +338,15 @@ export default function NovelConfigEditor() {
   )
 }
 
-/** 表单分组 — 支持右上角 AI 生成按钮 */
-function Section({
+/** 可折叠的叙事内容区块 — 标题栏可点击展开/收起，支持右上角 AI 生成与「同步故事架构」标记 */
+function CollapsibleSection({
   title,
   desc,
   children,
+  open,
+  onToggle,
+  preview,
+  syncLabel,
   aiFieldKey,
   generatingField,
   onAIGenerate,
@@ -323,6 +354,12 @@ function Section({
   title: string
   desc?: string
   children: React.ReactNode
+  open: boolean
+  onToggle: () => void
+  /** 收起态展示的内容预览 */
+  preview?: string
+  /** 与故事架构共用同一字段时，标注对应的架构条目名 */
+  syncLabel?: string
   /** 对应 NovelConfig 中的字段 key，传入则显示 AI 生成按钮 */
   aiFieldKey?: GeneratableField
   /** 当前正在生成的字段（全局共享状态，防止并发） */
@@ -333,21 +370,57 @@ function Section({
   const isGenerating = aiFieldKey != null && generatingField === aiFieldKey
   const isAnyGenerating = generatingField != null
   const showAIButton = aiFieldKey != null && onAIGenerate != null
+  const previewText = (preview || '').trim()
 
   return (
-    <div className="p-4 rounded-xl bg-[var(--color-sidebar)] border border-[var(--color-border)]">
-      <div className="flex items-start justify-between mb-3">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-sm font-semibold text-[var(--color-text)]">{title}</h3>
-          {desc && <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{desc}</p>}
+    <div className="rounded-xl bg-[var(--color-sidebar)] border border-[var(--color-border)] overflow-hidden">
+      {/* 标题栏：整行可点击折叠 */}
+      <div
+        className="flex items-center gap-2 px-4 py-3 cursor-pointer select-none"
+        onClick={onToggle}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle() } }}
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        title={open ? `收起「${title}」` : `展开「${title}」`}
+      >
+        <ChevronRight
+          size={15}
+          className={cn('flex-shrink-0 transition-transform', open && 'rotate-90')}
+          style={{ color: 'var(--color-text-muted)' }}
+        />
+        <h3 className="text-sm font-semibold text-[var(--color-text)] flex-shrink-0">{title}</h3>
+
+        {/* 收起态预览：占据剩余空间，溢出省略 */}
+        <div className="flex-1 min-w-0">
+          {!open && (
+            <span
+              className="block truncate text-xs"
+              style={{ color: 'var(--color-text-muted)', opacity: previewText ? 0.9 : 0.5 }}
+            >
+              {previewText || '未填写'}
+            </span>
+          )}
         </div>
+
+        {syncLabel && (
+          <span
+            className="inline-flex items-center gap-1 flex-shrink-0 text-[11px] px-1.5 py-0.5 rounded"
+            style={{ color: 'var(--color-info)', backgroundColor: 'var(--color-hover)' }}
+            title={`与「故事架构 · ${syncLabel}」是同一份数据，在此或架构页编辑均会双向同步`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <Link2 size={11} /> 同步「{syncLabel}」
+          </span>
+        )}
+
         {showAIButton && (
           <Button
             variant="ai"
             size="sm"
-            onClick={() => onAIGenerate(aiFieldKey)}
+            onClick={(e) => { e.stopPropagation(); onAIGenerate!(aiFieldKey!) }}
             disabled={isAnyGenerating}
-            className="flex-shrink-0 ml-3"
+            className="flex-shrink-0"
             title={isGenerating ? '正在生成...' : `AI 生成「${title}」`}
           >
             {isGenerating
@@ -358,7 +431,14 @@ function Section({
           </Button>
         )}
       </div>
-      {children}
+
+      {/* 展开态内容 */}
+      {open && (
+        <div className="px-4 pb-4">
+          {desc && <p className="text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>{desc}</p>}
+          {children}
+        </div>
+      )}
     </div>
   )
 }
