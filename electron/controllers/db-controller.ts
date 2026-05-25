@@ -172,6 +172,15 @@ export function registerDatabaseController() {
     }
   })
 
+  ipcMain.handle('db:draft-finalize-exclusive', async (_event, id: number, wordCount?: number) => {
+    try {
+      DraftRepository.finalizeExclusive(id, wordCount)
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
   ipcMain.handle('db:draft-update-content', async (_event, id: number, content: string, wordCount: number) => {
     try {
       DraftRepository.updateContent(id, content, wordCount)

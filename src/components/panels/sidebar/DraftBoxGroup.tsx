@@ -106,6 +106,12 @@ function DraftChapterGroup({
 
   // 已定稿的草稿存在时，章节显示绿色标记
   const hasFinalized = drafts.some(d => d.status === 'finalized')
+  // 真正生效的定稿 = 同章 finalized 中版本号最高者，与下游 getFinalizedByChapter（ORDER BY version DESC LIMIT 1）一致。
+  // 互斥逻辑只管将来的定稿；旧数据若残留多个 finalized，这里保证仅一个被标为「生效中」。
+  const effectiveFinalizedVersion = drafts.reduce<number | null>(
+    (max, d) => (d.status === 'finalized' && (max === null || d.version > max) ? d.version : max),
+    null,
+  )
   const baseTitle = bpTitle || drafts[0]?.chapterTitle || ''
   const displayTitle = baseTitle.startsWith(`第${chapterNumber}章`) ? baseTitle : (baseTitle ? `第${chapterNumber}章 ${baseTitle}` : `第${chapterNumber}章`)
 
@@ -142,6 +148,7 @@ function DraftChapterGroup({
               key={draft.filePath}
               draft={draft}
               chapterTitleText={displayTitle}
+              isEffectiveFinalized={draft.status === 'finalized' && draft.version === effectiveFinalizedVersion}
             />
           ))}
 
@@ -177,10 +184,13 @@ function DraftItem({
   draft,
   chapterTitleText,
   archived = false,
+  isEffectiveFinalized = false,
 }: {
   draft: DraftMeta
   chapterTitleText: string
   archived?: boolean
+  /** 是否为本章真正生效的定稿（同章最高版本 finalized）。仅此项标「生效中」并显示绿勾 */
+  isEffectiveFinalized?: boolean
 }) {
   /** 打开草稿到编辑器 */
   const openDraft = async () => {
@@ -248,15 +258,23 @@ function DraftItem({
       <span className="text-xs flex-1 truncate" style={{ color: 'var(--color-text-secondary)' }}>
         草稿_v{draft.version}
       </span>
-      {/* 状态标签（始终显示） */}
+      {/* 状态标签（始终显示）。同章可能残留多个历史 finalized，仅版本号最高者为生效稿；
+          生效稿标「已定稿 · 生效中」(绿)，非生效的旧定稿标「已定稿（旧版）」(灰) 以消除歧义 */}
       <span
         className="text-[0.7rem] flex-shrink-0"
-        style={{ color: DRAFT_STATUS_COLOR[draft.status] || 'var(--color-text-muted)' }}
+        title={isFinalized && !isEffectiveFinalized ? '该章存在更新的定稿，此版本已作为历史定稿保留' : undefined}
+        style={{
+          color: isFinalized
+            ? (isEffectiveFinalized ? 'var(--color-success)' : 'var(--color-text-muted)')
+            : (DRAFT_STATUS_COLOR[draft.status] || 'var(--color-text-muted)'),
+        }}
       >
-        {DRAFT_STATUS_LABEL[draft.status] || draft.status}
+        {isFinalized
+          ? (isEffectiveFinalized ? '已定稿 · 生效中' : '已定稿（旧版）')
+          : (DRAFT_STATUS_LABEL[draft.status] || draft.status)}
       </span>
-      {/* 已定稿图标 */}
-      {isFinalized && (
+      {/* 生效定稿图标（仅生效稿显示绿勾） */}
+      {isEffectiveFinalized && (
         <CheckCircle2 size={10} style={{ color: 'var(--color-success)', flexShrink: 0 }} />
       )}
     </div>

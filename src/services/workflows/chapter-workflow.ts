@@ -104,7 +104,12 @@ export async function updateDraftStatus(filePath: string, newStatus: DraftStatus
   const meta = await parseDraftMeta(filePath)
   if (meta) {
     const { ipc } = await import('../ipc-client')
-    await ipc.invoke('db:draft-update-status', meta.id, newStatus)
+    if (newStatus === 'finalized') {
+      // 定稿统一走互斥通道，避免本函数成为绕过 finalizeExclusive 的第二套判定来源
+      await ipc.invoke('db:draft-finalize-exclusive', meta.id, meta.wordCount)
+    } else {
+      await ipc.invoke('db:draft-update-status', meta.id, newStatus)
+    }
   }
 }
 

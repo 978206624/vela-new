@@ -126,16 +126,12 @@ export async function updateDraftStatus(
   const draftId = await getDraftId(chapterNumber, version)
   if (!draftId) return
 
-  await ipc.invoke('db:draft-update-status', draftId, status, wordCount)
-
   if (status === 'finalized') {
-    // DB 并没有自动把其他草稿归档，这里我们可以手动查出其他同章并归档
-    const list = await ipc.invoke('db:draft-list', chapterNumber)
-    for (const d of list as DB_DraftMeta[]) {
-      if (d.version !== version && (d.status === 'draft' || d.status === 'revised')) {
-        await ipc.invoke('db:draft-update-status', d.id, 'archived')
-      }
-    }
+    // 定稿走互斥通道：目标稿 → finalized，同章其它未归档稿 → archived（单事务）。
+    // 章节号由仓储按 id 反查，此处无需传入。统一归档判定来源，避免第二套规则。
+    await ipc.invoke('db:draft-finalize-exclusive', draftId, wordCount)
+  } else {
+    await ipc.invoke('db:draft-update-status', draftId, status, wordCount)
   }
 }
 

@@ -314,6 +314,7 @@ export interface DatabaseChannels {
   'db:draft-get-max-finalized-chapter': { args: []; return: number }
   'db:draft-next-version': { args: [chapterNumber: number]; return: number }
   'db:draft-update-status': { args: [id: number, status: string, wordCount?: number]; return: { success: boolean; error?: string } }
+  'db:draft-finalize-exclusive': { args: [id: number, wordCount?: number]; return: { success: boolean; error?: string } }
   'db:draft-update-content': { args: [id: number, content: string, wordCount: number]; return: { success: boolean; error?: string } }
 
   // 5. revisions

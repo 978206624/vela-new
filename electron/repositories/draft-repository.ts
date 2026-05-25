@@ -177,6 +177,45 @@ export class DraftRepository {
         }
     }
 
+    /**
+     * 定稿互斥：将目标草稿设为 finalized，并把同章其它所有非 archived 草稿降级为 archived。
+     * 章节号在事务内按主键 id 反查，不信任外部传入，杜绝误传章号导致错章被整章归档。
+     * 单事务执行，保证每章至多一个 finalized，避免中途崩溃留下半截状态。
+     */
+    static finalizeExclusive(id: number, wordCount?: number): void {
+        const db = getProjectDb()
+        if (!db) return
+
+        const tx = db.transaction(() => {
+            // 0. 按主键反查目标稿所属章节（权威来源），避免归档作用域被外部误传的章号污染
+            const target = db.prepare(
+                'SELECT chapter_number FROM drafts WHERE id = ?'
+            ).get(id) as { chapter_number: number } | undefined
+            if (!target) return
+
+            // 1. 目标稿 → finalized（带可选字数同步定稿期微调）
+            if (wordCount !== undefined) {
+                db.prepare(`
+        UPDATE drafts SET status = 'finalized', word_count = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(wordCount, id)
+            } else {
+                db.prepare(`
+        UPDATE drafts SET status = 'finalized', updated_at = datetime('now')
+        WHERE id = ?
+      `).run(id)
+            }
+
+            // 2. 同章其它未归档稿（draft/revised/reviewed/旧 finalized）→ archived
+            db.prepare(`
+        UPDATE drafts SET status = 'archived', updated_at = datetime('now')
+        WHERE chapter_number = ? AND id <> ? AND status <> 'archived'
+      `).run(target.chapter_number, id)
+        })
+
+        tx()
+    }
+
     /** 更新草稿正文（同时更新 contents 表） */
     static updateContent(id: number, content: string, wordCount: number): void {
         const meta = DraftRepository.getMeta(id)
