@@ -97,9 +97,13 @@ export function buildFinalizePostProcessSteps(
       const contentFileName = chapterTitle
         ? `第${chapterNumber}章 ${chapterTitle}.txt`
         : `chapter_${chapterNumber}.txt`
-      const result = await ipc.invoke('kb:import-text', draftContent, contentFileName, _project.path) as { success: boolean; error?: string; chunkCount?: number }
+      const result = await ipc.invoke('kb:import-text', draftContent, contentFileName, _project.path) as { success: boolean; error?: string; chunkCount?: number; embeddingFailed?: boolean; embeddingError?: string }
       if (result.success) {
         callbacks.log(`✅ 正文章节已导入知识库（${result.chunkCount} 块）`)
+        // 嵌入失败时不阻断定稿流程（FTS 已入库），但必须把降级原因冒泡出来，否则用户只能从徽标后知后觉
+        if (result.embeddingFailed) {
+          callbacks.log(`⚠️ 向量生成失败，已按关键词模式入库（${result.chunkCount} 块缺向量）：${result.embeddingError ?? '未知错误'}。请到知识库页点「重建向量索引」。`)
+        }
       } else {
         throw new Error(`导入知识库失败: ${result.error}`)
       }

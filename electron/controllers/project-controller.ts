@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { readJsonFile, writeJsonFile, RECENT_PROJECTS_PATH } from '../utils/config-utils'
+import { getCurrentProjectPath, getCurrentProjectToken, setCurrentProjectPath } from '../utils/current-project'
 import { ProjectData, type NovelConfig } from '../../src/shared/ipc-channels'
 import { DIR_VELA_INTERNAL, DIR_PROMPTS } from '../../src/shared/project-paths'
 import { initProjectDatabase } from '../database'
@@ -161,10 +162,28 @@ export function registerProjectController() {
 
       addRecentProject({ name: projectData.name, path: projectPath, updatedAt: projectData.updatedAt })
 
-      return { success: true, project: projectData }
+      // 同步"当前项目"到主进程，供 KB 等 IPC 使用；recent[0] 不再作为真相来源
+      const { token } = setCurrentProjectPath(projectPath)
+
+      return { success: true, project: projectData, currentToken: token }
     } catch (error) {
       return { success: false, project: null, error: String(error) }
     }
+  })
+
+  // 同步前端"当前打开项目"路径；传 null 表示关闭项目。
+  // expectedCurrent + expectedToken 用作 stale-write guard：fire-and-forget 的清空
+  // 动作如果晚于下一次 project:open 到达主进程，会把刚切换的项目清成 null。
+  // 仅 path 不够——close A → reopen A 时 path 仍匹配会误清；token 单调递增彻底排除竞态。
+  ipcMain.handle('project:set-current', async (_event, projectPath: string | null, expectedCurrent?: string | null, expectedToken?: number) => {
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: true, skipped: true }
+    }
+    if (expectedCurrent !== undefined && getCurrentProjectPath() !== expectedCurrent) {
+      return { success: true, skipped: true }
+    }
+    const { token } = setCurrentProjectPath(projectPath)
+    return { success: true, token }
   })
 
   // 保存/更新项目配置

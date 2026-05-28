@@ -49,7 +49,7 @@ export interface ProjectChannels {
   }
   'project:open': {
     args: [projectPath: string]
-    return: { success: boolean; project: ProjectData | null; error?: string }
+    return: { success: boolean; project: ProjectData | null; error?: string; currentToken?: number }
   }
   'project:save': {
     args: [projectId: string, data: Partial<ProjectData>]
@@ -66,6 +66,20 @@ export interface ProjectChannels {
   'project:recent-remove': {
     args: [projectPath: string]
     return: { success: boolean; error?: string }
+  }
+  /**
+   * 同步前端"当前打开项目"到主进程。
+   * 前端 openProject 成功 / closeProject 时调用，让 KB 等 IPC 知道操作的是哪个项目。
+   * 传 null 表示无项目打开。
+   *
+   * expectedCurrent / expectedToken: stale-write guard 的双 key。两者都提供时，
+   * 主进程仅在 currentProjectPath === expectedCurrent **且** currentProjectToken === expectedToken
+   * 时才写入；不匹配视为 stale 跳过。仅靠 path 无法挡住"close A → reopen A"的竞态，
+   * token 单调递增可以彻底排除。
+   */
+  'project:set-current': {
+    args: [projectPath: string | null, expectedCurrent?: string | null, expectedToken?: number]
+    return: { success: boolean; skipped?: boolean; token?: number }
   }
   'dialog:select-folder': {
     args: []
@@ -351,9 +365,9 @@ export interface DatabaseChannels {
 
 // ===== 知识库频道 =====
 export interface KnowledgeBaseChannels {
-  'kb:import-document': { args: [filePath: string]; return: { success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean } }
-  'kb:import-folder': { args: [folderPath: string]; return: { success: boolean; importedCount: number; failedFiles: string[]; error?: string } }
-  'kb:import-text': { args: [text: string, fileName: string, projectPath: string]; return: { success: boolean; docId?: string; chunkCount?: number; error?: string } }
+  'kb:import-document': { args: [filePath: string]; return: { success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean; embeddingError?: string } }
+  'kb:import-folder': { args: [folderPath: string]; return: { success: boolean; importedCount: number; failedFiles: string[]; error?: string; embeddingFailedCount?: number; firstEmbeddingError?: string } }
+  'kb:import-text': { args: [text: string, fileName: string, projectPath: string]; return: { success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean; embeddingError?: string } }
   'kb:search': { args: [query: string, topK?: number, mode?: 'semantic' | 'keyword']; return: Array<{ text: string; score: number; fileName: string }> }
   'kb:search-with-scope': { args: [query: string, fromChapter: number, toChapter: number, topK?: number]; return: Array<{ text: string; score: number; fileName: string }> }
   'kb:list-documents': { args: []; return: Array<{ id: string; fileName: string; importedAt: string; chunkCount: number; filePath: string }> }

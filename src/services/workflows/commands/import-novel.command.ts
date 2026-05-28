@@ -63,15 +63,21 @@ export class ImportInitializeCommand extends BaseWorkflowCommand<void> {
     callbacks.log('🔍 开始构建向量知识库...')
     let successCount = 0
     let failCount = 0
+    let embeddingFailedCount = 0
+    let firstEmbeddingError: string | undefined
     for (let i = 0; i < this.chapters.length; i++) {
       const ch = this.chapters[i]
       try {
         const fileName = ch.title
           ? `第${ch.number}章 ${ch.title}.txt`
           : `chapter_${ch.number}.txt`
-        const result = await ipc.invoke('kb:import-text', ch.content, fileName, project.path) as { success: boolean; error?: string }
+        const result = await ipc.invoke('kb:import-text', ch.content, fileName, project.path) as { success: boolean; error?: string; embeddingFailed?: boolean; embeddingError?: string }
         if (result.success) {
           successCount++
+          if (result.embeddingFailed) {
+            embeddingFailedCount++
+            if (!firstEmbeddingError) firstEmbeddingError = result.embeddingError
+          }
         } else {
           callbacks.log(`⚠️ 导入 ${fileName} 失败: ${result.error}`)
           failCount++
@@ -84,6 +90,9 @@ export class ImportInitializeCommand extends BaseWorkflowCommand<void> {
       }
     }
     callbacks.log(`✅ 知识库构建完成（成功 ${successCount} 章，失败 ${failCount} 章）`)
+    if (embeddingFailedCount > 0) {
+      callbacks.log(`⚠️ 其中 ${embeddingFailedCount} 章向量生成失败，已按关键词模式入库：${firstEmbeddingError ?? '未知错误'}。请到知识库页确认「嵌入」用途模型后点「重建向量索引」。`)
+    }
     callbacks.setProgress(90)
 
     // 将章节数据存入 context 供后续步骤使用

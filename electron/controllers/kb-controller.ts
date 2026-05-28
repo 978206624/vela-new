@@ -1,33 +1,48 @@
 import { ipcMain, dialog } from 'electron'
-import fs from 'node:fs'
 import {
   importDocument, importFolder, importText, searchKnowledge, searchKnowledgeFTS,
   listDocuments, removeDocument, getKnowledgeStats,
   getVectorlessCount, rebuildVectorIndex,
 } from '../knowledge-base'
 import { getKnownEmbeddingDimension } from '../embedding'
-import { readJsonFile, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG, MODELS_CONFIG_PATH, RECENT_PROJECTS_PATH } from '../utils/config-utils'
+import { readJsonFile, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG, MODELS_CONFIG_PATH } from '../utils/config-utils'
+import { getCurrentProjectPath } from '../utils/current-project'
 import { GlobalConfig, ModelProfile } from '../../src/shared/ipc-channels'
 
+/**
+ * 取"嵌入"用途的模型配置。
+ *
+ * 仅接受 purposes 显式包含 'embedding' 的模型——否则会把 chat 模型（如 Deepseek
+ * 的 deepseek-v4-pro）当嵌入模型用，调 /embeddings 端点必然失败、且失败被
+ * importText 的 try/catch 静默吞掉，造成"裸 chunk 入库"。
+ *
+ * 选择顺序：
+ * 1. **显式配置优先**：若用户在 config 里设置了 defaultEmbeddingModelId，必须命中且
+ *    该模型 purposes 含 'embedding'，否则返回 null（不静默回退）——避免用户的显式
+ *    选择被"找下一个能用的"覆盖。
+ * 2. **未配置时自动**：defaultEmbeddingModelId 为空时，找 models.json 第一个带
+ *    'embedding' purpose 的模型。
+ * 3. 都找不到 → 返回 null，由调用方告知"未配置嵌入模型"。
+ */
 function getEmbeddingConfig(): { protocol: 'openai' | 'gemini'; model: { baseUrl: string; apiKey: string; modelName: string } } | null {
   const config = readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
-  const targetModelId = config.defaultEmbeddingModelId || config.defaultModelId
-  if (!targetModelId) return null
-
   const models = readJsonFile<ModelProfile[]>(MODELS_CONFIG_PATH, [])
-  const model = models.find((m) => m.id === targetModelId)
-  if (!model) return null
+
+  let model: ModelProfile | undefined
+  if (config.defaultEmbeddingModelId) {
+    // 用户显式指定 → 必须命中合规模型，否则直接返回 null，不静默回退
+    model = models.find((m) => m.id === config.defaultEmbeddingModelId && m.purposes?.includes('embedding'))
+    if (!model) return null
+  } else {
+    // 未显式指定 → 自动选第一个带 embedding purpose 的模型
+    model = models.find((m) => m.purposes?.includes('embedding'))
+    if (!model) return null
+  }
+
   return {
     protocol: model.protocol as 'openai' | 'gemini',
     model: { baseUrl: model.baseUrl, apiKey: model.apiKey, modelName: model.modelName },
   }
-}
-
-function getCurrentProjectPath(): string | null {
-  try {
-    const recent = JSON.parse(fs.readFileSync(RECENT_PROJECTS_PATH, 'utf-8')) as Array<{ path: string }>
-    return recent[0]?.path ?? null
-  } catch { return null }
 }
 
 export function registerKBController() {

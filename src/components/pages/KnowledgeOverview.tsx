@@ -140,11 +140,15 @@ export default function KnowledgeOverview() {
       let failed = 0
       let embeddingFailed = 0 // 入库成功但嵌入调用失败（降级为关键词）的文件数
       let firstError: string | undefined
+      let firstEmbeddingError: string | undefined // 首个嵌入失败的具体原因，便于排查
       for (const filePath of files) {
         const r = await importDocument(filePath)
         if (r.success) {
           imported++
-          if (r.embeddingFailed) embeddingFailed++
+          if (r.embeddingFailed) {
+            embeddingFailed++
+            if (!firstEmbeddingError && r.embeddingError) firstEmbeddingError = r.embeddingError
+          }
         } else {
           failed++
           if (!firstError && r.error) firstError = r.error
@@ -152,9 +156,10 @@ export default function KnowledgeOverview() {
       }
       if (imported > 0) {
         toast.success(`已导入 ${imported} 个文件${failed > 0 ? `，${failed} 个失败` : ''}`)
-        // 入库成功但嵌入失败 → 明确告知已降级为关键词模式，引导检查嵌入模型配置
+        // 入库成功但嵌入失败 → 明确告知已降级为关键词模式，并把首个具体错误带出来引导排查
         if (embeddingFailed > 0) {
-          toast.warning(`其中 ${embeddingFailed} 个文件语义向量生成失败，已按关键词模式入库。请检查「嵌入」用途的模型配置后点「重建向量索引」。`)
+          const detail = firstEmbeddingError ? `（${firstEmbeddingError}）` : ''
+          toast.warning(`其中 ${embeddingFailed} 个文件语义向量生成失败${detail}，已按关键词模式入库。请检查「嵌入」用途的模型配置后点「重建向量索引」。`)
         }
       } else {
         // 全失败（常见：换嵌入模型后维度不一致）→ 提示重建

@@ -52,6 +52,12 @@ async function callProjectClosed() {
 interface ProjectState {
   /** 当前打开的项目 */
   currentProject: ProjectData | null
+  /**
+   * 主进程返回的 currentProject token，每次 project:open 单调递增。
+   * 关闭项目时回传给主进程做 stale-write guard，避免"关 A → 立即开 A"
+   * 的同路径竞态把刚开的项目误清成 null。
+   */
+  currentToken: number | null
   /** 项目文件树 */
   fileTree: FileNode[]
   /** 最近项目列表 */
@@ -87,6 +93,7 @@ interface ProjectState {
 
 export const useProjectStore = create<ProjectState>()((set, get) => ({
   currentProject: null,
+  currentToken: null,
   fileTree: [],
   recentProjects: [],
   loading: false,
@@ -118,7 +125,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
     try {
       const result = await ipc.invoke('project:open', projectPath)
       if (result.success && result.project) {
-        set({ currentProject: result.project })
+        set({ currentProject: result.project, currentToken: result.currentToken ?? null })
         // 加载文件树
         await get().refreshFileTree()
         // 自动展开侧边栏并切换到项目结构视图
@@ -197,9 +204,16 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
   },
 
   closeProject: () => {
+    const closingPath = get().currentProject?.path ?? null
+    const closingToken = get().currentToken ?? undefined
     // 统一清空 Layer 2 Store + 编辑器 Tab
     callProjectClosed()
-    set({ currentProject: null, fileTree: [] })
+    set({ currentProject: null, currentToken: null, fileTree: [] })
+    // 通知主进程清空"当前项目"，避免 KB 等 IPC 仍命中旧项目。
+    // 带 path + token 双 guard：如果此调用晚于下一次 open 到达主进程，
+    // token 已经递增（不再等于 closingToken），主进程跳过清空，避免误清。
+    // 单 path 在 close A → reopen A 的同路径场景下挡不住，token 单调递增可以。
+    void ipc.invoke('project:set-current', null, closingPath, closingToken)
   },
 
   updateCharacterStates: async (states) => {

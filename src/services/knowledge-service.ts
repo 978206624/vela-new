@@ -77,7 +77,7 @@ export async function selectImportFiles(): Promise<string[] | null> {
   return ipc.invoke('dialog:select-files')
 }
 
-/** 导入单个文件到知识库（embeddingFailed=true 表示配了嵌入模型却调用失败，已降级为关键词入库） */
-export async function importDocument(filePath: string): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean }> {
+/** 导入单个文件到知识库（embeddingFailed=true 表示配了嵌入模型却调用失败，已降级为关键词入库；embeddingError 含具体原因） */
+export async function importDocument(filePath: string): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean; embeddingError?: string }> {
   return ipc.invoke('kb:import-document', filePath)
 }

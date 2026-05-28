@@ -95,7 +95,7 @@ export async function importDocument(
   protocol: 'openai' | 'gemini',
   model: EmbeddingModelRef,
   onProgress?: (progress: number, message: string) => void,
-): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean }> {
+): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean; embeddingError?: string }> {
   try {
     await ensureMigration(projectPath)
 
@@ -119,8 +119,10 @@ export async function importDocument(
 
     // 3. 可选：生成向量（如果有 Embedding 配置）
     // embeddingFailed 仅在「配了 apiKey 却调用失败」时为 true，用于告知用户已降级为关键词模式
+    // embeddingError 把具体失败原因冒泡给 UI，便于排查（如鉴权失败/端点错误）
     let vectors: number[][] | undefined
     let embeddingFailed = false
+    let embeddingError: string | undefined
     if (model.apiKey) {
       try {
         onProgress?.(20, `正在向量化 ${chunks.length} 个块...`)
@@ -128,6 +130,7 @@ export async function importDocument(
       } catch (e) {
         console.warn('[Vela KB] Embedding 调用失败，降级为 FTS-only:', e)
         embeddingFailed = true
+        embeddingError = String(e instanceof Error ? e.message : e)
         // 不影响导入，仅 FTS
       }
     }
@@ -146,7 +149,7 @@ export async function importDocument(
     }
 
     onProgress?.(100, `✅ 已导入 ${fileName}（${chunks.length} 个块）`)
-    return { success: true, docId, chunkCount: chunks.length, embeddingFailed }
+    return { success: true, docId, chunkCount: chunks.length, embeddingFailed, embeddingError }
   } catch (error) {
     return { success: false, error: String(error) }
   }
@@ -230,6 +233,8 @@ export async function importFolder(
   importedCount: number
   failedFiles: string[]
   error?: string
+  embeddingFailedCount?: number
+  firstEmbeddingError?: string
 }> {
   try {
     // 递归收集所有 .txt / .md 文件
@@ -252,6 +257,9 @@ export async function importFolder(
     const failedFiles: string[] = []
     let importedCount = 0
     let firstError: string | undefined
+    // 嵌入失败但 FTS 入库成功的文件数——避免与"入库失败"混为一谈被静默吞
+    let embeddingFailedCount = 0
+    let firstEmbeddingError: string | undefined
 
     for (let i = 0; i < files.length; i++) {
       const filePath = files[i]
@@ -261,6 +269,10 @@ export async function importFolder(
       const result = await importDocument(filePath, projectPath, protocol, model)
       if (result.success) {
         importedCount++
+        if (result.embeddingFailed) {
+          embeddingFailedCount++
+          if (!firstEmbeddingError && result.embeddingError) firstEmbeddingError = result.embeddingError
+        }
       } else {
         failedFiles.push(fileName)
         if (!firstError && result.error) firstError = result.error
@@ -269,9 +281,9 @@ export async function importFolder(
 
     // 全部失败（如维度不一致）时返回失败并带出首个错误，避免静默"成功"
     if (importedCount === 0 && failedFiles.length > 0) {
-      return { success: false, importedCount, failedFiles, error: firstError || '全部文件导入失败' }
+      return { success: false, importedCount, failedFiles, error: firstError || '全部文件导入失败', embeddingFailedCount, firstEmbeddingError }
     }
-    return { success: true, importedCount, failedFiles }
+    return { success: true, importedCount, failedFiles, embeddingFailedCount, firstEmbeddingError }
   } catch (error) {
     return { success: false, importedCount: 0, failedFiles: [], error: String(error) }
   }
@@ -302,7 +314,7 @@ export async function importText(
   projectPath: string,
   protocol: 'openai' | 'gemini',
   model: EmbeddingModelRef,
-): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string }> {
+): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string; embeddingFailed?: boolean; embeddingError?: string }> {
   try {
     if (!text.trim()) return { success: false, error: '文本内容为空' }
 
@@ -316,12 +328,18 @@ export async function importText(
     const chapterMeta = parseChapterMetaFromFileName(fileName)
 
     // 可选：生成向量
+    // embeddingFailed 仅在「调用嵌入接口失败」时为 true，用于让上层提示"已降级为关键词模式"；
+    // 入库本身仍会成功（FTS-only），与 importDocument 行为一致。
     let vectors: number[][] | undefined
+    let embeddingFailed = false
+    let embeddingError: string | undefined
     if (model.apiKey) {
       try {
         vectors = await generateEmbeddings(chunks, protocol, model)
       } catch (e) {
         console.warn('[Vela KB] importText Embedding 失败，降级 FTS-only:', e)
+        embeddingFailed = true
+        embeddingError = String(e instanceof Error ? e.message : e)
       }
     }
 
@@ -347,7 +365,7 @@ export async function importText(
       writeKBMeta(projectPath, { vectorDimension: result.dimension, embeddingModel: model.modelName })
     }
 
-    return { success: true, docId, chunkCount: chunks.length }
+    return { success: true, docId, chunkCount: chunks.length, embeddingFailed, embeddingError }
   } catch (error) {
     return { success: false, error: String(error) }
   }
