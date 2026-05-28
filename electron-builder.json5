@@ -1,6 +1,7 @@
 // @see - https://www.electron.build/configuration/configuration
 {
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "afterExtract": "scripts/electron-builder-hooks.cjs",
   "appId": "com.vela.ide",
   "asar": true,
   "asarUnpack": [
@@ -25,6 +26,7 @@
     "category": "public.app-category.productivity"
   },
   "win": {
+    "signAndEditExecutable": false,
     "target": [
       {
         "target": "nsis",
