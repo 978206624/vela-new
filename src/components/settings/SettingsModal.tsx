@@ -181,7 +181,7 @@ function LLMSection({
       id: randomUUID(),
       name: '',
       provider: 'openai',
-      protocol: (openaiPreset?.protocol ?? 'openai') as 'openai' | 'gemini',
+      protocol: (openaiPreset?.protocol ?? 'openai') as 'openai' | 'gemini' | 'anthropic',
       modelName: isEmbedding
         ? (openaiPreset?.embeddingModels[0] ?? 'text-embedding-3-small')
         : (openaiPreset?.models[0]?.name ?? 'gpt-4o'),
@@ -378,19 +378,32 @@ function ModelForm({
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ success: boolean, error?: string } | null>(null)
   const testConnection = useLLMStore(s => s.testConnection)
+  const fetchAvailableModels = useLLMStore(s => s.fetchAvailableModels)
+
+  // 「按 API Key 拉取可用模型」局部 state：拉取结果只活在当前编辑卡片，不持久化
+  const [fetchedModels, setFetchedModels] = useState<import('../../shared/provider-presets').ModelPreset[] | null>(null)
+  const [fetching, setFetching] = useState(false)
+  // 持有正在进行的 testResult 自动消失 timer；新 setResult 前先清掉旧 timer，避免老定时器把新结果清掉
+  const resultTimerRef = useRef<number | null>(null)
 
   const isEmbedding = model.purposes?.includes('embedding')
   // 将预设数组转换为以 provider 为键的 Map 方便查找
   const presetMap = new Map(presets.map((p) => [p.provider, p]))
   const preset = presetMap.get(model.provider)
-  // 生成模型列表为 ModelPreset[]，embedding 模型为 string列表转换过来的 ModelPreset
-  const presetModels: import('../../shared/provider-presets').ModelPreset[] = isEmbedding
+  // 模型下拉源：优先用拉取结果，没拉过/拉取失败回退到内置预设
+  const builtinPresetModels: import('../../shared/provider-presets').ModelPreset[] = isEmbedding
     ? (preset?.embeddingModels ?? []).map((name) => ({ name, maxTokens: 0 }))
     : (preset?.models ?? [])
+  const presetModels = fetchedModels ?? builtinPresetModels
 
-  /** 更新单个字段 */
-  const up = <K extends keyof ModelProfile>(key: K, val: ModelProfile[K]) =>
+  /** 更新单个字段；改 baseUrl/apiKey/protocol 时拉取结果作废（端点已变，旧列表不再可信） */
+  const up = <K extends keyof ModelProfile>(key: K, val: ModelProfile[K]) => {
+    if (key === 'baseUrl' || key === 'apiKey' || key === 'protocol') {
+      setFetchedModels(null)
+      setTestResult(null)
+    }
     onChange({ ...model, [key]: val })
+  }
 
   /**
    * 切换服务商：从持久化预设中自动填充 baseUrl / protocol
@@ -403,14 +416,50 @@ function ModelForm({
       ? (p?.embeddingModels[0] ?? '')
       : (firstModel?.name ?? '')
     setCustomModelName(false)
+    // 切服务商 → 拉取状态作废（应 Gemini R1 防脏数据残留：旧 provider 拉到的模型名不该在新 provider 下显示）
+    setFetchedModels(null)
+    setTestResult(null)
     onChange({
       ...model,
       provider,
-      protocol: (p?.protocol ?? 'openai') as 'openai' | 'gemini',
+      protocol: (p?.protocol ?? 'openai') as 'openai' | 'gemini' | 'anthropic',
       baseUrl: p?.baseUrl ?? '',
       modelName: defaultModelName,
       maxTokens: firstModel?.maxTokens ?? 4096,
     })
+  }
+
+  /** 拉取该 baseUrl+apiKey 上可用的模型清单，覆盖下拉源（不持久化） */
+  const handleFetchModels = async () => {
+    setFetching(true)
+    setTestResult(null)
+    // 清掉可能残留的旧 timeout（避免老定时器把新结果清掉）
+    if (resultTimerRef.current !== null) {
+      clearTimeout(resultTimerRef.current)
+      resultTimerRef.current = null
+    }
+    try {
+      const result = await fetchAvailableModels(model)
+      if (result.success && result.models.length > 0) {
+        const list = result.models.map((id) => ({ name: id, maxTokens: model.maxTokens || 4096 }))
+        setFetchedModels(list)
+        // 拉取后若当前 modelName 不在新列表里，让自定义输入框可见（保留旧值，避免被隐藏到下拉的 __custom__ 项后丢失视觉反馈）
+        const currentInList = list.some((m) => m.name === model.modelName)
+        setCustomModelName(!currentInList)
+        // 拉取成功用专用文案，跟"测试连接"区分（应 Gemini #1）
+        setTestResult({ success: true, error: `模型列表拉取成功（${list.length} 个）` })
+        resultTimerRef.current = window.setTimeout(() => {
+          setTestResult(null)
+          resultTimerRef.current = null
+        }, 2500)
+      } else {
+        const errMsg = result.error || (result.models.length === 0 ? '该端点没有返回任何模型' : '拉取失败')
+        setTestResult({ success: false, error: errMsg })
+      }
+    } catch (e) {
+      setTestResult({ success: false, error: String(e) })
+    }
+    setFetching(false)
   }
 
   /** 选择预设模型或切换到自定义输入 */
@@ -440,10 +489,17 @@ function ModelForm({
   const handleTest = async () => {
     setTesting(true)
     setTestResult(null)
+    if (resultTimerRef.current !== null) {
+      clearTimeout(resultTimerRef.current)
+      resultTimerRef.current = null
+    }
     const result = await testConnection(model)
     setTestResult(result)
     setTesting(false)
-    setTimeout(() => setTestResult(null), 3000)
+    resultTimerRef.current = window.setTimeout(() => {
+      setTestResult(null)
+      resultTimerRef.current = null
+    }, 3000)
   }
 
   return (
@@ -462,6 +518,7 @@ function ModelForm({
           value={model.name}
           onChange={(e) => up('name', e.target.value)}
           placeholder="如：DeepSeek 主力 / GPT-4o 备用"
+          disabled={fetching}
         />
       </div>
 
@@ -472,8 +529,10 @@ function ModelForm({
           <Select
             value={model.provider}
             onValueChange={(v) => handleProviderChange(v as ModelProfile['provider'])}
+            disabled={fetching}
             options={[
               { value: 'openai', label: 'OpenAI' },
+              { value: 'claude', label: 'Claude（Anthropic）' },
               { value: 'deepseek', label: 'DeepSeek' },
               { value: 'gemini', label: 'Google Gemini' },
               { value: 'ollama', label: 'Ollama（本地）' },
@@ -486,10 +545,12 @@ function ModelForm({
           <Label>调用协议</Label>
           <Select
             value={model.protocol}
-            onValueChange={(v) => up('protocol', v as 'openai' | 'gemini')}
+            onValueChange={(v) => up('protocol', v as 'openai' | 'gemini' | 'anthropic')}
+            disabled={fetching}
             options={[
               { value: 'openai', label: 'OpenAI' },
               { value: 'gemini', label: 'Gemini' },
+              { value: 'anthropic', label: 'Anthropic' },
             ]}
           />
         </div>
@@ -499,27 +560,40 @@ function ModelForm({
       <div>
         <div className="flex items-center justify-between mb-1">
           <Label className="mb-0">模型标识</Label>
-          {presetModels.length > 0 && (
+          <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => {
-                if (customModelName) {
-                  // 切回预设列表
-                  const first = presetModels[0]
-                  setCustomModelName(false)
-                  onChange({ ...model, modelName: first.name, maxTokens: first.maxTokens ?? model.maxTokens })
-                } else {
-                  // 切换到自定义输入
-                  setCustomModelName(true)
-                  up('modelName', '')
-                }
-              }}
-              className="text-xs transition-colors"
+              onClick={handleFetchModels}
+              disabled={fetching || !model.baseUrl || (!model.apiKey && model.provider !== 'ollama')}
+              className="text-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               style={{ color: 'var(--color-accent)' }}
+              title="按 baseUrl + API Key 拉取该服务商可用模型列表"
             >
-              {customModelName ? '← 从列表选择' : '手动输入 →'}
+              {fetching ? '⏳ 拉取中...' : '🔄 拉取可用'}
             </button>
-          )}
+            {presetModels.length > 0 && (
+              <button
+                type="button"
+                disabled={fetching}
+                onClick={() => {
+                  if (customModelName) {
+                    // 切回预设列表
+                    const first = presetModels[0]
+                    setCustomModelName(false)
+                    onChange({ ...model, modelName: first.name, maxTokens: first.maxTokens ?? model.maxTokens })
+                  } else {
+                    // 切换到自定义输入
+                    setCustomModelName(true)
+                    up('modelName', '')
+                  }
+                }}
+                className="text-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ color: 'var(--color-accent)' }}
+              >
+                {customModelName ? '← 从列表选择' : '手动输入 →'}
+              </button>
+            )}
+          </div>
         </div>
 
         {/* 有预设模型 且 未切到手动输入 → 显示下拉 */}
@@ -527,6 +601,7 @@ function ModelForm({
           <Select
             value={selectValue}
             onValueChange={(v) => handleModelSelect(v)}
+            disabled={fetching}
             options={[
               ...presetModels.map((m) => ({ value: m.name, label: m.name })),
               { value: '__custom__', label: '── 手动输入 ──' },
@@ -539,6 +614,7 @@ function ModelForm({
               onChange={(e) => up('modelName', e.target.value)}
               placeholder={isEmbedding ? 'text-embedding-3-small' : 'gpt-4o'}
               autoFocus={customModelName}
+              disabled={fetching}
             />
           </div>
         )}
@@ -551,6 +627,7 @@ function ModelForm({
           value={model.baseUrl}
           onChange={(e) => up('baseUrl', e.target.value)}
           placeholder="https://api.openai.com"
+          disabled={fetching}
         />
         {model.provider !== 'custom' && (
           <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
@@ -569,6 +646,7 @@ function ModelForm({
             onChange={(e) => up('apiKey', e.target.value)}
             placeholder={model.provider === 'ollama' ? '本地部署可留空' : 'sk-...'}
             className="pr-9"
+            disabled={fetching}
           />
           <button
             type="button"
@@ -593,6 +671,7 @@ function ModelForm({
                 const v = Number(model.temperature);
                 if (isNaN(v)) up('temperature', 0.7)
               }}
+              disabled={fetching}
             />
           </div>
           <div>
@@ -605,8 +684,30 @@ function ModelForm({
                 const v = Number(model.maxTokens);
                 if (!v || v < 1) up('maxTokens', 4096)
               }}
+              disabled={fetching}
             />
           </div>
+        </div>
+      )}
+
+      {/* 思考模式（仅生成模型）——按模型能力配置，不做成运行时开关 */}
+      {!isEmbedding && (
+        <div>
+          <Label>思考模式</Label>
+          <Select
+            value={model.thinkingMode ?? 'optional'}
+            onValueChange={(v) => up('thinkingMode', v as 'always' | 'optional' | 'never')}
+            disabled={fetching}
+            options={[
+              { value: 'optional', label: '默认（跟随代码请求）' },
+              { value: 'always', label: '始终开启（推理模型）' },
+              { value: 'never', label: '始终关闭（普通 chat 模型）' },
+            ]}
+          />
+          <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+            推理模型（如 deepseek-reasoner、o 系列）选「始终开启」；
+            普通 chat 模型（如 deepseek-chat）若不支持 thinking 参数选「始终关闭」覆盖代码请求。
+          </p>
         </div>
       )}
 
@@ -614,7 +715,7 @@ function ModelForm({
         <Button
           variant="outline"
           onClick={handleTest}
-          disabled={testing || !model.baseUrl || (!model.apiKey && model.provider !== 'ollama')}
+          disabled={testing || fetching || !model.baseUrl || (!model.apiKey && model.provider !== 'ollama')}
         >
           <Zap size={13} />
           {testing ? '测试中...' : '测试连接'}
@@ -622,16 +723,20 @@ function ModelForm({
         <Button
           className="flex-1"
           onClick={onSave}
-          disabled={saving || !model.name || (!model.apiKey && model.provider !== 'ollama')}
+          disabled={saving || fetching || !model.name || (!model.apiKey && model.provider !== 'ollama')}
         >
           <Save size={13} />
           {saving ? '保存中...' : '保存配置'}
         </Button>
-        <Button variant="ghost" onClick={onCancel}>取消</Button>
+        <Button variant="ghost" onClick={onCancel} disabled={fetching}>取消</Button>
       </div>
       {testResult && (
         <div className={`text-xs p-2 rounded ${testResult.success ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-red-500/10 text-red-500 border border-red-500/20'} break-all`}>
-          {testResult.success ? '✅ 连接成功！' : `❌ 连接失败: ${testResult.error}`}
+          {testResult.success
+            // 拉取成功时 error 字段被复用为消息内容（如"模型列表拉取成功（12 个）"）；
+            // 测试连接成功时 error 为空，回退到默认"连接成功"
+            ? `✅ ${testResult.error || '连接成功！'}`
+            : `❌ 失败: ${testResult.error}`}
         </div>
       )}
     </div>
@@ -994,7 +1099,7 @@ function AboutSection() {
 
 function providerEmoji(provider: string) {
   const map: Record<string, string> = {
-    openai: '🤖', deepseek: '🐬', gemini: '✨', ollama: '🦙', bigmodel: '🧠', custom: '⚙️',
+    openai: '🤖', claude: '🎭', deepseek: '🐬', gemini: '✨', ollama: '🦙', bigmodel: '🧠', custom: '⚙️',
   }
   return map[provider] ?? '🔧'
 }

@@ -9,7 +9,7 @@ import { toolRegistry } from '../services/agent/tool-registry'
 import type { ToolArtifact } from '../services/agent/tool-registry'
 import { ipc } from '../services/ipc-client'
 import { globalEventBus } from '../shared/event-bus'
-import type { TokenUsage } from '../shared/ipc-channels'
+import type { TokenUsage, ClaudeThinkingBlock } from '../shared/ipc-channels'
 
 // ===== 类型定义 =====
 
@@ -28,6 +28,17 @@ export interface AgentMessage {
   toolCalls?: ToolCallInfo[]
   /** 产物列表（Agent 创建/修改的文件、触发的工作流等） */
   artifacts?: ToolArtifact[]
+  /**
+   * Anthropic 多轮回传所需的原始 thinking content blocks（仅 Claude assistant 消息有值）。
+   * 下一轮启用 tools + thinking 时由 ClaudeProvider 重建到 content 数组前部，
+   * 满足 Anthropic 多轮硬约束（必须回传含 signature 的 thinking 块）。
+   */
+  thinkingBlocks?: ClaudeThinkingBlock[]
+  /**
+   * DeepSeek/OpenAI 协议族 reasoning_content 原文（仅 DeepSeek assistant 消息有值）。
+   * 下一轮 tool_calls 多轮 wire 时由 OpenAIProvider 回传，满足 DeepSeek thinking 硬约束。
+   */
+  reasoningContent?: string
 }
 
 /** 单个会话 */
@@ -439,10 +450,17 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       }
 
       // 构造历史消息（取最近 16 条非流式消息）
+      // 保留 thinkingBlocks 字段：Claude 多轮回传 tools+thinking 时必须把 assistant 之前的
+      // thinking blocks 原样回传（含 signature）；其它 provider 路径上忽略此字段。
       const historyMessages: LLMMessage[] = currentConv.messages
         .filter(m => !m.streaming && m.role !== 'system')
         .slice(-16)
-        .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+        .map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+          ...(m.thinkingBlocks ? { thinkingBlocks: m.thinkingBlocks } : {}),
+          ...(m.reasoningContent ? { reasoningContent: m.reasoningContent } : {}),
+        }))
 
       // 模型显示名（写 llm_calls 统计用）
       const modelName = llmStore.models.find(m => m.id === modelId)?.name || modelId
@@ -463,13 +481,14 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
             msgs,
             {
               onChunk: (chunk) => { acc += chunk; onTextChunk(chunk) },
-              onDone: (fullText, usage, toolCalls) => {
+              onDone: (fullText, usage, toolCalls, thinkingBlocks, reasoningContent) => {
                 activeStreamRequestId = null
                 logAgentLLMCall({
                   modelId: mid, modelName, usage, inputChars,
                   output: fullText || acc, durationMs: Date.now() - startTime, success: true,
                 })
-                resolve({ text: fullText, toolCalls: toolCalls ?? [], usage })
+                // thinkingBlocks 仅 Claude 路径、reasoningContent 仅 DeepSeek 路径产出；其它为 undefined
+                resolve({ text: fullText, toolCalls: toolCalls ?? [], usage, thinkingBlocks, reasoningContent })
               },
               onError: (err) => {
                 activeStreamRequestId = null

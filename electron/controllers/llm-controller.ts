@@ -18,6 +18,21 @@ function getModelConfig(modelId: string): ModelProfile | null {
   return models.find((m) => m.id === modelId) ?? null
 }
 
+/**
+ * 按模型 thinkingMode 裁决最终是否开启 thinking——thinking 是"模型能力"而非用户偏好，
+ * 不暴露成运行时 UI 开关。三档语义：
+ * - 'always'：覆盖调用方代码，强制开（推理模型如 deepseek-reasoner / o-series）
+ * - 'never'：覆盖调用方代码，强制关（普通 chat 模型如 deepseek-chat）
+ * - 'optional' / 未设置：跟随调用方传入的 thinking（保持现有行为，向后兼容）
+ */
+function resolveThinking(model: ModelProfile, requested?: boolean): boolean | undefined {
+  switch (model.thinkingMode) {
+    case 'always': return true
+    case 'never': return false
+    default: return requested
+  }
+}
+
 function applyProxyConfig() {
   try {
     const config = readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
@@ -50,7 +65,7 @@ export function registerLLMController() {
         temperature: request.temperature ?? model.temperature,
         maxTokens: request.maxTokens ?? model.maxTokens,
         responseFormat: request.responseFormat,
-        thinking: request.thinking,
+        thinking: resolveThinking(model, request.thinking),
         tools: request.tools,
       })
     } catch (error) {
@@ -74,12 +89,12 @@ export function registerLLMController() {
       temperature: request.temperature ?? model.temperature,
       maxTokens: request.maxTokens ?? model.maxTokens,
       responseFormat: request.responseFormat,
-      thinking: request.thinking,
+      thinking: resolveThinking(model, request.thinking),
       tools: request.tools,
       signal: abortController.signal,
       onChunk: (chunk: string) => win?.webContents.send('llm:stream-chunk', { requestId, chunk }),
-      onDone: (fullText, usage, toolCalls) => {
-        win?.webContents.send('llm:stream-done', { requestId, fullText, usage, toolCalls })
+      onDone: (fullText, usage, toolCalls, thinkingBlocks, reasoningContent) => {
+        win?.webContents.send('llm:stream-done', { requestId, fullText, usage, toolCalls, thinkingBlocks, reasoningContent })
         activeStreams.delete(requestId)
       },
       onError: (error: string) => {
@@ -167,6 +182,10 @@ export function registerLLMController() {
       
       let result = { success: true, error: undefined as undefined | string }
       if (model.purposes?.includes('embedding')) {
+        // Anthropic 没有 embedding 模型，拒绝把 claude 走嵌入路径
+        if (model.protocol !== 'openai' && model.protocol !== 'gemini') {
+          return { success: false, error: 'Anthropic Claude 协议不支持嵌入模型，请改用 OpenAI / Gemini 兼容端点' }
+        }
         const { generateEmbeddings } = await import('../embedding')
         await generateEmbeddings(['hello'], model.protocol, model)
       } else {
@@ -180,6 +199,22 @@ export function registerLLMController() {
       return { success: result.success, error: result.error }
     } catch (error) {
       return { success: false, error: String(error) }
+    }
+  })
+
+  /**
+   * 按 baseUrl+apiKey 拉取该服务商可用模型 ID 清单。
+   * 跟 llm:test-connection 同范式：前端传 ModelProfile 草稿（不要求落库），主进程
+   * applyProxyConfig 后按 protocol 分发到 provider.listModels；异常归类为 readable 字符串。
+   */
+  ipcMain.handle('llm:fetch-available-models', async (_event, model: ModelProfile) => {
+    try {
+      applyProxyConfig()
+      const provider = LLMFactory.getProvider(model)
+      const models = await provider.listModels(model)
+      return { success: true, models }
+    } catch (error) {
+      return { success: false, models: [], error: error instanceof Error ? error.message : String(error) }
     }
   })
 }

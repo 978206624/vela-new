@@ -2,11 +2,15 @@ import { ILLMProvider } from './provider.interface'
 import { ModelProfile } from '../../src/shared/ipc-channels'
 import { OpenAIProvider } from './openai-provider'
 import { GeminiProvider } from './gemini-provider'
+import { ClaudeProvider } from './claude-provider'
 
 export class LLMFactory {
   static getProvider(model: ModelProfile): ILLMProvider {
     if (model.protocol === 'gemini') {
       return new GeminiProvider()
+    }
+    if (model.protocol === 'anthropic') {
+      return new ClaudeProvider()
     }
     return new OpenAIProvider()
   }

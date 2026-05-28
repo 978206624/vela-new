@@ -65,9 +65,18 @@ export class GeminiProvider implements ILLMProvider {
     if (!tools || tools.length === 0) return undefined
     return [{ functionDeclarations: tools }]
   }
+
+  /**
+   * 归一化 baseUrl → API root（剥尾斜杠 + 剥已含 /v1beta 或 /v1beta/models 后缀）。
+   * generate / generateStream / listModels 三处共用，避免用户填 /v1beta 时重复拼接。
+   */
+  private buildRoot(baseUrl: string): string {
+    return baseUrl.replace(/\/+$/, '').replace(/\/v1beta(\/models)?$/, '')
+  }
+
   async generate(model: ModelProfile, messages: LLMChatMessage[], opts: LLMGenerateOptions): Promise<LLMResponse> {
-    const baseUrl = model.baseUrl.replace(/\/$/, '')
-    const url = `${baseUrl}/v1beta/models/${model.modelName}:generateContent`
+    const root = this.buildRoot(model.baseUrl)
+    const url = `${root}/v1beta/models/${model.modelName}:generateContent`
 
     const { contents, systemInstruction } = this.toGeminiContents(messages)
 
@@ -132,8 +141,8 @@ export class GeminiProvider implements ILLMProvider {
 
   async generateStream(model: ModelProfile, messages: LLMChatMessage[], opts: LLMStreamOptions): Promise<void> {
     try {
-      const baseUrl = model.baseUrl.replace(/\/$/, '')
-      const url = `${baseUrl}/v1beta/models/${model.modelName}:streamGenerateContent?alt=sse`
+      const root = this.buildRoot(model.baseUrl)
+      const url = `${root}/v1beta/models/${model.modelName}:streamGenerateContent?alt=sse`
 
       const { contents, systemInstruction } = this.toGeminiContents(messages)
 
@@ -239,5 +248,80 @@ export class GeminiProvider implements ILLMProvider {
         opts.onError(String(error))
       }
     }
+  }
+
+  /**
+   * 拉取 Gemini 可用模型清单。
+   * 端点：`GET {baseUrl}/v1beta/models?key=<apiKey>`
+   * 双层过滤策略（应对代理网关可能不返回 supportedGenerationMethods 字段）：
+   *   1. 优先按 `supportedGenerationMethods.includes('generateContent')` 过滤
+   *   2. 字段缺失时退到名字硬过滤：剥掉 embed/imagen/veo 等明显非生成模型
+   * 名字格式归一化：剥掉 `models/` 前缀。
+   */
+  async listModels(model: ModelProfile): Promise<string[]> {
+    // 复用 buildRoot 跟 generate/generateStream 保持归一化一致
+    const root = this.buildRoot(model.baseUrl)
+    const namePassesHardFilter = (name: string): boolean => {
+      const low = name.toLowerCase()
+      return !low.includes('embed') && !low.includes('imagen') && !low.includes('veo')
+    }
+
+    const all: Array<{ name?: string; supportedGenerationMethods?: string[] }> = []
+    let pageToken: string | undefined
+    // 官方 models.list 分页：默认 pageSize=50，最大 1000；nextPageToken 翻页
+    // 安全循环上限 20 页 × 1000 = 2 万型号，远超实际任何代理网关返回
+    for (let page = 0; page < 20; page++) {
+      const url = new URL(`${root}/v1beta/models`)
+      url.searchParams.set('key', model.apiKey)
+      url.searchParams.set('pageSize', '1000')
+      if (pageToken) url.searchParams.set('pageToken', pageToken)
+
+      const res = await fetch(url.toString(), {
+        method: 'GET',
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!res.ok) {
+        const body = await res.text()
+        throw new Error(this.summarizeGeminiListError(res.status, body))
+      }
+
+      const data = await res.json() as {
+        models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>
+        nextPageToken?: string
+      }
+      for (const m of data.models ?? []) all.push(m)
+      if (!data.nextPageToken) break
+      pageToken = data.nextPageToken
+    }
+
+    const filtered = all.filter((m) => {
+      if (!m.name) return false
+      // 字段存在 → 严格按 generateContent 过滤
+      if (Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.length > 0) {
+        return m.supportedGenerationMethods.includes('generateContent')
+      }
+      // 字段缺失（代理可能漏）→ 名字硬过滤兜底
+      return namePassesHardFilter(m.name)
+    })
+
+    return filtered
+      .map((m) => m.name!)
+      .map((n) => (n.startsWith('models/') ? n.slice('models/'.length) : n))
+      .filter((id) => id.length > 0)
+  }
+
+  private summarizeGeminiListError(status: number, body: string): string {
+    const trimmed = body.trim()
+    if (!trimmed) return `Gemini API ${status}：无响应内容`
+    let detail = trimmed
+    try {
+      const j = JSON.parse(trimmed) as { error?: { message?: string } }
+      if (j.error?.message) detail = j.error.message
+    } catch { /* 非 JSON 按原文 */ }
+    if (/<html|<!doctype|<head|<body|cloudflare/i.test(detail)) {
+      return `Gemini API ${status}：端点返回网页而非 JSON（鉴权失败或代理拦截）`
+    }
+    const oneLine = detail.replace(/\s+/g, ' ').trim()
+    return `Gemini API ${status}：${oneLine.length > 240 ? oneLine.slice(0, 240) + '…' : oneLine}`
   }
 }

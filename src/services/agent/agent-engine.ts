@@ -11,7 +11,7 @@
  */
 
 import { toolRegistry, type ToolResult, type ToolArtifact } from './tool-registry'
-import type { LLMChatMessage, LLMToolCall, LLMToolDef, TokenUsage } from '../../shared/ipc-channels'
+import type { LLMChatMessage, LLMToolCall, LLMToolDef, TokenUsage, ClaudeThinkingBlock } from '../../shared/ipc-channels'
 
 // ===== 常量 =====
 
@@ -65,6 +65,17 @@ export interface AgentLLMResult {
   toolCalls: LLMToolCall[]
   /** token 用量（供上层写 llm_calls） */
   usage?: TokenUsage
+  /**
+   * Anthropic 多轮回传所需的原始 thinking content blocks（仅 ClaudeProvider 路径产出）。
+   * 含 signature/redacted data；下一轮 wire 回 Anthropic 时必须随 assistant 消息一起发回，
+   * 否则同时启用 tools + thinking 会被 API 拒收。其它 provider 路径上为 undefined。
+   */
+  thinkingBlocks?: ClaudeThinkingBlock[]
+  /**
+   * DeepSeek/OpenAI 协议族 reasoning_content 原文（仅 OpenAIProvider 路径产出）。
+   * DeepSeek thinking + tool_calls 多轮，下一轮 wire 必须随 assistant 消息回传，否则 400。
+   */
+  reasoningContent?: string
 }
 
 /**
@@ -149,11 +160,16 @@ export async function runAgentLoop(
       return
     }
 
-    // 将模型本轮回复（含原生 tool_calls）加入历史
+    // 将模型本轮回复（含原生 tool_calls + Claude thinkingBlocks）加入历史。
+    // thinkingBlocks 在下一轮 ClaudeProvider.toWireMessages 时被重建到 content 数组前部，
+    // 满足 Anthropic "tools + thinking 多轮必须回传 thinking blocks（含 signature）" 的硬约束。
     messages.push({
       role: 'assistant',
       content: result.text,
       tool_calls: result.toolCalls,
+      thinkingBlocks: result.thinkingBlocks,
+      // DeepSeek thinking + tool_calls 多轮：reasoning_content 必须随本轮 assistant 回传下一轮
+      reasoningContent: result.reasoningContent,
     })
 
     // 依次执行每个 tool_call，结果以 tool 角色消息回灌（每个调用都必须有对应回应）

@@ -39,8 +39,12 @@ function getEmbeddingConfig(): { protocol: 'openai' | 'gemini'; model: { baseUrl
     if (!model) return null
   }
 
+  // embedding 路径仅支持 openai / gemini 协议——Anthropic 没出 embedding 模型，
+  // 防御性 guard：即便用户把 Claude 模型勾上 'embedding' purpose，也拒绝把它当嵌入模型用
+  if (model.protocol !== 'openai' && model.protocol !== 'gemini') return null
+
   return {
-    protocol: model.protocol as 'openai' | 'gemini',
+    protocol: model.protocol,
     model: { baseUrl: model.baseUrl, apiKey: model.apiKey, modelName: model.modelName },
   }
 }

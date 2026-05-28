@@ -1,11 +1,17 @@
 import { create } from 'zustand'
 import { ipc } from '../services/ipc-client'
-import type { ModelProfile, LLMResponse, TokenUsage, LLMPurpose, GlobalConfig, LLMChatMessage, LLMToolDef, LLMToolCall } from '../shared/ipc-channels'
+import type { ModelProfile, LLMResponse, TokenUsage, LLMPurpose, GlobalConfig, LLMChatMessage, LLMToolDef, LLMToolCall, ClaudeThinkingBlock } from '../shared/ipc-channels'
 
 /** 流式生成的回调 */
 interface StreamCallbacks {
   onChunk?: (chunk: string) => void
-  onDone?: (fullText: string, usage?: TokenUsage, toolCalls?: LLMToolCall[]) => void
+  /**
+   * 流结束：
+   * - thinkingBlocks 仅 ClaudeProvider 路径产出（Anthropic 多轮回传）
+   * - reasoningContent 仅 OpenAIProvider/DeepSeek 路径产出（DeepSeek tool_calls 多轮回传）
+   * 其他 provider 上为 undefined，调用方按需消费。
+   */
+  onDone?: (fullText: string, usage?: TokenUsage, toolCalls?: LLMToolCall[], thinkingBlocks?: ClaudeThinkingBlock[], reasoningContent?: string) => void
   onError?: (error: string) => void
 }
 
@@ -67,6 +73,8 @@ interface LLMState {
   cancelGeneration: (requestId: string) => Promise<void>
   /** 测试模型连接 */
   testConnection: (model: ModelProfile) => Promise<{ success: boolean; error?: string }>
+  /** 按 baseUrl+apiKey 拉取该服务商可用模型 ID 列表（SettingsModal「拉取可用」按钮用） */
+  fetchAvailableModels: (model: ModelProfile) => Promise<{ success: boolean; models: string[]; error?: string }>
 }
 
 export const useLLMStore = create<LLMState>()((set, get) => ({
@@ -204,7 +212,7 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
 
     const unsubDone = ipc.on('llm:stream-done', (data) => {
       if (data.requestId === requestId) {
-        callbacks.onDone?.(data.fullText, data.usage, data.toolCalls)
+        callbacks.onDone?.(data.fullText, data.usage, data.toolCalls, data.thinkingBlocks, data.reasoningContent)
         cleanup()
       }
     })
@@ -256,5 +264,9 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
 
   testConnection: async (model) => {
     return ipc.invoke('llm:test-connection', model)
+  },
+
+  fetchAvailableModels: async (model) => {
+    return ipc.invoke('llm:fetch-available-models', model)
   },
 }))

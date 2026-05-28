@@ -165,11 +165,19 @@ export interface LLMChannels {
     args: [model: ModelProfile]
     return: { success: boolean; error?: string }
   }
+  /**
+   * 按 baseUrl+apiKey 向服务商拉取当前可用模型 ID 列表。
+   * 复用 test-connection 范式：前端传 ModelProfile 草稿（可不入库），主进程按 protocol 分发到 provider.listModels。
+   */
+  'llm:fetch-available-models': {
+    args: [model: ModelProfile]
+    return: { success: boolean; models: string[]; error?: string }
+  }
 }
 
 export interface LLMStreamEvents {
   'llm:stream-chunk': { requestId: string; chunk: string }
-  'llm:stream-done': { requestId: string; fullText: string; usage?: TokenUsage; toolCalls?: LLMToolCall[] }
+  'llm:stream-done': { requestId: string; fullText: string; usage?: TokenUsage; toolCalls?: LLMToolCall[]; thinkingBlocks?: ClaudeThinkingBlock[]; reasoningContent?: string }
   'llm:stream-error': { requestId: string; error: string }
 }
 
@@ -235,6 +243,16 @@ export interface LLMToolDef {
   }
 }
 
+/**
+ * Anthropic Messages API 的思考内容块（含 redacted）。
+ * 当 assistant 历史里既有 tool_use 又有 thinking 时，Anthropic 要求多轮回传时
+ * 原样保留这些块（含 signature 加密签名 / redacted data），否则 API 拒收。
+ * Vela 仅在 ClaudeProvider 上读写本字段；OpenAIProvider / GeminiProvider 不读不写。
+ */
+export type ClaudeThinkingBlock =
+  | { type: 'thinking'; thinking: string; signature: string }
+  | { type: 'redacted_thinking'; data: string }
+
 /** LLM 对话消息（统一基准格式，跨 IPC 传递；含原生 tool-calling 回合所需字段） */
 export interface LLMChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -245,6 +263,17 @@ export interface LLMChatMessage {
   tool_call_id?: string
   /** tool 结果消息：工具名（Gemini functionResponse 按名匹配） */
   name?: string
+  /**
+   * Anthropic 多轮回传所需的 thinking content blocks 原始序列。
+   * 仅 ClaudeProvider 在 assistant 历史消息上读写；OpenAI/Gemini 忽略。
+   */
+  thinkingBlocks?: ClaudeThinkingBlock[]
+  /**
+   * DeepSeek / OpenAI 协议族思考模型返回的 reasoning_content 原文（纯字符串）。
+   * DeepSeek thinking 模式下，带 tool_calls 的 assistant 历史多轮回传时必须原样带回，
+   * 否则 API 400（"reasoning_content must be passed back"）。仅 OpenAIProvider 读写。
+   */
+  reasoningContent?: string
 }
 
 export interface LLMRequest {
@@ -265,6 +294,10 @@ export interface LLMResponse {
   usage?: TokenUsage
   /** 非流式生成时模型发起的原生工具调用（与 provider 接口对齐，避免契约分叉） */
   toolCalls?: LLMToolCall[]
+  /** Anthropic thinking content blocks（仅 Claude 路径产出，供多轮回传保留 signature/redacted data） */
+  thinkingBlocks?: ClaudeThinkingBlock[]
+  /** DeepSeek/OpenAI 协议族 reasoning_content 原文（供 tool_calls 多轮回传） */
+  reasoningContent?: string
   error?: string
 }
 
@@ -277,14 +310,23 @@ export interface TokenUsage {
 export interface ModelProfile {
   id: string
   name: string
-  provider: 'openai' | 'gemini' | 'deepseek' | 'ollama' | 'bigmodel' | 'custom'
-  protocol: 'openai' | 'gemini'
+  provider: 'openai' | 'gemini' | 'deepseek' | 'ollama' | 'bigmodel' | 'claude' | 'custom'
+  protocol: 'openai' | 'gemini' | 'anthropic'
   modelName: string
   apiKey: string
   baseUrl: string
   temperature: number
   maxTokens: number
   purposes: Array<'generation' | 'refinement' | 'summary' | 'embedding'>
+  /**
+   * 思考模式策略——模型层面决定是否启用 reasoning/thinking。
+   * - 'always'：所有调用强制开 thinking（如 deepseek-reasoner、o-series 等推理模型）
+   * - 'optional'（默认/未设置）：跟随调用方代码的 opts.thinking（如架构推演命令写死 thinking:true）
+   * - 'never'：所有调用强制关 thinking，覆盖代码层的请求（如 deepseek-chat 这种不支持/不应该开的）
+   *
+   * 不做成运行时 UI 开关——thinking 是模型能力而非用户偏好。
+   */
+  thinkingMode?: 'always' | 'optional' | 'never'
 }
 
 // ===== 引入 DB 类型 =====
