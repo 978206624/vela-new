@@ -33,8 +33,11 @@ interface DraftState {
   /** 加载全部章节草稿（扫描 drafts/ 目录下所有 ch{NNN} 子目录） */
   loadAllDrafts: () => Promise<void>
 
-  /** 手动标记草稿状态（修稿/审稿后更新用） */
-  markDraftStatus: (draftPath: string, chapterNumber: number, status: DraftStatus) => Promise<void>
+  /** 手动标记草稿状态（修稿/审稿后更新用）。返回 IPC 结果供调用方判断成败（如「放弃修改」需先确认归档成功再删除） */
+  markDraftStatus: (draftPath: string, chapterNumber: number, status: DraftStatus) => Promise<{ success: boolean; error?: string }>
+  /** 从某章定稿派生一个可编辑副本（status='draft'，老定稿保持 finalized 不动）。
+   *  防重复派生：同章已有活跃非定稿稿（draft/revised/reviewed）时复用并返回 existing:true，不新建。 */
+  deriveEditableCopy: (finalizedDraftPath: string, chapterNumber: number) => Promise<{ success: boolean; newDraftPath?: string; existing?: boolean; error?: string }>
   /** 彻底删除草稿（从数据库移除，级联删除修稿/审稿，不可恢复）。返回 IPC 结果供调用方判断成败 */
   deleteDraftPermanently: (draftPath: string, chapterNumber: number) => Promise<{ success: boolean; error?: string }>
   /** 清除指定章节的缓存（下次访问时重新加载） */
@@ -118,30 +121,30 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
 
   markDraftStatus: async (draftPath, chapterNumber, status) => {
     const project = useProjectStore.getState().currentProject
-    if (!project) return
+    if (!project) return { success: false, error: '未打开项目' }
 
     // DB 化后的标准路径为 vela://draft/{id}，直接用 id 更新状态。
     // 旧的 draft_v{version}.md 文件名格式已不再产生（仅作兼容兜底）。
     const idMatch = draftPath.match(/^vela:\/\/draft\/(\d+)$/)
     if (idMatch) {
       const draftId = parseInt(idMatch[1])
-      if (status === 'finalized') {
-        await ipc.invoke('db:draft-finalize-exclusive', draftId)
-      } else {
-        await ipc.invoke('db:draft-update-status', draftId, status)
-      }
+      const res = status === 'finalized'
+        ? await ipc.invoke('db:draft-finalize-exclusive', draftId)
+        : await ipc.invoke('db:draft-update-status', draftId, status)
+      if (!res.success) return { success: false, error: res.error }
       await get().loadChapterDrafts(chapterNumber)
-      return
+      return { success: true }
     }
 
     // 兼容旧格式 draft_v{version}.md
     const versionMatch = draftPath.match(/draft_v(\d+)\.md$/)
-    if (!versionMatch) return
+    if (!versionMatch) return { success: false, error: '无效的草稿路径' }
     const version = parseInt(versionMatch[1])
     const chapterDir = getDraftDir(project.path, chapterNumber)
     await updateDraftStatusInIndex(chapterDir, version, status)
     // 重新加载该章草稿以刷新缓存
     await get().loadChapterDrafts(chapterNumber)
+    return { success: true }
   },
 
   deleteDraftPermanently: async (draftPath, chapterNumber) => {
@@ -220,6 +223,40 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
       useProjectStore.getState().refreshFileTree()
 
       return { success: true }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  },
+
+  deriveEditableCopy: async (finalizedDraftPath, chapterNumber) => {
+    const project = useProjectStore.getState().currentProject
+    if (!project) return { success: false, error: '未打开项目' }
+
+    try {
+      // 防重复派生：同章若已有活跃的非定稿稿（draft/revised/reviewed），直接复用最新版本，不新建副本。
+      const list = await ipc.invoke('db:draft-list', chapterNumber)
+      const activeEditable = list
+        .filter(d => d.status === 'draft' || d.status === 'revised' || d.status === 'reviewed')
+        .sort((a, b) => b.version - a.version)[0]
+      if (activeEditable) {
+        return { success: true, existing: true, newDraftPath: `vela://draft/${activeEditable.id}` }
+      }
+
+      // 读定稿正文 → 派生为新 draft（source='rewrite'）。老定稿保持 finalized 不动，仍是生效定稿。
+      const { readVelaContent } = await import('../services/vela-protocol')
+      const body = await readVelaContent(finalizedDraftPath)
+      const nextVersion = await ipc.invoke('db:draft-next-version', chapterNumber)
+      const res = await ipc.invoke('db:draft-create', {
+        chapterNumber,
+        version: nextVersion,
+        source: 'rewrite',
+        content: body,
+        wordCount: body.length,
+      })
+      if (!res.success || !res.id) return { success: false, error: res.error || '创建派生副本失败' }
+
+      await get().loadChapterDrafts(chapterNumber)
+      return { success: true, newDraftPath: `vela://draft/${res.id}` }
     } catch (e) {
       return { success: false, error: String(e) }
     }

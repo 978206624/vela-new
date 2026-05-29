@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Sparkles, Search, BadgeCheck, Save, FileStack, FileText, Wrench } from 'lucide-react'
+import { Sparkles, Search, BadgeCheck, Save, FileStack, FileText, Wrench, FilePenLine, Trash2 } from 'lucide-react'
 
 import { useProjectStore } from '../../stores/project-store'
 import { useEditorStore } from '../../stores/editor-store'
@@ -24,7 +24,7 @@ import { ipc } from '../../services/ipc-client'
 import { DRAFT_STATUS_LABEL, DRAFT_STATUS_COLOR } from '../../shared/draft-status'
 import { PostProcessStatusPanel } from '../ui/PostProcessStatusPanel'
 import { getChapterFinalizeScope } from '../../services/workflows/workflow-utils'
-import { guardRepairPostProcess } from '../../services/workflow-guards'
+import { guardRepairPostProcess, guardFinalizeChapter } from '../../services/workflow-guards'
 
 interface Props {
   filePath: string
@@ -87,6 +87,14 @@ export default function DraftEditor({ filePath, content }: Props) {
   )
   const status: DraftStatus = (liveStatus ?? meta?.status ?? 'draft') as DraftStatus
   const isReadonly = status === 'finalized' || status === 'archived'
+
+  // 同章是否已存在生效定稿（用于：派生副本 Banner 判定 + 重定稿确认文案区分 + 重定稿即覆盖语义）
+  const hasFinalizedSibling = useDraftStore(s =>
+    meta ? !!s.draftsByChapter[meta.chapterNumber]?.some(d => d.status === 'finalized') : false
+  )
+  // 「修改副本」= 自身为可编辑稿（draft/revised/reviewed）且同章已有定稿——
+  // 覆盖被 AI 修稿合并后变 revised 的副本，避免 Banner 在副本生命周期中途消失。
+  const isDerivedCopy = hasFinalizedSibling && (status === 'draft' || status === 'revised' || status === 'reviewed')
 
   // 检查是否有相关章节工作流正在运行
   // ✅ 只订阅 activeRuns，不订阅 globalLogs 等高频更新字段
@@ -189,11 +197,17 @@ export default function DraftEditor({ filePath, content }: Props) {
   /** 定稿 */
   const doFinalize = async () => {
     if (!meta || isChapterBusy) return
+    // 前端快速反馈：回溯定稿历史章会被后端 db:draft-finalize-exclusive handler 硬拦，
+    // 这里提前拦截，避免启动 workflow 后才在后台报错（真正的硬拦截在 handler + execute 返回值检查）。
+    const guard = await guardFinalizeChapter(meta.chapterNumber)
+    if (!guard.ok) { toast.error(guard.message || '无法定稿'); return }
     const ok = await confirm(
-      `确定要将第 ${meta.chapterNumber} 章定稿吗？\n\n定稿后章节将标记为完成，不再支持修改和重新后处理。`,
+      hasFinalizedSibling
+        ? `即将【重新定稿】第 ${meta.chapterNumber} 章。\n\n这会覆盖更新本章的定稿记录、根目录正文与知识库；角色卡状态与剧情要点将基于新正文更新且【不可回滚】。\n\n确认重新定稿？`
+        : `确定要将第 ${meta.chapterNumber} 章定稿吗？\n\n定稿后将冻结为只读；如需修改，可在只读提示区点「修改此定稿」派生新副本重改。`,
       {
-        title: '确认定稿',
-        confirmText: '确认定稿',
+        title: hasFinalizedSibling ? '确认重新定稿' : '确认定稿',
+        confirmText: hasFinalizedSibling ? '确认重定稿' : '确认定稿',
       }
     )
     if (!ok) return
@@ -212,6 +226,52 @@ export default function DraftEditor({ filePath, content }: Props) {
     } catch (e) {
       toast.error(`定稿启动失败：${e}`)
     }
+  }
+
+  /** 修改此定稿 —— 从定稿正文派生一个可编辑副本（老定稿保留生效），打开副本开始改 */
+  const doReopenFinalized = async () => {
+    if (!meta || isChapterBusy) return
+    // 前端快速反馈：只允许修改「最新定稿章」，回溯中间历史章会破坏后续上下文链（后端 handler 同样硬拦）。
+    const guard = await guardFinalizeChapter(meta.chapterNumber)
+    if (!guard.ok) { toast.error(guard.message || '无法修改此定稿'); return }
+    const ok = await confirm(
+      '将基于本章定稿复制一份可编辑副本，老定稿保留生效；改完重新定稿后老定稿自动归档。\n\n注意：角色卡状态与剧情要点没有定稿前快照、无法回滚，重新定稿时会基于新正文覆盖更新。',
+      { title: '修改此定稿', confirmText: '创建可编辑副本' }
+    )
+    if (!ok) return
+    try {
+      const r = await useDraftStore.getState().deriveEditableCopy(filePath, meta.chapterNumber)
+      if (!r.success || !r.newDraftPath) { toast.error(`创建副本失败：${r.error}`); return }
+      const body = await readDraftBody(r.newDraftPath)
+      useEditorStore.getState().openFile({
+        id: r.newDraftPath,
+        name: `${meta.chapterTitle ?? `第${meta.chapterNumber}章`}（修改副本）`,
+        type: 'chapter',
+        filePath: r.newDraftPath,
+        content: body,
+      })
+      toast.success(r.existing ? '该章已有修改中的副本，已为你切换过去' : '已创建可编辑副本，开始修改吧')
+    } catch (e) {
+      toast.error(`创建副本失败：${e}`)
+    }
+  }
+
+  /** 放弃修改 —— 彻底删除当前派生副本，恢复为「仅老定稿生效」。
+   *  db:draft-delete 仅允许删 archived 稿，故先归档并校验成功再删，归档失败保留 tab 提示。 */
+  const doDiscardDraft = async () => {
+    if (!meta) return
+    const ok = await confirm(
+      '放弃本次修改将彻底删除这个修改副本，章节恢复为原定稿生效（原定稿是天然备份）。\n\n确定放弃？',
+      { title: '放弃修改', confirmText: '放弃并删除副本' }
+    )
+    if (!ok) return
+    const ds = useDraftStore.getState()
+    const arch = await ds.markDraftStatus(filePath, meta.chapterNumber, 'archived')
+    if (!arch.success) { toast.error(`放弃失败（归档未成功）：${arch.error ?? ''}`); return }
+    const del = await ds.deleteDraftPermanently(filePath, meta.chapterNumber)
+    if (!del.success) { toast.error(`放弃失败（删除未成功）：${del.error ?? ''}`); return }
+    useEditorStore.getState().closeTab(filePath)
+    toast.success('已放弃修改，恢复为原定稿生效')
   }
 
   /** 修复定稿后处理 — 只重跑失败的步骤 */
@@ -449,6 +509,19 @@ export default function DraftEditor({ filePath, content }: Props) {
             <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
               {status === 'finalized' ? '已定稿（只读）' : '已归档（只读）'}
             </span>
+            {/* 已定稿 → 修改此定稿（派生可编辑副本，老定稿保留生效） */}
+            {status === 'finalized' && meta && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={doReopenFinalized}
+                disabled={isChapterBusy}
+                title="基于本章定稿派生一个可编辑副本进行修改，改完重新定稿覆盖"
+              >
+                <FilePenLine size={11} />
+                修改此定稿
+              </Button>
+            )}
             {/* 已定稿 → 有失败项时显示修复定稿按钮 */}
             {status === 'finalized' && meta && hasProcessFailure && (
               <Button
@@ -465,6 +538,35 @@ export default function DraftEditor({ filePath, content }: Props) {
           </div>
         )}
       </div>
+
+      {/* 派生副本提示 Banner —— 区分「修改副本 vs 原定稿」，降低用户对「哪个生效」的混淆 */}
+      {isDerivedCopy && (
+        <div
+          className="flex items-center justify-between gap-2 px-3 py-1.5 text-xs flex-shrink-0"
+          style={{
+            borderBottom: '1px solid var(--color-border)',
+            backgroundColor: 'var(--color-hover)',
+            color: 'var(--color-text-secondary)',
+          }}
+        >
+          <span className="flex items-center gap-1.5 min-w-0">
+            <FilePenLine size={12} style={{ color: 'var(--color-warning)', flexShrink: 0 }} />
+            <span className="truncate">
+              此为定稿的<b>修改副本</b> —— 当前系统仍以原定稿为准，重新定稿后将覆盖原定稿。
+            </span>
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={doDiscardDraft}
+            disabled={isChapterBusy}
+            title="彻底删除此修改副本，恢复为原定稿生效"
+          >
+            <Trash2 size={11} />
+            放弃修改
+          </Button>
+        </div>
+      )}
 
       {/* 后处理状态面板（仅定稿草稿显示） */}
       {status === 'finalized' && meta && (

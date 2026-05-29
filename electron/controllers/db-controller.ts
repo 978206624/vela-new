@@ -186,6 +186,19 @@ export function registerDatabaseController() {
 
   ipcMain.handle('db:draft-finalize-exclusive', async (_event, id: number, wordCount?: number) => {
     try {
+      // 定稿不变量守卫（唯一物理收口，覆盖 UI/Agent/版本历史/直接调用本通道的 helper）：
+      // 禁止回溯定稿「中间历史章」——会破坏后续章节的角色状态/知识库/剧情要点线性演化链。
+      // 规则：仅当已有定稿(maxFinalized>0)且目标章号 < 当前最新定稿章号时拦截；
+      // 放行最新章重定稿(==)、正常推进(=max+1)、跳章(>max)。
+      const meta = DraftRepository.getMeta(id)
+      if (!meta) return { success: false, error: '草稿不存在' }
+      const maxFinalized = DraftRepository.getMaxFinalizedChapter()
+      if (maxFinalized > 0 && meta.chapterNumber < maxFinalized) {
+        return {
+          success: false,
+          error: `禁止回溯定稿第 ${meta.chapterNumber} 章：当前最新定稿为第 ${maxFinalized} 章，回溯重定稿会破坏后续章节的角色状态/知识库/剧情要点线性演化链。如需修改更早章节，请先逐章退回。`,
+        }
+      }
       DraftRepository.finalizeExclusive(id, wordCount)
       return { success: true }
     } catch (err) {

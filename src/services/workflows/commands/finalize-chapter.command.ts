@@ -261,8 +261,11 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
     // 同步定稿期微调过的正文；写入失败则中止，避免 DB 正文与后续后处理文本不一致
     const contentRes = await ipc.invoke('db:draft-update-content', dbDraft.id, refinedDraftText, refinedDraftText.length)
     if (!contentRes.success) throw new Error(`定稿正文写入失败：${contentRes.error || '未知错误'}`)
-    // 定稿互斥：本稿置 finalized 的同时，把同章其它未归档稿降级为 archived（单事务），保证每章只剩一个生效定稿
-    await ipc.invoke('db:draft-finalize-exclusive', dbDraft.id, refinedDraftText.length)
+    // 定稿互斥：本稿置 finalized 的同时，把同章其它未归档稿降级为 archived（单事务），保证每章只剩一个生效定稿。
+    // 返回值必须检查：handler 内含「禁止回溯定稿历史章」守卫，命中时返回 {success:false}；
+    // 此处若不中止，后续仍会写根目录物理文件、跑后处理流水线、发 FINALIZE_COMPLETE 事件，使守卫形同虚设。
+    const finalizeRes = await ipc.invoke('db:draft-finalize-exclusive', dbDraft.id, refinedDraftText.length)
+    if (!finalizeRes.success) throw new Error(finalizeRes.error || '定稿状态写入失败')
 
     // 【重要】：除了写入 DB，对于已定稿的章节需要实体化为物理文件放在根目录，供外部系统读取或备份
     const safeTitle = this.params.chapterInfo.title ? ` ${this.params.chapterInfo.title.replace(/[/\\]/g, '_')}` : ''

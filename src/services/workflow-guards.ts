@@ -216,3 +216,33 @@ export async function guardRepairPostProcess(chapterNumber: number): Promise<Gua
 
   return { ok: true }
 }
+
+// ===== Guard 6：章节定稿 / 修改已定稿前 → 禁止回溯定稿历史章 =====
+
+/**
+ * 定稿不变量的前端快速反馈守卫（与 `db:draft-finalize-exclusive` handler 内的硬拦截同逻辑）。
+ * 用于在启动定稿 workflow / 发起「修改此定稿」派生前提前拦截，避免启动后才在后端报错。
+ * 真正的硬拦截在 handler 层（唯一物理收口），本守卫仅为体验。
+ *
+ * 规则：仅当已有定稿（maxFinalized>0）且目标章号 < 当前最新定稿章号时拦截；
+ * 放行最新章重定稿（==）、正常推进（=max+1）、跳章（>max）。
+ * 不变量同 `guardRepairPostProcess`：禁止回溯定稿中间历史章，避免破坏后续章节
+ * 的角色状态/知识库/剧情要点线性演化链。
+ */
+export async function guardFinalizeChapter(chapterNumber: number): Promise<GuardResult> {
+  const project = useProjectStore.getState().currentProject
+  if (!project) {
+    return { ok: false, message: '请先打开或新建一个项目。' }
+  }
+
+  const maxFinalized = await ipc.invoke('db:draft-get-max-finalized-chapter')
+
+  if (maxFinalized > 0 && chapterNumber < maxFinalized) {
+    return {
+      ok: false,
+      message: `禁止回溯定稿第 ${chapterNumber} 章：当前最新定稿为第 ${maxFinalized} 章，回溯重定稿会破坏后续章节的角色状态/知识库/剧情要点线性演化链。\n\n如需修改更早章节，请先逐章退回。`,
+    }
+  }
+
+  return { ok: true }
+}

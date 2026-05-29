@@ -291,6 +291,34 @@ export async function removeDocument(
 }
 
 /**
+ * 按 fileName 删除 chunks 表中的残留块，但保留指定 docId 的块。
+ *
+ * 用于「重新定稿」覆盖式导入：写入新 docId 成功后，清掉同名文件历史版本残留的所有 chunks，
+ * 包括 documents 表已无对应行的「孤儿块」（removeDocument 只能按 docId 删，覆盖不到孤儿）。
+ * fileName 做单引号转义（与 addChunks 的 documents 去重谓词一致），以处理含特殊字符的章节标题。
+ */
+export async function removeChunksByFileNameExcept(
+  projectPath: string,
+  fileName: string,
+  keepDocId: string,
+): Promise<boolean> {
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    if (tableNames.includes(TABLE_NAME)) {
+      const table = await db.openTable(TABLE_NAME)
+      const fn = fileName.replace(/'/g, "''")
+      const keep = keepDocId.replace(/'/g, "''")
+      await table.delete(`fileName = '${fn}' AND docId != '${keep}'`)
+    }
+    return true
+  } catch (error) {
+    console.error('[Vela VectorStore] 按文件名清理残留块失败:', error)
+    return false
+  }
+}
+
+/**
  * 统一检索入口 — 自动选择 FTS / 混合模式
  *
  * @param queryText 搜索关键词/语句

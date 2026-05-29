@@ -17,6 +17,7 @@ import {
   addChunks,
   buildChunkSchema,
   removeDocument as removeDocFromStore,
+  removeChunksByFileNameExcept,
   searchWithScope as storeSearchWithScope,
   listDocuments as storeListDocuments,
   getStats as storeGetStats,
@@ -343,23 +344,27 @@ export async function importText(
       }
     }
 
-    // 先记录同名旧文档的 docId（仅查询、不删除），以便写入成功后再清理其残留块。
+    // 先记录所有同名旧文档的 docId（仅查询、不删除），以便写入成功后再清理其残留块。
     // 注意：必须先记录——addChunks 内部会按 fileName 删除 documents 表旧条目，
-    // 之后就再也查不到旧 docId，旧 chunks 会变孤儿。
+    // 之后就再也查不到旧 docId，旧 chunks 会变孤儿。用 filter 取全部（可能有多个历史版本），非单个。
     const existingDocs = await storeListDocuments(projectPath)
-    const existingDoc = existingDocs.find(d => d.fileName === fileName)
+    const staleDocs = existingDocs.filter(d => d.fileName === fileName && d.id !== docId)
 
     // 先写新块（新 docId）。维度不一致时 addChunks 在写入前即返回失败，旧数据完整保留，
     // 不会因「先删后写」在失败时丢数据（Codex must-fix）。
     const result = await addChunks(projectPath, docId, fileName, chunks, vectors, undefined, chapterMeta)
     if (!result.success) {
+      // best-effort：addChunks 可能已写入部分 chunks 但后续步骤失败，清掉本次 docId 防孤儿（覆盖 !success 路径）。
+      await removeDocFromStore(projectPath, docId).catch(() => {})
       return { success: false, error: result.error }
     }
 
-    // 写入成功后再清理同名旧文档的残留 chunks（documents 表条目已被 addChunks 按 fileName 去重）
-    if (existingDoc && existingDoc.id !== docId) {
-      await removeDocFromStore(projectPath, existingDoc.id)
+    // 写入成功后清理同名旧文档（可能多个历史版本）的 documents 行 + 其残留 chunks。
+    for (const old of staleDocs) {
+      await removeDocFromStore(projectPath, old.id)
     }
+    // 再按 fileName 清掉 documents 表已无对应行的孤儿 chunks（保留本次 docId），彻底去重。
+    await removeChunksByFileNameExcept(projectPath, fileName, docId)
 
     if (result.dimension) {
       writeKBMeta(projectPath, { vectorDimension: result.dimension, embeddingModel: model.modelName })
