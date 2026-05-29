@@ -34,6 +34,8 @@ interface UpdateState {
   errorMessage: string
   /** 当前检查是否用户手动触发（决定设置页是否展示「已是最新」反馈） */
   manual: boolean
+  /** 用户在下载中点了关闭：下载继续，但进度事件不再重新弹窗，仅下载完成时再提示 */
+  dismissed: boolean
   /** 事件订阅是否已初始化 */
   initialized: boolean
 
@@ -58,6 +60,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
   percent: 0,
   errorMessage: '',
   manual: false,
+  dismissed: false,
   initialized: false,
 
   init: () => {
@@ -72,6 +75,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
         version: data.version,
         releaseNotes: data.releaseNotes,
         percent: 0,
+        dismissed: false,
       }),
     )
 
@@ -80,34 +84,45 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
     )
 
     ipc.on('updater:download-progress', (data) =>
-      set({ status: 'downloading', percent: Math.round(data.percent) }),
+      // 用户已关闭弹窗：下载在后台继续，仅静默更新百分比，不重新弹窗
+      set((s) =>
+        s.dismissed
+          ? { percent: Math.round(data.percent) }
+          : { status: 'downloading', percent: Math.round(data.percent) },
+      ),
     )
 
     ipc.on('updater:downloaded', (data) =>
-      set({ status: 'downloaded', version: data.version, percent: 100 }),
+      // 下载完成始终提示重启安装（即便此前关闭过），故复位 dismissed
+      set({ status: 'downloaded', version: data.version, percent: 100, dismissed: false }),
     )
 
     ipc.on('updater:error', (data) => {
       // 主进程仅在交互式（手动检查/下载）时推送 error，这里直接展示
       set({ status: 'error', errorMessage: data.message })
     })
+
+    // 订阅就绪后再触发启动静默检查（manual=false）——保证事件不早于订阅而丢失。
+    // 主进程对 dev/便携/非 Windows 会返回降级标记，由 checkForUpdate 静默处理。
+    get().checkForUpdate(false)
   },
 
   checkForUpdate: async (manual) => {
-    set({ manual, errorMessage: '' })
+    set({ manual, errorMessage: '', dismissed: false })
     if (manual) set({ status: 'checking' })
     const result = await ipc.invoke('updater:check', manual)
     if (result.portable) {
-      set({ status: 'portable-manual' })
-    } else if (result.dev) {
-      // 开发模式无法更新，手动检查时给「已是最新」反馈
-      set({ status: 'not-available' })
+      // 便携版：仅手动检查时引导前往 Releases；静默启动不打扰（每次启动都弹会很烦）
+      set({ status: manual ? 'portable-manual' : 'idle' })
+    } else if (result.dev || result.unsupported) {
+      // 开发模式 / 非 Windows 打包：无法自动更新。手动检查给「已是最新」反馈，静默则保持 idle
+      set({ status: manual ? 'not-available' : 'idle' })
     }
     // 其余（triggered）等待 updater:* 事件驱动状态
   },
 
   startDownload: async () => {
-    set({ status: 'downloading', percent: 0 })
+    set({ status: 'downloading', percent: 0, dismissed: false })
     const result = await ipc.invoke('updater:start-download')
     if (!result.ok) {
       set({ status: 'error', errorMessage: result.error ?? '下载失败' })
@@ -122,5 +137,5 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
     await ipc.invoke('updater:open-releases')
   },
 
-  dismiss: () => set({ status: 'idle', errorMessage: '' }),
+  dismiss: () => set({ status: 'idle', errorMessage: '', dismissed: true }),
 }))

@@ -28,8 +28,8 @@ export default function UpdateDialog() {
 
   if (!visible) return null
 
-  // 下载中不允许点遮罩关闭，避免误中断
-  const dismissable = status !== 'downloading'
+  // 允许随时关闭：下载中关闭不中断下载，下载在后台继续，完成后会再次提示重启安装
+  const dismissable = true
 
   return (
     <div
@@ -72,14 +72,12 @@ export default function UpdateDialog() {
               <p className="text-sm" style={{ color: 'var(--color-text)' }}>
                 新版本 <span className="font-semibold" style={{ color: 'var(--color-accent)' }}>v{version}</span> 已发布，是否更新？
               </p>
-              {releaseNotes && (
-                <div
-                  className="text-xs leading-relaxed whitespace-pre-wrap rounded-lg p-3 max-h-48 overflow-y-auto"
-                  style={{ backgroundColor: 'var(--color-panel)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}
-                >
-                  {releaseNotes}
-                </div>
-              )}
+              <div
+                className="text-xs leading-relaxed whitespace-pre-wrap rounded-lg p-3 max-h-48 overflow-y-auto"
+                style={{ backgroundColor: 'var(--color-panel)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}
+              >
+                {releaseNotes || '暂无更新说明。'}
+              </div>
             </div>
           )}
 
@@ -94,7 +92,10 @@ export default function UpdateDialog() {
                   style={{ width: `${percent}%`, backgroundColor: 'var(--color-accent)' }}
                 />
               </div>
-              <p className="text-xs text-right" style={{ color: 'var(--color-text-muted)' }}>{percent}%</p>
+              <div className="flex items-center justify-between">
+                <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>可关闭，下载将在后台继续</span>
+                <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{percent}%</span>
+              </div>
             </div>
           )}
 

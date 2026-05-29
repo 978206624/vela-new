@@ -467,7 +467,7 @@ export interface UpdaterChannels {
    * 实际的「有新版/已最新」结果通过 updater:* 事件推送，此处只返回触发态。 */
   'updater:check': {
     args: [manual?: boolean]
-    return: { triggered: boolean; portable?: boolean; dev?: boolean }
+    return: { triggered: boolean; portable?: boolean; dev?: boolean; unsupported?: boolean }
   }
   /** 开始下载已检测到的更新（autoDownload 已关闭，由用户确认后调用） */
   'updater:start-download': { args: []; return: { ok: boolean; error?: string } }

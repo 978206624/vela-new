@@ -35,9 +35,16 @@ function isPortable(): boolean {
   return !!process.env.PORTABLE_EXECUTABLE_DIR
 }
 
-/** 向渲染进程推送更新事件 */
+/** 是否支持自动更新：仅 Windows（NSIS 安装版）。mac/linux 打包不走自动更新（Spec §4.9「仅 NSIS」） */
+function isAutoUpdateSupported(): boolean {
+  return process.platform === 'win32'
+}
+
+/** 向渲染进程推送更新事件（防护已销毁的窗口/webContents） */
 function send(channel: string, payload: unknown): void {
-  getCurrentWindow()?.webContents.send(channel, payload)
+  const win = getCurrentWindow()
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+  win.webContents.send(channel, payload)
 }
 
 /** GitHub Release 的 releaseNotes 可能是字符串或分段数组，统一成字符串 */
@@ -100,11 +107,13 @@ function wireEvents(): void {
  * 检查更新。
  * @param manual 是否用户手动触发（手动失败才弹错）
  */
-async function checkForUpdates(manual: boolean): Promise<{ triggered: boolean; portable?: boolean; dev?: boolean }> {
+async function checkForUpdates(manual: boolean): Promise<{ triggered: boolean; portable?: boolean; dev?: boolean; unsupported?: boolean }> {
   // 便携版无法原地替换自身，不走自动更新，引导手动下载
   if (isPortable()) return { triggered: false, portable: true }
   // 开发模式（未打包）下 electron-updater 会因缺少 app-update.yml 抛错，直接跳过
   if (!app.isPackaged) return { triggered: false, dev: true }
+  // 仅 Windows NSIS 安装版支持自动更新；mac/linux 打包不触发（Spec §4.9）
+  if (!isAutoUpdateSupported()) return { triggered: false, unsupported: true }
 
   interactive = manual
   try {
@@ -118,8 +127,12 @@ async function checkForUpdates(manual: boolean): Promise<{ triggered: boolean; p
 }
 
 /**
- * 初始化在线更新：注册事件、IPC handlers，并在打包环境下做一次启动静默检查。
+ * 初始化在线更新：注册事件与 IPC handlers。
  * 在 app.whenReady 后调用。
+ *
+ * 注意：启动静默检查由渲染层 update-store.init() 在订阅完事件后主动触发
+ * （ipc.invoke('updater:check', false)），而非在此处自动 fire——避免主进程
+ * 检查事件早于渲染层订阅导致 updater:available 竞态丢失。
  */
 export function initAutoUpdater(ipcMain: Electron.IpcMain): void {
   autoUpdater.autoDownload = false
@@ -135,6 +148,9 @@ export function initAutoUpdater(ipcMain: Electron.IpcMain): void {
       await autoUpdater.downloadUpdate()
       return { ok: true }
     } catch (err) {
+      // downloadUpdate 拒绝但未必触发 'error' 事件，此处兜底复位 interactive，
+      // 避免标志残留导致后续非交互式错误被误判为需弹窗
+      interactive = false
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
@@ -147,9 +163,4 @@ export function initAutoUpdater(ipcMain: Electron.IpcMain): void {
   ipcMain.handle('updater:open-releases', () => {
     shell.openExternal(RELEASES_URL)
   })
-
-  // 启动静默检查（仅打包后的非便携版；失败静默）
-  if (app.isPackaged && !isPortable()) {
-    checkForUpdates(false)
-  }
 }

@@ -64,6 +64,11 @@ function createWindow() {
   win.on('maximize', sendMaximizedState)
   win.on('unmaximize', sendMaximizedState)
 
+  // 窗口关闭即清空引用，避免向已销毁的 webContents 发送（如更新事件）
+  win.on('closed', () => {
+    win = null
+  })
+
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL)
   } else {
