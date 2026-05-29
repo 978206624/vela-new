@@ -104,6 +104,9 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       reportPath: pseudoReviewPath,
       reviewReport: reportContent,
       chapterNumber: this.params.chapterNumber,
+      // 补传 chapterDir：ReviewReport 的「一键修稿」入口依赖它（canRefine），
+      // 缺失会导致刚生成的审稿报告里入口不显示。
+      chapterDir: `vela://draft/ch${this.params.chapterNumber}`,
     })
 
     callbacks.log(`✅ 审查完成，已生成审稿报告 r${revIndex}`)

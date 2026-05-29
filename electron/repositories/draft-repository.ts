@@ -232,21 +232,45 @@ export class DraftRepository {
     `).run(wordCount, id)
     }
 
-    /** 删除草稿（级联删除 revisions/reviews，但 contents 需手动清理） */
+    /**
+     * 删除草稿（级联删除 revisions/reviews，并清理由此产生的孤儿 contents）。
+     *
+     * revisions/reviews 对 base_draft_id 是 ON DELETE CASCADE（删草稿自动删子行），
+     * 但它们的 content_id 是 ON DELETE RESTRICT，子行被级联删除后其 content 不会自动消失。
+     * 故必须在删除前收集整棵树（草稿自身 + 全部 revisions/reviews）持有的 content_id，
+     * 删除后再回收已不被任何表引用的内容，避免孤儿正文/报告在 contents 表中堆积。
+     */
     static delete(id: number): void {
         const db = getProjectDb()
         if (!db) return
 
-        // 先获取 contentId 以便清理
         const meta = DraftRepository.getMeta(id)
-        db.prepare('DELETE FROM drafts WHERE id = ?').run(id)
+        if (!meta) return
 
-        // 清理孤立的 content 记录
-        if (meta) {
-            // 【DB 迁移备注】：如果 contents。id 仍被 revision 或 review 引用，
-            // SQLite外键约束会阻止删除（抛出异常）。捕获并吞掉异常是预期的，
-            // 这会导致少量不再被草稿引用的内容记录残留，但长期风险极低。
-            try { ContentRepository.delete(meta.contentId) } catch { /* 被外键保护 */ }
-        }
+        const tx = db.transaction(() => {
+            // 1. 删除前收集本草稿树持有的全部 content_id（CASCADE 删行后就查不到了）
+            const contentIds = new Set<number>([meta.contentId])
+            const revRows = db.prepare('SELECT content_id FROM revisions WHERE base_draft_id = ?').all(id) as { content_id: number }[]
+            const reviewRows = db.prepare('SELECT content_id FROM reviews WHERE base_draft_id = ?').all(id) as { content_id: number }[]
+            for (const r of revRows) contentIds.add(r.content_id)
+            for (const r of reviewRows) contentIds.add(r.content_id)
+
+            // 2. 删除草稿（revisions/reviews 行经 ON DELETE CASCADE 自动删除）
+            db.prepare('DELETE FROM drafts WHERE id = ?').run(id)
+
+            // 3. 回收孤儿内容：仅删除已不被 drafts/revisions/reviews 任何一行引用的 content。
+            //    先查引用再删，既避开 RESTRICT 抛错，也防御性兼容 content 被多行复用的情况。
+            for (const cid of contentIds) {
+                const used =
+                    db.prepare('SELECT 1 FROM drafts WHERE content_id = ? LIMIT 1').get(cid) ||
+                    db.prepare('SELECT 1 FROM revisions WHERE content_id = ? LIMIT 1').get(cid) ||
+                    db.prepare('SELECT 1 FROM reviews WHERE content_id = ? LIMIT 1').get(cid)
+                if (!used) {
+                    db.prepare('DELETE FROM contents WHERE id = ?').run(cid)
+                }
+            }
+        })
+
+        tx()
     }
 }

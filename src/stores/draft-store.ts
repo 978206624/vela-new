@@ -35,6 +35,8 @@ interface DraftState {
 
   /** 手动标记草稿状态（修稿/审稿后更新用） */
   markDraftStatus: (draftPath: string, chapterNumber: number, status: DraftStatus) => Promise<void>
+  /** 彻底删除草稿（从数据库移除，级联删除修稿/审稿，不可恢复）。返回 IPC 结果供调用方判断成败 */
+  deleteDraftPermanently: (draftPath: string, chapterNumber: number) => Promise<{ success: boolean; error?: string }>
   /** 清除指定章节的缓存（下次访问时重新加载） */
   invalidateChapter: (chapterNumber: number) => void
   /** 应用合并后的修稿，更新文件和各类状态 */
@@ -115,16 +117,41 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
 
 
   markDraftStatus: async (draftPath, chapterNumber, status) => {
-    // 从路径提取版本号
+    const project = useProjectStore.getState().currentProject
+    if (!project) return
+
+    // DB 化后的标准路径为 vela://draft/{id}，直接用 id 更新状态。
+    // 旧的 draft_v{version}.md 文件名格式已不再产生（仅作兼容兜底）。
+    const idMatch = draftPath.match(/^vela:\/\/draft\/(\d+)$/)
+    if (idMatch) {
+      const draftId = parseInt(idMatch[1])
+      if (status === 'finalized') {
+        await ipc.invoke('db:draft-finalize-exclusive', draftId)
+      } else {
+        await ipc.invoke('db:draft-update-status', draftId, status)
+      }
+      await get().loadChapterDrafts(chapterNumber)
+      return
+    }
+
+    // 兼容旧格式 draft_v{version}.md
     const versionMatch = draftPath.match(/draft_v(\d+)\.md$/)
     if (!versionMatch) return
     const version = parseInt(versionMatch[1])
-    const project = useProjectStore.getState().currentProject
-    if (!project) return
     const chapterDir = getDraftDir(project.path, chapterNumber)
     await updateDraftStatusInIndex(chapterDir, version, status)
     // 重新加载该章草稿以刷新缓存
     await get().loadChapterDrafts(chapterNumber)
+  },
+
+  deleteDraftPermanently: async (draftPath, chapterNumber) => {
+    const idMatch = draftPath.match(/^vela:\/\/draft\/(\d+)$/)
+    if (!idMatch) return { success: false, error: '无效的草稿路径' }
+    const draftId = parseInt(idMatch[1])
+    const res = await ipc.invoke('db:draft-delete', draftId)
+    // 仅删除成功才刷新缓存；失败时保留现状交由调用方提示
+    if (res.success) await get().loadChapterDrafts(chapterNumber)
+    return res
   },
 
   invalidateChapter: (chapterNumber) => {
@@ -147,7 +174,10 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
       if (filePath.startsWith('vela://draft/') || filePath.startsWith('vela://manuscript/')) {
         const prefix = filePath.startsWith('vela://draft/') ? 'vela://draft/' : 'vela://manuscript/'
         targetDraftId = parseInt(filePath.replace(prefix, ''))
-        await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedText.length)
+        // 写正文若被服务端拒绝（如目标稿已定稿/归档），立即中止——
+        // 不可继续改状态/标记合并/同步 tab，否则会绕过只读冻结。
+        const wr = await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedText.length)
+        if (!wr.success) return { success: false, error: wr.error || '写入草稿正文失败' }
       } else {
         // 从 filePath 解析 chapterNumber 和 version，查出 draftId 再更新
         const chMatch = filePath.match(/ch(\d+)/)
@@ -157,7 +187,8 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
           const target = (drafts as unknown as Array<Record<string, unknown>>).find((d) => d.version === version)
           if (target) {
             targetDraftId = target.id as number
-            await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedText.length)
+            const wr = await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedText.length)
+            if (!wr.success) return { success: false, error: wr.error || '写入草稿正文失败' }
           }
         }
       }

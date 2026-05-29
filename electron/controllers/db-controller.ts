@@ -165,6 +165,18 @@ export function registerDatabaseController() {
 
   ipcMain.handle('db:draft-update-status', async (_event, id: number, status: string, wordCount?: number) => {
     try {
+      // 服务端状态机守卫：
+      // - 定稿必须经 db:draft-finalize-exclusive（维护"每章至多一个生效定稿"互斥），
+      //   禁止本通道直接把任意草稿置为 finalized。
+      // - finalized 是冻结终态，禁止本通道修改其状态（避免 finalized→archived 后再彻底删除等越权链路）。
+      if (status === 'finalized') {
+        return { success: false, error: '定稿必须通过定稿流程，不能直接置为 finalized' }
+      }
+      const meta = DraftRepository.getMeta(id)
+      if (!meta) return { success: false, error: '草稿不存在' }
+      if (meta.status === 'finalized') {
+        return { success: false, error: '已定稿的草稿状态已冻结，不可变更' }
+      }
       DraftRepository.updateStatus(id, status, wordCount)
       return { success: true }
     } catch (err) {
@@ -183,7 +195,29 @@ export function registerDatabaseController() {
 
   ipcMain.handle('db:draft-update-content', async (_event, id: number, content: string, wordCount: number) => {
     try {
+      // 服务端守卫：已定稿/已归档的草稿不可写入（定稿即冻结）。
+      // 防止前端只读 UI 被绕过（如 Ctrl+S 或直接 IPC 调用）。
+      const meta = DraftRepository.getMeta(id)
+      if (!meta) return { success: false, error: '草稿不存在' }
+      if (meta.status === 'finalized' || meta.status === 'archived') {
+        return { success: false, error: `已${meta.status === 'finalized' ? '定稿' : '归档'}的草稿不可修改` }
+      }
       DraftRepository.updateContent(id, content, wordCount)
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:draft-delete', async (_event, id: number) => {
+    try {
+      // 服务端守卫：彻底删除仅允许作用于已归档草稿，避免误删/越权删活跃稿或定稿。
+      const meta = DraftRepository.getMeta(id)
+      if (!meta) return { success: false, error: '草稿不存在' }
+      if (meta.status !== 'archived') {
+        return { success: false, error: '只能彻底删除已归档的草稿' }
+      }
+      DraftRepository.delete(id)
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }

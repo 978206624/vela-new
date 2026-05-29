@@ -3,11 +3,12 @@
  */
 
 import { useState, useEffect } from 'react'
-import { ChevronRight, ChevronDown, CheckCircle2, Circle, FileText, FolderOpen, Copy, Trash2, FilePen } from 'lucide-react'
+import { ChevronRight, ChevronDown, CheckCircle2, Circle, FileText, FolderOpen, Copy, Trash2, FilePen, ArchiveRestore, Archive } from 'lucide-react'
 import type { DraftMeta } from '../../../stores/draft-store'
 import { useDraftStore, readDraftBody } from '../../../stores/draft-store'
 import { useEditorStore } from '../../../stores/editor-store'
 import { confirm } from '../../ui/Confirm'
+import { toast } from '../../ui/Toast'
 import { DRAFT_STATUS_LABEL, DRAFT_STATUS_COLOR } from '../../../shared/draft-status'
 import { showSidebarMenu } from './SidebarShared'
 import { ipc } from '../../../services/ipc-client'
@@ -209,10 +210,32 @@ function DraftItem({
     if (isFinalized) return
     const ok = await confirm(
       `归档草稿 "${chapterTitleText} v${draft.version}" 后可在草稿管理列表中展开已归档列表查看。`,
-      { title: '归档草稿', confirmText: '归档', danger: true }
+      { title: '归档草稿', confirmText: '归档' }
     )
     if (!ok) return
     await useDraftStore.getState().markDraftStatus(draft.filePath, draft.chapterNumber, 'archived')
+  }
+
+  /** 取消归档：恢复为活跃草稿（draft 状态），重新出现在草稿列表 */
+  const unarchiveDraft = async () => {
+    await useDraftStore.getState().markDraftStatus(draft.filePath, draft.chapterNumber, 'draft')
+  }
+
+  /** 彻底删除：从数据库永久移除（级联删除修稿/审稿），不可恢复 */
+  const deleteForever = async () => {
+    const ok = await confirm(
+      `彻底删除草稿 "${chapterTitleText} v${draft.version}"？此操作将从数据库永久移除该草稿及其全部修稿、审稿记录，无法恢复。`,
+      { title: '彻底删除', confirmText: '永久删除', danger: true }
+    )
+    if (!ok) return
+    // 先删除并检查结果：成功后才关闭对应 tab；失败则保留 tab 并提示，避免误关后数据仍在
+    const res = await useDraftStore.getState().deleteDraftPermanently(draft.filePath, draft.chapterNumber)
+    if (!res.success) {
+      toast.error(`删除失败：${res.error || '未知错误'}`)
+      return
+    }
+    // 删除成功后关闭该草稿可能打开着的标签，避免留下指向已删数据的死标签
+    useEditorStore.getState().closeTab(draft.filePath)
   }
 
   const isFinalized = draft.status === 'finalized'
@@ -243,14 +266,31 @@ function DraftItem({
           onClick: () => navigator.clipboard.writeText(draft.filePath).catch(() => { }),
         },
         { key: 'div2', type: 'divider' as const },
-        {
-          key: 'delete',
-          label: '删除草稿',
-          icon: <Trash2 size={13} />,
-          danger: true,
-          disabled: isFinalized,
-          onClick: deleteDraft,
-        },
+        ...(archived
+          ? [
+              {
+                key: 'unarchive',
+                label: '取消归档',
+                icon: <ArchiveRestore size={13} />,
+                onClick: unarchiveDraft,
+              },
+              {
+                key: 'delete-forever',
+                label: '彻底删除',
+                icon: <Trash2 size={13} />,
+                danger: true,
+                onClick: deleteForever,
+              },
+            ]
+          : [
+              {
+                key: 'archive',
+                label: '归档草稿',
+                icon: <Archive size={13} />,
+                disabled: isFinalized,
+                onClick: deleteDraft,
+              },
+            ]),
       ], e)}
       title={`点击打开 — ${chapterTitleText} v${draft.version}（${DRAFT_STATUS_LABEL[draft.status] || draft.status}）`}
     >

@@ -18,7 +18,7 @@ import {
   type DraftStatus,
 } from '../../services/workflows/chapter-workflow'
 import { getPendingRevisions, getReviewsForVersion, type RevisionEntry } from '../../services/draft-index'
-import { readDraftBody } from '../../stores/draft-store'
+import { readDraftBody, useDraftStore } from '../../stores/draft-store'
 import { ipc } from '../../services/ipc-client'
 
 import { DRAFT_STATUS_LABEL, DRAFT_STATUS_COLOR } from '../../shared/draft-status'
@@ -79,7 +79,13 @@ export default function DraftEditor({ filePath, content }: Props) {
     }
   }, [filePath])
 
-  const status: DraftStatus = meta?.status ?? 'draft'
+  // 状态以 draft store 为实时数据源：meta 是本地缓存（仅 filePath 变化时重载），
+  // 而 Tab 复用同一 filePath，状态切换（归档/取消归档/定稿/合并）不会重挂载组件，
+  // 若只读 meta.status 会导致 isReadonly 卡在打开那一刻的旧值（已定稿仍可编辑、取消归档后仍只读）。
+  const liveStatus = useDraftStore(s =>
+    meta ? s.draftsByChapter[meta.chapterNumber]?.find(d => d.filePath === filePath)?.status : undefined
+  )
+  const status: DraftStatus = (liveStatus ?? meta?.status ?? 'draft') as DraftStatus
   const isReadonly = status === 'finalized' || status === 'archived'
 
   // 检查是否有相关章节工作流正在运行
@@ -111,12 +117,19 @@ export default function DraftEditor({ filePath, content }: Props) {
 
   /** 保存（vela://draft/ 走 DB，其他走 FS） */
   const doSave = async (text: string) => {
+    // 只读稿（已定稿/已归档）不写入——拦截 Ctrl+S 等绕过 UI 的保存路径。
+    if (isReadonly) return
     setSaving(true)
     try {
       if (filePath.startsWith('vela://draft/') || filePath.startsWith('vela://manuscript/')) {
         const prefix = filePath.startsWith('vela://draft/') ? 'vela://draft/' : 'vela://manuscript/'
         const draftId = parseInt(filePath.replace(prefix, ''))
-        await ipc.invoke('db:draft-update-content', draftId, text, text.length)
+        const res = await ipc.invoke('db:draft-update-content', draftId, text, text.length)
+        // 写入被服务端拒绝时，不可清除 dirty / 同步 tab，否则会谎报已保存。
+        if (!res.success) {
+          toast.error(`保存失败：${res.error || '未知错误'}`)
+          return
+        }
       } else {
         await ipc.invoke('fs:write-file', filePath, text)
       }

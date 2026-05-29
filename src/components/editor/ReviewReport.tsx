@@ -181,6 +181,9 @@ const SEVERITY_META: Record<ReviewIssue['severity'], {
 /** 审稿报告查看器 */
 export default function ReviewReport({ reportText, draftPath, chapterNumber, chapterDir }: ReviewReportProps) {
   const { issues, summary } = parseReport(reportText)
+  // chapterDir 兜底：部分入口（如审稿工作流）可能只传了 chapterNumber 而漏传 chapterDir，
+  // 此时由 chapterNumber 派生，保证「一键修稿」入口可用。
+  const effectiveChapterDir = chapterDir ?? (chapterNumber != null ? `vela://draft/ch${chapterNumber}` : undefined)
   const [showRefineDialog, setShowRefineDialog] = useState(false)
   const [userRefinePrompt, setUserRefinePrompt] = useState('')
   const [processing, setProcessing] = useState(false)
@@ -201,7 +204,7 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
 
   /** 根据审稿意见修稿 */
   const doRefineFromReview = async () => {
-    if (!draftPath || !chapterDir) return
+    if (!draftPath || !effectiveChapterDir) return
     setProcessing(true)
     setShowRefineDialog(false)
     try {
@@ -214,13 +217,15 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
       const draftContent = await readDraftBody(draftPath)
       if (!draftContent) return
 
-      // 提取版本信息
-      const versionMatch = draftPath.match(/draft_v(\d+)\.md$/)
-      const baseVersion = versionMatch ? parseInt(versionMatch[1]) : 1
-      const chapterNum = chapterNumber || 0
+      // 提取版本信息：DB 化后 draftPath 是 vela://draft/{id}，旧的 draft_v{n}.md 正则已失效，
+      // 改用 parseDraftMeta 从 id 反查真实版本号，避免 baseVersion 永远兜底成 1。
+      const { parseDraftMeta } = await import('../../services/workflows/chapter-workflow')
+      const baseMeta = await parseDraftMeta(draftPath)
+      const baseVersion = baseMeta?.version ?? 1
+      const chapterNum = chapterNumber || baseMeta?.chapterNumber || 0
 
       // 获取最新审稿文件名（用于关联）
-      const latestReview = await getLatestReview(chapterDir, baseVersion)
+      const latestReview = await getLatestReview(effectiveChapterDir, baseVersion)
       const reviewFileName = latestReview?.fileName || ''
 
       // 从 index.json 读取章节标题
@@ -249,7 +254,7 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
   }
 
   // 是否可以触发修稿（有草稿路径和章节信息时）
-  const canRefine = !!(draftPath && chapterDir)
+  const canRefine = !!(draftPath && effectiveChapterDir)
 
   return (
     <div className="h-full overflow-y-auto">

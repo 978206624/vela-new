@@ -372,6 +372,7 @@ export interface DatabaseChannels {
   'db:draft-update-status': { args: [id: number, status: string, wordCount?: number]; return: { success: boolean; error?: string } }
   'db:draft-finalize-exclusive': { args: [id: number, wordCount?: number]; return: { success: boolean; error?: string } }
   'db:draft-update-content': { args: [id: number, content: string, wordCount: number]; return: { success: boolean; error?: string } }
+  'db:draft-delete': { args: [id: number]; return: { success: boolean; error?: string } }
 
   // 5. revisions
   'db:revision-create': { args: [params: { baseDraftId: number; revisionIndex: number; revisionType: 'refine' | 'review-fix'; userPrompt?: string; reviewSourceId?: number; content: string; wordCount: number }]; return: { success: boolean; id?: number; error?: string } }

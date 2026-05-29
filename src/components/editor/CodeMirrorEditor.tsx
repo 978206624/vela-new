@@ -96,12 +96,14 @@ export default function CodeMirrorEditor({
       } else {
         setSelectionRange({ from: sel.from, to: sel.to })
         // 交由下方的 useEffect 进行精准防越界座标计算与位置同步
-        if (!aiResult) {
+        // 只读稿（已定稿/已归档/正文）不弹 AI 气泡——润色/扩写/续写/对话/加粗都是改写操作，
+        // 只读状态下不应提供。选区本身仍可用于复制。
+        if (!aiResult && editable) {
           setBubbleOpen(true)
         }
       }
     }
-  }, [onChange, onCharCountChange, aiResult])
+  }, [onChange, onCharCountChange, aiResult, editable])
 
   // 监听滚动与缩放，实时更新 Bubble Menu 坐标
   useEffect(() => {
@@ -328,7 +330,8 @@ export default function CodeMirrorEditor({
         // 捕获 Cmd+S 保存
         if ((e.metaKey || e.ctrlKey) && e.key === 's') {
           e.preventDefault()
-          onSave?.(lastEmittedContentRef.current)
+          // 只读稿（已定稿/已归档）拦截保存快捷键，不触发写入
+          if (editable) onSave?.(lastEmittedContentRef.current)
         }
       }}>
       <div className="flex-1 relative min-h-0 overflow-hidden"
@@ -352,8 +355,8 @@ export default function CodeMirrorEditor({
         </div>
       </div>
 
-      {/* Bubble Menu */}
-      {bubbleOpen && bubblePos.top !== 0 && (
+      {/* Bubble Menu — 仅可编辑状态显示（只读稿不提供改写操作） */}
+      {bubbleOpen && editable && bubblePos.top !== 0 && (
         <div
           className="fixed z-50 flex items-center gap-0.5 p-1 rounded-xl border select-none shadow-xl transform -translate-x-1/2 -translate-y-full"
           style={{

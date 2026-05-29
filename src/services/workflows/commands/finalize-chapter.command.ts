@@ -258,7 +258,9 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
     const dbDraft = await parseDraftMeta(this.params.draftPath)
     if (!dbDraft) throw new Error('内部状态流转异常：无法在数据库中定位该草稿源文件或解析路径版本')
 
-    await ipc.invoke('db:draft-update-content', dbDraft.id, refinedDraftText, refinedDraftText.length)
+    // 同步定稿期微调过的正文；写入失败则中止，避免 DB 正文与后续后处理文本不一致
+    const contentRes = await ipc.invoke('db:draft-update-content', dbDraft.id, refinedDraftText, refinedDraftText.length)
+    if (!contentRes.success) throw new Error(`定稿正文写入失败：${contentRes.error || '未知错误'}`)
     // 定稿互斥：本稿置 finalized 的同时，把同章其它未归档稿降级为 archived（单事务），保证每章只剩一个生效定稿
     await ipc.invoke('db:draft-finalize-exclusive', dbDraft.id, refinedDraftText.length)
 
