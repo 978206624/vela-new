@@ -1,6 +1,8 @@
 "use strict";
 
 const { execFile } = require("child_process");
+const { copyFile, rm } = require("fs/promises");
+const os = require("os");
 const path = require("path");
 const { appBuilderPath } = require("app-builder-bin");
 
@@ -17,6 +19,32 @@ function execFileAsync(file, args) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function execFileWithRetry(file, args, retryCount = 5) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    try {
+      return await execFileAsync(file, args);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === retryCount) {
+        break;
+      }
+
+      await delay(500 * (attempt + 1));
+    }
+  }
+
+  throw lastError;
 }
 
 exports.afterExtract = async function afterExtract(context) {
@@ -71,5 +99,20 @@ exports.afterExtract = async function afterExtract(context) {
     args.push("--set-icon", iconPath);
   }
 
-  await execFileAsync(appBuilderPath, ["rcedit", "--args", JSON.stringify(args)]);
+  const tempExecutablePath = path.join(
+    os.tmpdir(),
+    `vela-electron-rcedit-${process.pid}-${Date.now()}.exe`,
+  );
+
+  try {
+    await copyFile(executablePath, tempExecutablePath);
+
+    const tempArgs = [...args];
+    tempArgs[0] = tempExecutablePath;
+
+    await execFileWithRetry(appBuilderPath, ["rcedit", "--args", JSON.stringify(tempArgs)]);
+    await copyFile(tempExecutablePath, executablePath);
+  } finally {
+    await rm(tempExecutablePath, { force: true });
+  }
 };
