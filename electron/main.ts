@@ -1,6 +1,7 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
 import { registerIPCHandlers } from './ipc-handlers'
 import { registerMCPHandlers } from './mcp/mcp-ipc-bridge'
+import { initAutoUpdater } from './updater'
 
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -89,4 +90,6 @@ app.whenReady().then(() => {
   registerIPCHandlers()
   registerMCPHandlers()
   createWindow()
+  // 在线更新：注册 IPC + 启动静默检查（需窗口已创建以接收更新事件）
+  initAutoUpdater(ipcMain)
 })

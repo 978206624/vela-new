@@ -20,6 +20,15 @@
     "dist-electron",
     "build"
   ],
+  // 在线更新源：GitHub Releases。构建时据此生成 app-update.yml + latest.yml，
+  // autoUpdater 启动后据此比对版本。发布用 `electron-builder --publish always`（需 GH_TOKEN）。
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "978206624",
+      "repo": "vela-new"
+    }
+  ],
   "mac": {
     "target": ["dmg"],
     "artifactName": "${productName}-Mac-${version}-Installer.${ext}",

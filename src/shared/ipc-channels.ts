@@ -461,15 +461,47 @@ export interface SystemChannels {
   'system:reveal-in-explorer': { args: [filePath: string]; return: void }
 }
 
+// ===== 在线更新（electron-updater，主进程 invoke） =====
+export interface UpdaterChannels {
+  /** 检查更新；manual=true 为用户手动触发（失败才弹错），false/省略为启动静默检查。
+   * 实际的「有新版/已最新」结果通过 updater:* 事件推送，此处只返回触发态。 */
+  'updater:check': {
+    args: [manual?: boolean]
+    return: { triggered: boolean; portable?: boolean; dev?: boolean }
+  }
+  /** 开始下载已检测到的更新（autoDownload 已关闭，由用户确认后调用） */
+  'updater:start-download': { args: []; return: { ok: boolean; error?: string } }
+  /** 退出并安装已下载的更新 */
+  'updater:quit-and-install': { args: []; return: void }
+  /** 在系统浏览器打开 GitHub Releases 页（便携版手动下载用） */
+  'updater:open-releases': { args: []; return: void }
+}
+
 // ===== 窗口状态事件（主进程 → 渲染进程） =====
 export interface WindowEvents {
   /** 窗口最大化状态变化，payload 为是否已最大化 */
   'window:maximized-changed': boolean
 }
 
+// ===== 在线更新事件（主进程 → 渲染进程） =====
+export interface UpdaterEvents {
+  /** 开始检查更新 */
+  'updater:checking': null
+  /** 检测到新版本（携带版本号与 GitHub Release 更新日志） */
+  'updater:available': { version: string; releaseNotes: string; releaseName: string; releaseDate: string }
+  /** 已是最新版本 */
+  'updater:not-available': { version: string }
+  /** 下载进度 */
+  'updater:download-progress': { percent: number; transferred: number; total: number; bytesPerSecond: number }
+  /** 更新已下载完成，可重启安装 */
+  'updater:downloaded': { version: string }
+  /** 检查/下载出错；manual=true 表示用户手动触发（渲染层据此决定是否弹错） */
+  'updater:error': { message: string; manual: boolean }
+}
+
 // ===== 合并所有频道 =====
-export type AllInvokeChannels = ConfigChannels & ProjectChannels & FileChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & ImportChannels & MCPChannels & WindowChannels & SystemChannels
-export type AllEventChannels = LLMStreamEvents & WindowEvents
+export type AllInvokeChannels = ConfigChannels & ProjectChannels & FileChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & ImportChannels & MCPChannels & WindowChannels & SystemChannels & UpdaterChannels
+export type AllEventChannels = LLMStreamEvents & WindowEvents & UpdaterEvents
 
 /** 提取 invoke 频道名 */
 export type InvokeChannel = keyof AllInvokeChannels

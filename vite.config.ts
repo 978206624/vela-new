@@ -24,7 +24,9 @@ export default defineConfig({
         build: {
           // 强制输出 CommonJS，保证 better-sqlite3 等 native 模块能正常加载
           rollupOptions: {
-            external: ['better-sqlite3', '@lancedb/lancedb'],
+            // electron-updater 含动态 require，须 external 化、运行时从 node_modules 加载，
+            // 否则 rollup 打包其 CJS 依赖会出问题
+            external: ['better-sqlite3', '@lancedb/lancedb', 'electron-updater'],
             output: {
               format: 'cjs'
             }

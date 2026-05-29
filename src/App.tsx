@@ -20,7 +20,9 @@ import NewProjectDialog from './components/dialogs/NewProjectDialog'
 import ImportNovelDialog from './components/dialogs/ImportNovelDialog'
 import ChapterCreationDialog from './components/dialogs/ChapterCreationDialog'
 import ExportDialog from './components/dialogs/ExportDialog'
+import UpdateDialog from './components/dialogs/UpdateDialog'
 import SettingsModal from './components/settings/SettingsModal'
+import { useUpdateStore } from './stores/update-store'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { actionToast } from './components/ui/ActionToast'
 import { globalEventBus } from './shared/event-bus'
@@ -54,6 +56,8 @@ export default function App() {
     initTheme()
     initLLM()
     loadRecentProjects()
+    // 初始化在线更新：订阅 updater:* 事件（主进程在打包环境下已做启动静默检查）
+    useUpdateStore.getState().init()
     // 初始化 MCP Store
     useMCPStore.getState().init().catch(e => console.warn('[MCP] 初始化失败:', e))
     // 加载全局自定义提示词覆盖（~/.vela/prompts/）——否则 customPromptsLoaded 恒 false，
@@ -214,6 +218,9 @@ export default function App() {
         open={settingsOpen}
         onClose={closeSettings}
       />
+
+      {/* 在线更新提示（自管显隐，由 update-store 状态驱动） */}
+      <UpdateDialog />
 
     </div>
   )

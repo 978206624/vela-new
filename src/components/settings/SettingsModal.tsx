@@ -2,9 +2,10 @@ import { useState, useEffect, useRef } from 'react'
 import {
   X, Plus, Trash2, Check, Save, Globe, Cpu, Database,
   Type, Settings2, Zap, Eye, EyeOff, ChevronDown, MessageSquare,
-  Info,
+  Info, RefreshCw,
 } from 'lucide-react'
 import PromptSettings from './PromptSettings'
+import { useUpdateStore } from '../../stores/update-store'
 import { useLLMStore } from '../../stores/llm-store'
 import { useThemeStore, FONT_OPTIONS, type FontId } from '../../stores/theme-store'
 import type { ModelProfile } from '../../shared/ipc-channels'
@@ -1069,6 +1070,40 @@ function EditorSection() {
 
 // ==================== 关于区 ====================
 
+/** 手动检查更新行（启动检查在主进程自动进行，这里是手动入口，对应 Product-Spec §4.9） */
+function CheckUpdateRow() {
+  const status = useUpdateStore((s) => s.status)
+  const version = useUpdateStore((s) => s.version)
+  const checkForUpdate = useUpdateStore((s) => s.checkForUpdate)
+
+  const checking = status === 'checking'
+
+  // 反馈文案：有新版/下载流程由 UpdateDialog 接管，这里只回显轻量结果
+  let hint: { text: string; color: string } | null = null
+  if (status === 'not-available') hint = { text: '已是最新版本', color: 'var(--color-text-muted)' }
+  else if (status === 'available' || status === 'downloading' || status === 'downloaded') hint = { text: `发现新版本 v${version}`, color: 'var(--color-accent)' }
+  else if (status === 'error') hint = { text: '检查失败，请稍后重试', color: 'var(--color-error)' }
+  else if (status === 'portable-manual') hint = { text: '便携版请前往 Releases 手动下载', color: 'var(--color-text-muted)' }
+
+  return (
+    <div
+      className="flex items-center justify-between p-4 rounded-xl"
+      style={{ backgroundColor: 'var(--color-sidebar)', border: '1px solid var(--color-border)' }}
+    >
+      <div className="min-w-0">
+        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>软件更新</p>
+        <p className="text-xs mt-0.5" style={{ color: hint ? hint.color : 'var(--color-text-muted)' }}>
+          {hint ? hint.text : '通过 GitHub Releases 检查并下载新版本'}
+        </p>
+      </div>
+      <Button variant="outline" onClick={() => checkForUpdate(true)} disabled={checking}>
+        <RefreshCw size={13} className={checking ? 'animate-spin' : undefined} />
+        {checking ? '检查中…' : '检查更新'}
+      </Button>
+    </div>
+  )
+}
+
 function AboutSection() {
   return (
     <div className="space-y-6 max-w-[600px] p-2">
@@ -1077,6 +1112,8 @@ function AboutSection() {
         <p className="text-sm opacity-80" style={{ color: 'var(--color-text)' }}>v{__APP_VERSION__}</p>
         <p className="text-xs mt-2" style={{ color: 'var(--color-text-muted)' }}>GPL-3.0 二次开发版，基于上游 Vela</p>
       </div>
+
+      <CheckUpdateRow />
 
       <div className="space-y-4 pt-2">
         <h3 className="text-sm font-semibold pb-2" style={{ borderBottom: '1px solid var(--color-border)', color: 'var(--color-text)' }}>上游归属</h3>
