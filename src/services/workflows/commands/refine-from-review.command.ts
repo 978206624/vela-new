@@ -10,6 +10,8 @@ export interface RefineFromReviewParams {
   draftContent: string
   reviewReport: string
   reviewFileName?: string
+  /** 来源审稿报告的 review DB id；写入修订稿 review_source_id 供「已修」溯源（缺失则不写） */
+  reviewSourceId?: number
   chapterNumber: number
   userRefinePrompt?: string
 }
@@ -60,6 +62,7 @@ export class RefineFromReviewCommand extends BaseWorkflowCommand<string> {
       content: cleanRefined,
       wordCount: cleanRefined.length,
       userPrompt: this.params.userRefinePrompt,
+      reviewSourceId: this.params.reviewSourceId,
     }) as { success: boolean; id: number }
 
     const { useEditorStore } = await import('../../../stores/editor-store')

@@ -22,6 +22,8 @@ export interface EditorTab {
   chapterDir?: string
   /** 审稿报告存放路径 */
   reportPath?: string
+  /** 审稿报告对应的 review DB id（用于「已修」判定与修稿溯源；旧 tab 可能缺失） */
+  reviewId?: number
 }
 
 interface EditorState {

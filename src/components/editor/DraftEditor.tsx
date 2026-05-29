@@ -304,6 +304,7 @@ export default function DraftEditor({ filePath, content }: Props) {
       reviewReport: reportContent,
       chapterNumber: meta.chapterNumber,
       chapterDir,
+      reviewId: latest.id,
     })
   }
 

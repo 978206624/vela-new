@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { AlertTriangle, CheckCircle, Info, Sparkles, HelpCircle, Quote } from 'lucide-react'
+import { useState, useEffect, useMemo } from 'react'
+import { AlertTriangle, CheckCircle, Info, Sparkles, HelpCircle, Quote, BadgeCheck } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { Button } from '../ui/Button'
 import {
@@ -35,6 +35,8 @@ interface ReviewReportProps {
   chapterNumber?: number
   /** 章节目录 */
   chapterDir?: string
+  /** 审稿报告对应的 review DB id（用于「已修」判定与修稿溯源；旧 tab 可能缺失，缺失则降级不标记） */
+  reviewId?: number
 }
 
 // ===== 解析器 =====
@@ -179,8 +181,8 @@ const SEVERITY_META: Record<ReviewIssue['severity'], {
 }
 
 /** 审稿报告查看器 */
-export default function ReviewReport({ reportText, draftPath, chapterNumber, chapterDir }: ReviewReportProps) {
-  const { issues, summary } = parseReport(reportText)
+export default function ReviewReport({ reportText, draftPath, chapterNumber, chapterDir, reviewId }: ReviewReportProps) {
+  const { issues, summary } = useMemo(() => parseReport(reportText), [reportText])
   // chapterDir 兜底：部分入口（如审稿工作流）可能只传了 chapterNumber 而漏传 chapterDir，
   // 此时由 chapterNumber 派生，保证「一键修稿」入口可用。
   const effectiveChapterDir = chapterDir ?? (chapterNumber != null ? `vela://draft/ch${chapterNumber}` : undefined)
@@ -188,14 +190,50 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
   const [userRefinePrompt, setUserRefinePrompt] = useState('')
   const [processing, setProcessing] = useState(false)
   const [showLegend, setShowLegend] = useState(false)
+  // 「已修」状态：该审稿报告是否存在已采纳合并、且溯源指向它的修订稿。
+  // 仅当持有精确 reviewId 时判定（无 reviewId 的旧 tab 一律降级为不标记）。
+  // 依赖组件重挂载重查（EditorArea 仅渲染 active tab，切回报告必 remount）。
+  const [resolved, setResolved] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    if (reviewId == null || !draftPath) { setResolved(false); return }
+    void (async () => {
+      try {
+        const { parseDraftMeta } = await import('../../services/workflows/chapter-workflow')
+        const meta = await parseDraftMeta(draftPath)
+        if (!meta) { if (!cancelled) setResolved(false); return }
+        const { ipc } = await import('../../services/ipc-client')
+        const revisions = await ipc.invoke('db:revision-list', meta.id)
+        const done = revisions.some(r => r.status === 'merged' && r.reviewSourceId === reviewId)
+        if (!cancelled) setResolved(done)
+      } catch {
+        if (!cancelled) setResolved(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [draftPath, reviewId])
 
-  // 按分类分组
-  const categories = new Map<string, ReviewIssue[]>()
-  for (const issue of issues) {
+  // 逐条勾选要修复的问题（以 issues 全局下标为 key）。默认勾选「严重」「建议」，不勾「通过」。
+  // 报告内容变化（reportText→issues 重算）时重置为默认；勾选态不跨 tab 持久化（方案甲）。
+  const [selectedIdx, setSelectedIdx] = useState<Set<number>>(new Set())
+  useEffect(() => {
+    const def = new Set<number>()
+    issues.forEach((it, i) => { if (it.severity === 'error' || it.severity === 'warning') def.add(i) })
+    setSelectedIdx(def)
+  }, [issues])
+  const toggleIssue = (idx: number) => setSelectedIdx(prev => {
+    const next = new Set(prev)
+    if (next.has(idx)) next.delete(idx); else next.add(idx)
+    return next
+  })
+
+  // 按分类分组（保留每条问题的全局下标，供勾选与精简报告引用）
+  const categories = new Map<string, { issue: ReviewIssue; idx: number }[]>()
+  issues.forEach((issue, idx) => {
     const list = categories.get(issue.category) || []
-    list.push(issue)
+    list.push({ issue, idx })
     categories.set(issue.category, list)
-  }
+  })
 
   // 统计
   const errorCount = issues.filter((i) => i.severity === 'error').length
@@ -216,6 +254,14 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
 
       const draftContent = await readDraftBody(draftPath)
       if (!draftContent) return
+
+      // 构造精简报告：仅含被勾选的问题项，并强制覆写 summary——
+      // 否则原 summary 里提到的未勾选问题会被模板一起喂给 LLM 导致越界修改。
+      const selectedItems = issues
+        .filter((_, i) => selectedIdx.has(i))
+        .map(it => ({ category: it.category, severity: it.severity, description: it.description, ...(it.quote ? { quote: it.quote } : {}) }))
+      if (selectedItems.length === 0) return
+      const slimReport = JSON.stringify({ items: selectedItems, summary: '已精简，仅含用户勾选的重点项' }, null, 2)
 
       // 提取版本信息：DB 化后 draftPath 是 vela://draft/{id}，旧的 draft_v{n}.md 正则已失效，
       // 改用 parseDraftMeta 从 id 反查真实版本号，避免 baseVersion 永远兜底成 1。
@@ -238,8 +284,10 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
         chapterTitle,
         draftPath,
         draftContent,
-        reviewReport: reportText,
+        reviewReport: slimReport,
         reviewFileName,
+        // 写入修订稿 review_source_id 供「已修」溯源；reviewId 缺失（旧 tab）则传 undefined 不写
+        reviewSourceId: reviewId,
         userRefinePrompt: userRefinePrompt.trim() || undefined,
       }), false)
     } finally {
@@ -262,6 +310,15 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
         {/* 统计栏 */}
         <div className="flex items-center gap-4 mb-4 pb-3 border-b border-[var(--color-border)]">
           <h3 className="text-base font-bold text-[var(--color-text)]"> 审稿报告</h3>
+          {resolved && reviewId != null && (
+            <span
+              className="flex items-center gap-1 px-2 py-0.5 rounded text-xs cursor-default"
+              style={{ backgroundColor: 'var(--color-badge-bg)', color: 'var(--color-badge-text)' }}
+              title="已根据本报告修稿并采纳合并"
+            >
+              <BadgeCheck size={12} /> 已修
+            </span>
+          )}
           <div className="flex items-center gap-3 text-xs ml-auto">
             {errorCount > 0 && (
               <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-red-500/20 text-red-400">
@@ -347,20 +404,33 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
                   {category}
                 </h4>
                 <div className="space-y-1.5 pl-1">
-                  {items.map((item, i) => {
-                    const meta = SEVERITY_META[item.severity]
+                  {items.map(({ issue, idx }) => {
+                    const meta = SEVERITY_META[issue.severity]
+                    const selectable = issue.severity !== 'pass'
                     return (
                       <div
-                        key={i}
+                        key={idx}
                         className={cn(
                           'px-3 py-2 rounded-md border text-xs leading-relaxed',
                           meta.borderClass, meta.bgClass
                         )}
                       >
                         <div className="flex items-start gap-2">
-                          <SeverityIcon severity={item.severity} />
+                          {selectable ? (
+                            <input
+                              type="checkbox"
+                              checked={selectedIdx.has(idx)}
+                              onChange={() => toggleIssue(idx)}
+                              className="mt-0.5 w-3.5 h-3.5 flex-shrink-0 cursor-pointer accent-[var(--color-accent)]"
+                              title="勾选后将纳入本次修稿范围"
+                            />
+                          ) : (
+                            // pass 项不可勾，补等宽占位让严重级别图标与上方各行垂直对齐
+                            <span className="w-3.5 flex-shrink-0" aria-hidden="true" />
+                          )}
+                          <SeverityIcon severity={issue.severity} />
                           <div className="flex-1 min-w-0">
-                            <span className="text-[var(--color-text-secondary)]">{item.description}</span>
+                            <span className="text-[var(--color-text-secondary)]">{issue.description}</span>
                             <span
                               className={cn('ml-2 text-[0.65rem] opacity-70', meta.colorClass)}
                             >
@@ -369,7 +439,7 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
                           </div>
                         </div>
                         {/* 引用原文（如有） */}
-                        {item.quote && (
+                        {issue.quote && (
                           <div
                             className="mt-1.5 ml-5 pl-2 text-[0.7rem] italic"
                             style={{
@@ -378,7 +448,7 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
                             }}
                           >
                             <Quote size={10} className="inline mr-1 opacity-60" />
-                            {item.quote}
+                            {issue.quote}
                           </div>
                         )}
                       </div>
@@ -404,16 +474,18 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
         {canRefine && (
           <div className="mt-6 pt-6 border-t border-[var(--color-border)] flex flex-col items-center">
             <Button
-              variant="ai"
+              variant={resolved && reviewId != null ? 'outline' : 'ai'}
               className="px-8"
               onClick={() => { setUserRefinePrompt(''); setShowRefineDialog(true) }}
               disabled={processing}
             >
               <Sparkles size={14} className="mr-1" />
-              AI 一键修稿
+              {resolved && reviewId != null ? '再次修稿' : 'AI 一键修稿'}
             </Button>
             <p className="text-[0.7rem] text-center mt-3" style={{ color: 'var(--color-text-muted)' }}>
-              AI 将根据上方审稿报告中发现的问题精准修复草稿，并为您生成对比视图
+              {resolved && reviewId != null
+                ? '已根据本报告修稿并采纳；如需再次基于本报告修复可重新发起'
+                : 'AI 将根据上方审稿报告中发现的问题精准修复草稿，并为您生成对比视图'}
             </p>
           </div>
         )}
@@ -433,8 +505,8 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
           </DialogHeader>
           <div className="px-5 py-2 text-sm space-y-1.5" style={{ color: 'var(--color-text-secondary)' }}>
             <div className="font-medium text-[var(--color-text)]">本次【审稿修稿】范围：</div>
-            <div>1. 重点修复审稿报告中指出的「严重问题」与「改进建议」。</div>
-            <div>2. 可在下方指定的额外修稿要求。</div>
+            <div>1. 仅修复你在报告中勾选的 {selectedIdx.size} 条问题，未勾选的保持不动。</div>
+            <div>2. 可在下方指定额外修稿要求。</div>
           </div>
           <div className="px-5 pb-2">
             <label className="text-xs font-medium block mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
@@ -457,8 +529,8 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setShowRefineDialog(false)}>取消</Button>
-            <Button variant="ai" onClick={doRefineFromReview}>
-              确认修稿
+            <Button variant="ai" onClick={doRefineFromReview} disabled={selectedIdx.size === 0}>
+              {selectedIdx.size === 0 ? '请先勾选问题' : `确认修稿（${selectedIdx.size} 条）`}
             </Button>
           </DialogFooter>
         </DialogContent>

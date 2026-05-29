@@ -83,7 +83,7 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       parsedResult = { summary: '解析失败', items: [] }
     }
 
-    await ipc.invoke('db:review-create', {
+    const reviewCreateRes = await ipc.invoke('db:review-create', {
       baseDraftId: baseDraft.id,
       reviewIndex: revIndex,
       content: JSON.stringify(parsedResult, null, 2),
@@ -107,6 +107,8 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       // 补传 chapterDir：ReviewReport 的「一键修稿」入口依赖它（canRefine），
       // 缺失会导致刚生成的审稿报告里入口不显示。
       chapterDir: `vela://draft/ch${this.params.chapterNumber}`,
+      // 带上 review DB id：供 ReviewReport 判定「已修」与修稿时写 review_source_id 溯源
+      reviewId: reviewCreateRes.id,
     })
 
     callbacks.log(`✅ 审查完成，已生成审稿报告 r${revIndex}`)

@@ -636,10 +636,12 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
         )}
         {activeTab?.type === 'review-report' && activeTab.content && (
           <ReviewReport
+            key={activeTab.id}
             reportText={activeTab.content}
             draftPath={activeTab.filePath}
             chapterNumber={activeTab.chapterNumber}
             chapterDir={activeTab.chapterDir}
+            reviewId={activeTab.reviewId}
           />
         )}
         {/* diff 合并视图 — 统一使用弹出式 Dialog（与 DraftEditor 一致） */}
