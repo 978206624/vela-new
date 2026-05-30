@@ -362,6 +362,7 @@ export interface DatabaseChannels {
   'db:character-save-all': { args: [items: CharacterData[]]; return: { success: boolean; error?: string } }
   'db:character-delete': { args: [name: string]; return: { success: boolean; error?: string } }
   'db:character-update-state': { args: [name: string, state: CharacterStateData]; return: { success: boolean; error?: string } }
+  'db:character-fill-empty-profile': { args: [name: string, patch: Partial<CharacterData>]; return: { success: boolean; applied?: Record<string, string>; error?: string } }
 
   // 4. drafts
   'db:draft-create': { args: [params: { chapterNumber: number; version: number; source: 'write' | 'rewrite'; content: string; wordCount: number }]; return: { success: boolean; id?: number; error?: string } }
@@ -370,6 +371,7 @@ export interface DatabaseChannels {
   'db:draft-get-full': { args: [id: number]; return: DraftFull | null }
   'db:draft-get-latest': { args: [chapterNumber: number]; return: DraftMeta | null }
   'db:draft-get-finalized': { args: [chapterNumber: number]; return: DraftMeta | null }
+  'db:draft-find-chapters-by-name': { args: [name: string, finalizedOnly?: boolean]; return: number[] }
   'db:draft-get-max-finalized-chapter': { args: []; return: number }
   'db:draft-next-version': { args: [chapterNumber: number]; return: number }
   'db:draft-update-status': { args: [id: number, status: string, wordCount?: number]; return: { success: boolean; error?: string } }

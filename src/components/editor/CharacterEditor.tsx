@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Save, Trash2, Users } from 'lucide-react'
+import { Save, Trash2, Users, Sparkles } from 'lucide-react'
 import { useProjectStore } from '../../stores/project-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 import { confirm } from '../ui/Confirm'
@@ -10,6 +10,8 @@ import {
   type CharacterCurrentState,
 } from '../../stores/character-store'
 import RelationshipGraph from './RelationshipGraph'
+import CharacterProfilePreviewDialog, { type ProfileProposal } from './CharacterProfilePreviewDialog'
+import { CompleteCharacterProfileCommand, PROFILE_FIELDS } from '../../services/workflows/commands/complete-character-profile.command'
 import { EmptyState as BaseEmptyState } from '../ui/EmptyState'
 import { Button } from '../ui/Button'
 import { Input } from '../ui/Input'
@@ -31,10 +33,28 @@ export default function CharacterEditor() {
   const deleteCharacter = useCharacterStore(s => s.deleteCharacter)
   const saveAll = useCharacterStore(s => s.saveAll)
   const [viewMode, setViewMode] = useState<'edit' | 'state'>('edit')
+  const [inferring, setInferring] = useState(false)
+  const [previewProposals, setPreviewProposals] = useState<ProfileProposal[] | null>(null)
 
   // 数据由 ProjectService 统一加载，组件只消费 store 数据
 
   const selectedCard = characters.find((c) => c.name === selectedName) || null
+
+  // 是否存在空的静态人设字段（决定「AI 补全」按钮是否可用）
+  const hasEmptyStatic = !!selectedCard && PROFILE_FIELDS.some(f => ((selectedCard[f] as string) ?? '').trim() === '')
+
+  const handleAIComplete = async () => {
+    if (!selectedCard) return
+    setInferring(true)
+    try {
+      const result = await new CompleteCharacterProfileCommand().infer(selectedCard.name)
+      setPreviewProposals([{ characterName: selectedCard.name, profile: result.profile, evidence: result.evidence }])
+    } catch (e) {
+      addLog('error', `AI 补全人设失败：${String(e)}`)
+    } finally {
+      setInferring(false)
+    }
+  }
 
   const handleDelete = async () => {
     if (!selectedCard || !currentProject) return
@@ -84,6 +104,14 @@ export default function CharacterEditor() {
                   📋 当前状态
                 </Button>
               )}
+              <Button
+                variant="outline" size="sm"
+                onClick={handleAIComplete}
+                disabled={inferring || !hasEmptyStatic}
+                title={hasEmptyStatic ? 'AI 从出场正文补全空缺人设' : '静态人设已完整，无空字段'}
+              >
+                <Sparkles size={12} /> {inferring ? '补全中…' : 'AI 补全'}
+              </Button>
               <Button variant="destructive" size="sm" onClick={handleDelete}>
                 <Trash2 size={12} /> 删除
               </Button>
@@ -181,6 +209,14 @@ export default function CharacterEditor() {
           </div>
         )}
       </div>
+
+      {/* AI 补全人设 — 预览确认弹窗 */}
+      {previewProposals && (
+        <CharacterProfilePreviewDialog
+          proposals={previewProposals}
+          onClose={() => setPreviewProposals(null)}
+        />
+      )}
     </div>
   )
 }

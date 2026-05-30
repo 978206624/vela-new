@@ -135,6 +135,35 @@ export class DraftRepository {
         return row ? rowToMeta(row) : null
     }
 
+    /**
+     * 找出正文包含指定名字的章节号（用于「AI 补全人设」定位角色出场章节）。
+     * 用 `instr(body, name) > 0` 精确子串匹配（不用 LIKE——名字可能含 `%`/`_` 通配符）。
+     * - finalizedOnly=true：只查定稿正文（默认）。
+     * - finalizedOnly=false：只查每章 latest draft 的正文（导入旧作未定稿时兜底，排除旧版/archived 误纳）。
+     * name 为空直接返回 []（避免 instr(body,'') 命中所有正文）。
+     */
+    static findChaptersByName(name: string, finalizedOnly = true): number[] {
+        const db = getProjectDb()
+        if (!db) return []
+        const trimmed = name.trim()
+        if (!trimmed) return []
+
+        const sql = finalizedOnly
+            ? `SELECT DISTINCT d.chapter_number AS ch
+               FROM drafts d JOIN contents c ON d.content_id = c.id
+               WHERE d.status = 'finalized' AND instr(c.body, @name) > 0
+               ORDER BY ch ASC`
+            : `SELECT d.chapter_number AS ch
+               FROM drafts d JOIN contents c ON d.content_id = c.id
+               WHERE d.version = (
+                 SELECT MAX(d2.version) FROM drafts d2 WHERE d2.chapter_number = d.chapter_number
+               ) AND instr(c.body, @name) > 0
+               ORDER BY ch ASC`
+
+        const rows = db.prepare(sql).all({ name: trimmed }) as Array<{ ch: number }>
+        return rows.map(r => r.ch)
+    }
+
     /** 获取下一个可用版本号 */
     static getNextVersion(chapterNumber: number): number {
         const db = getProjectDb()

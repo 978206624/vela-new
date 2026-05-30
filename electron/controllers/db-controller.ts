@@ -120,6 +120,16 @@ export function registerDatabaseController() {
     }
   })
 
+  // 仅填充为空的静态人设字段（AI 补全人设），返回实际填入字段供前端 merge
+  ipcMain.handle('db:character-fill-empty-profile', async (_event, name: string, patch: Partial<CharacterData>) => {
+    try {
+      const { applied } = CharacterRepository.fillEmptyStaticProfileFields(name, patch)
+      return { success: true, applied }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
   // ============================================================
   // 4. drafts — 草稿
   // ============================================================
@@ -156,6 +166,10 @@ export function registerDatabaseController() {
 
   ipcMain.handle('db:draft-get-finalized', async (_event, chapterNumber: number) => {
     return DraftRepository.getFinalizedByChapter(chapterNumber)
+  })
+
+  ipcMain.handle('db:draft-find-chapters-by-name', async (_event, name: string, finalizedOnly?: boolean) => {
+    return DraftRepository.findChaptersByName(name, finalizedOnly !== false)
   })
 
   ipcMain.handle('db:draft-get-max-finalized-chapter', async () => {
