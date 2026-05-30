@@ -205,6 +205,9 @@ export default function CodeMirrorEditor({
         {
           key: 'Tab',
           run: (target) => {
+            // 只读态吞掉 Tab：实时读 EditorState.readOnly（dispatch 时取值），
+            // 不依赖 useMemo 闭包里的 editable，避免 DraftEditor 运行时切只读时闭包陈旧漏拦
+            if (target.state.readOnly) return true
             // 插入两个 em 空格（U+2003）= 2em = 标准中文首行缩进两字符宽
             // 使用 \u2003 而非 \u3000（全角空格），因为 em 空格在任何 Unicode 字体下
             // 都精确等于 1em，不依赖 CJK 字体加载
@@ -244,7 +247,8 @@ export default function CodeMirrorEditor({
       exts.push(markdown({ base: markdownLanguage, codeLanguages: languages }))
     }
     return exts
-  }, [mode])
+    // editable 入依赖：editable 变化时重建扩展（Tab guard 双保险，主防线仍是 handler 实时读 readOnly）
+  }, [mode, editable])
 
   // AI 菜单处理（流式调用，实时显示生成内容）
   const handleAIAction = async (prompt: string, _actionKey: string) => {
@@ -348,6 +352,7 @@ export default function CodeMirrorEditor({
             className="h-full"
             theme={cmTheme}
             extensions={extensions}
+            editable={editable}
             readOnly={!editable}
             basicSetup={cmBasicSetup}
             onUpdate={handleUpdate}

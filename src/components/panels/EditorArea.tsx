@@ -1,4 +1,4 @@
-import { X, FileText, Settings, Users, ArrowLeftRight, MoreHorizontal, BookOpen, History, ClipboardCheck, Globe, Save, ChevronLeft, ChevronRight, PenTool } from 'lucide-react'
+import { X, FileText, Settings, Users, ArrowLeftRight, MoreHorizontal, BookOpen, History, ClipboardCheck, Globe, ChevronLeft, ChevronRight, PenTool } from 'lucide-react'
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { ContextMenu, type ContextMenuEntry } from '../ui/ContextMenu'
 import {
@@ -25,30 +25,48 @@ import { useLayoutStore } from '../../stores/layout-store'
 import { ipc } from '../../services/ipc-client'
 import { toast } from '../ui/Toast'
 
-import { clearChapterTitleCache } from './sidebar/ManuscriptGroup'
 import '../editor/novel-editor.css'
 
-// ─── 正文章节编辑器包装层（含字数信息栏） ─────────────────────────────────────────────
+// ─── 正文章节编辑器包装层（定稿正文 · 只读 + 引导回草稿箱修改） ─────────────────────────
+// Phase 15：正文 manuscript 视图一律只读，不再向物理文件写入（杜绝正文与 DB/知识库/角色卡分叉）。
+// 用户要改正文 → 点「去草稿箱修改」跳到对应定稿草稿（DraftEditor，自带「修改此定稿」派生新版本）。
 function ProseEditorWrapper({
   tab,
-  onSave,
 }: {
   tab: EditorTab
-  onSave: (text: string) => Promise<void>
 }) {
   const [wordCount, setWordCount] = useState(0)
-  const [saving, setSaving] = useState(false)
+  const [jumpHover, setJumpHover] = useState(false)
   const fileName = tab.name
-  // 追踪当前编辑器内容，供保存按钮使用（不触发重渲染）
-  const currentContentRef = useRef(tab.content ?? '')
 
-  const handleSave = async (text: string) => {
-    setSaving(true)
-    try {
-      await onSave(text)
-    } finally {
-      setSaving(false)
+  // 跳转到该定稿正文对应的定稿草稿。
+  // 核实：vela://manuscript/{id} 的 id == 该章 finalized 草稿的 draft id（ProjectTree 构造 + readVelaContent 同源解析），
+  // 故直接把 manuscript/{id} 换成 draft/{id} openFile，命中 EditorArea 的 draft 分支渲染 DraftEditor。
+  const goToDraft = async () => {
+    const id = tab.filePath?.replace('vela://manuscript/', '')
+    if (!id || !/^\d+$/.test(id)) {
+      toast.error('无法定位定稿草稿')
+      return
     }
+    const draftId = Number(id)
+    // 校验草稿真实存在且仍为定稿：manuscript id 可能 stale（指向已删除/非定稿草稿），
+    // 若不校验直接打开 vela://draft/{id}，DraftEditor meta 缺失会 fallback 成「可编辑空草稿」，
+    // 等于只读逃生口从异常路径复活（Codex 终审 Finding 1）。直接取 full 复用 content，省一次 IPC。
+    const full = await ipc.invoke('db:draft-get-full', draftId)
+    if (!full || full.status !== 'finalized') {
+      toast.error('定稿草稿不存在或已失效')
+      return
+    }
+    const draftPath = `vela://draft/${draftId}`
+    useEditorStore.getState().openFile({
+      id: draftPath,
+      name: tab.name,
+      type: 'chapter',
+      filePath: draftPath,
+      content: full.content,
+    })
+    // 若该 draft tab 已打开，openFile 仅激活不刷新 content，这里静默同步最新正文（Codex 终审 Finding 2）
+    useEditorStore.getState().syncTabContent(draftPath, full.content)
   }
 
   return (
@@ -61,57 +79,56 @@ function ProseEditorWrapper({
           backgroundColor: 'var(--color-editor-bg)',
         }}
       >
-        {/* 左侧：文件名 */}
-        <span className="text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
-          {fileName}
-        </span>
+        {/* 左侧：文件名 + 只读标识 */}
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
+            {fileName}
+          </span>
+          <span
+            className="text-xs px-1.5 py-0.5 rounded flex-shrink-0"
+            style={{ color: 'var(--color-text-muted)', backgroundColor: 'var(--color-hover)' }}
+          >
+            定稿正文 · 只读
+          </span>
+        </div>
 
-        {/* 右侧：字数 + dirty 指示灯 + 保存按钮 */}
-        <div className="flex items-center gap-1.5 flex-shrink-0">
+        {/* 右侧：字数 + 去草稿箱修改 */}
+        <div className="flex items-center gap-2 flex-shrink-0">
           {wordCount > 0 && (
             <span className="text-xs tabular-nums" style={{ color: 'var(--color-text-muted)' }}>
               {wordCount.toLocaleString()} 字
             </span>
           )}
-          {/* 未保存圆点指示灯 */}
-          {tab.dirty && (
-            <span
-              className="w-1.5 h-1.5 rounded-full"
-              style={{ backgroundColor: 'var(--color-warning)' }}
-              title="有未保存的修改"
-            />
-          )}
-          {/* 保存按钮（有改动时显示） */}
-          {tab.dirty && (
-            <button
-              className="icon-btn"
-              style={{ width: 24, height: 22 }}
-              onClick={() => handleSave(currentContentRef.current)}
-              disabled={saving}
-              title="保存（⌘S）"
-            >
-              <Save size={13} strokeWidth={1.5} />
-            </button>
-          )}
+          <button
+            className="flex items-center gap-1 text-xs px-2 h-6 rounded transition-colors"
+            style={{
+              color: 'var(--color-accent)',
+              border: '1px solid var(--color-border)',
+              backgroundColor: jumpHover ? 'var(--color-hover)' : 'transparent',
+            }}
+            onMouseEnter={() => setJumpHover(true)}
+            onMouseLeave={() => setJumpHover(false)}
+            onClick={goToDraft}
+            title="定稿正文不可直接修改，点此回草稿箱「修改此定稿」派生新版本"
+          >
+            <PenTool size={12} strokeWidth={1.5} />
+            去草稿箱修改
+          </button>
         </div>
       </div>
 
-      {/* 编辑器主体 */}
-      <div className="flex-1 overflow-hidden">
+      {/* 编辑器主体（只读，不回写物理文件）
+          极浅面差：CodeMirror 主题背景为 transparent，此处 bg-elevated 透出，
+          与可编辑草稿（editor-bg）形成微弱区分，强化「只读」视觉暗示 */}
+      <div className="flex-1 overflow-hidden" style={{ backgroundColor: 'var(--color-bg-elevated)' }}>
         <CodeMirrorEditor
           key={tab.id}
           mode="prose"
           content={tab.content ?? ''}
           filePath={tab.filePath}
+          editable={false}
           hideStatusBar
           onCharCountChange={setWordCount}
-          onChange={(text) => {
-            // 同步 ref，供保存按钮使用
-            currentContentRef.current = text
-            // 标记 tab.dirty
-            useEditorStore.getState().updateTabContent(tab.id, text)
-          }}
-          onSave={(text) => handleSave(text)}
         />
       </div>
     </div>
@@ -587,19 +604,11 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
           />
         )}
         {activeTab?.type === 'chapter' && !activeTab.filePath?.startsWith('vela://draft/') && (
-          // 【DB 迁移备注】：终稿目前作为物理文件保存在 manuscript/ 目录是合理的（用于外部阅读器或最终打包编译导出）
-          // 终稿文件（manuscript/）：用 ProseEditorWrapper（含字数信息栏）
+          // 【DB 迁移备注】：终稿物理文件保存在 manuscript/ 目录（供外部阅读器或最终打包编译导出）
+          // Phase 15：终稿（manuscript/）视图一律只读，不再回写物理文件；改正文走「去草稿箱修改」跳转
           <ProseEditorWrapper
             key={activeTab.id}
             tab={activeTab}
-            onSave={async (text) => {
-              if (!activeTab.filePath) return
-              await ipc.invoke('fs:write-file', activeTab.filePath, text)
-              // 清除 dirty 标记 + 同步内容 + 刷新章节名缓存
-              useEditorStore.getState().markTabSaved(activeTab.id)
-              useEditorStore.getState().syncTabContent(activeTab.id, text)
-              clearChapterTitleCache(activeTab.filePath)
-            }}
           />
         )}
         {activeTab?.type === 'config' && (
