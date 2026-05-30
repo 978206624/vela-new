@@ -4,6 +4,7 @@ import { useLLMStore } from '../../../stores/llm-store'
 import { getPromptTemplate } from '../../prompt-templates'
 import { PostProcessPromptBuilder } from '../../prompts/prompt-builder'
 import { ipc } from '../../ipc-client'
+import { coerceRole } from '../../../stores/character-store'
 
 import {
   runPostProcessPipeline,
@@ -193,7 +194,7 @@ export function buildFinalizePostProcessSteps(
             const cs = newChar.currentState || {}
             await ipc.invoke('db:character-upsert', {
               name: newChar.name,
-              role: newChar.role || 'supporting',
+              role: coerceRole(newChar.role),
               gender: '', age: '', appearance: '', personality: '', background: '',
               abilities: '', motivation: '', relationships: '', arc: '', notes: '',
               currentState: {

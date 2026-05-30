@@ -23,6 +23,29 @@ export const ROLE_LABELS: Record<CharacterCard['role'], string> = {
   minor: '📌 龙套',
 }
 
+/** 角色定位的合法枚举值 */
+const VALID_ROLES = ['protagonist', 'antagonist', 'supporting', 'minor'] as const
+/** 常见中文/变体 → 枚举（AI 写 role 时可能吐这些） */
+const ROLE_SYNONYMS: Record<string, CharacterCard['role']> = {
+  主角: 'protagonist', 主人公: 'protagonist', 男主: 'protagonist', 女主: 'protagonist', 男主角: 'protagonist', 女主角: 'protagonist', 主角团: 'protagonist',
+  反派: 'antagonist', 反一: 'antagonist', 大反派: 'antagonist', boss: 'antagonist',
+  配角: 'supporting', 重要配角: 'supporting',
+  龙套: 'minor', 路人: 'minor', 群演: 'minor', 次要: 'minor', 次要角色: 'minor',
+}
+
+/**
+ * 把 AI 写入的 role 归一到合法枚举，杜绝列表外值在「定位」下拉里冒出幻影选项。
+ * 认得的枚举/中文/变体映射过去，认不得一律默认 supporting。
+ */
+export function coerceRole(raw: unknown): CharacterCard['role'] {
+  if (typeof raw !== 'string') return 'supporting'
+  const v = raw.trim()
+  if ((VALID_ROLES as readonly string[]).includes(v)) return v as CharacterCard['role']
+  const lower = v.toLowerCase()
+  if ((VALID_ROLES as readonly string[]).includes(lower)) return lower as CharacterCard['role']
+  return ROLE_SYNONYMS[v] ?? ROLE_SYNONYMS[lower] ?? 'supporting'
+}
+
 interface CharacterState {
   characters: CharacterCard[]
   selectedName: string | null

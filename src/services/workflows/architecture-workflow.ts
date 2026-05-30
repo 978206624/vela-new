@@ -1,6 +1,7 @@
 import type { WorkflowDefinition, WorkflowContext, StepCallbacks } from '../../stores/workflow-store'
 import { useLLMStore } from '../../stores/llm-store'
 import { useProjectStore } from '../../stores/project-store'
+import { coerceRole } from '../../stores/character-store'
 import { getPromptTemplate } from '../prompt-templates'
 import { ipc } from '../ipc-client'
 import type { NovelConfig } from '../../shared/ipc-channels'
@@ -233,13 +234,11 @@ export function createCharacterExtractSteps(_projectPath: string, characterDynam
           if (Array.isArray(candidate)) parsedCards = candidate as Array<Record<string, unknown>>
         }
 
-        // 构建角色卡数据列表
-        const validRoles = ['protagonist', 'antagonist', 'supporting', 'minor']
+        // 构建角色卡数据列表（role 统一经 coerceRole 归一到合法枚举）
         const characterDataList: Array<Record<string, unknown>> = []
         for (const card of parsedCards) {
           if (!card.name) continue
-          const role = validRoles.includes(card.role as string) ? card.role : 'supporting'
-          characterDataList.push({ ...card, role, name: card.name })
+          characterDataList.push({ ...card, role: coerceRole(card.role), name: card.name })
         }
 
         // 批量写入数据库
