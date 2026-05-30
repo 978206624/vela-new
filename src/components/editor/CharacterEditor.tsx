@@ -11,7 +11,7 @@ import {
 } from '../../stores/character-store'
 import RelationshipGraph from './RelationshipGraph'
 import CharacterProfilePreviewDialog, { type ProfileProposal } from './CharacterProfilePreviewDialog'
-import { CompleteCharacterProfileCommand, PROFILE_FIELDS } from '../../services/workflows/commands/complete-character-profile.command'
+import { CompleteCharacterProfileCommand, PROFILE_FIELDS, type InferProfileResult } from '../../services/workflows/commands/complete-character-profile.command'
 import { EmptyState as BaseEmptyState } from '../ui/EmptyState'
 import { Button } from '../ui/Button'
 import { Input } from '../ui/Input'
@@ -26,6 +26,7 @@ import { Select } from '../ui/Select'
 export default function CharacterEditor() {
   const currentProject = useProjectStore(s => s.currentProject)
   const addLog = useWorkflowStore(s => s.addLog)
+  const startWorkflow = useWorkflowStore(s => s.startWorkflow)
   const characters = useCharacterStore(s => s.characters)
   const selectedName = useCharacterStore(s => s.selectedName)
   const saving = useCharacterStore(s => s.saving)
@@ -45,14 +46,33 @@ export default function CharacterEditor() {
 
   const handleAIComplete = async () => {
     if (!selectedCard) return
+    const name = selectedCard.name
     setInferring(true)
+    // 经 workflow-store 跑：流式正文 + 日志显示在 AI 输出面板，和章节生成等操作一致；取消走面板原生。
+    // 结果用 holder 对象经闭包回传（TS 不跨闭包做控制流收窄，故不能用裸 let）。
+    const holder: { value: InferProfileResult | null } = { value: null }
     try {
-      const result = await new CompleteCharacterProfileCommand().infer(selectedCard.name)
-      setPreviewProposals([{ characterName: selectedCard.name, profile: result.profile, evidence: result.evidence }])
+      await startWorkflow({
+        type: 'character_profile',
+        title: `AI 补全人设：${name}`,
+        steps: [{
+          name: `分析「${name}」的出场正文`,
+          description: '从出场正文 + 人物群像反向归纳静态人设',
+          executor: async (_step, context, callbacks) => {
+            const res = await new CompleteCharacterProfileCommand().infer(name, { callbacks, context })
+            holder.value = res
+            const filled = PROFILE_FIELDS.filter(f => (res.profile[f] ?? '').trim() !== '').length
+            callbacks.log(`归纳出 ${filled} 个可补全字段`)
+          },
+        }],
+      })
     } catch (e) {
       addLog('error', `AI 补全人设失败：${String(e)}`)
     } finally {
       setInferring(false)
+    }
+    if (holder.value) {
+      setPreviewProposals([{ characterName: name, profile: holder.value.profile, evidence: holder.value.evidence }])
     }
   }
 
