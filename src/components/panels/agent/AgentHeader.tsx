@@ -56,7 +56,7 @@ export default function AgentHeader() {
         className="flex min-w-0 items-center overflow-hidden text-ellipsis whitespace-nowrap gap-1"
         style={{ color: 'var(--color-text-secondary)', fontSize: '0.75rem', fontWeight: 500 }}
       >
-        AGENT
+        智能体
       </div>
 
       {/* 右侧工具按钮组 */}

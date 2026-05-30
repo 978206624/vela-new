@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Trash2 } from 'lucide-react'
+import { Trash2, Sparkles } from 'lucide-react'
 import { useAgentStore } from '../../../stores/agent-store'
 import { useLayoutStore } from '../../../stores/layout-store'
 import AgentMessage from './AgentMessage'
@@ -32,68 +32,48 @@ export default function AgentConversation() {
 // ===== 空状态视图 =====
 
 function EmptyState() {
-  const { conversations, selectConversation } = useAgentStore()
-  // 取最近 3 条历史会话（不包含当前空会话）。
-  // 用 messageCount 而非 messages.length：懒加载下列表项是 meta 空壳（messages=[]），
-  // 用 messages.length 会把所有历史会话误判为空而过滤掉。
-  const recentConvs = conversations
-    .filter(c => c && c.messageCount > 0)
-    .slice(0, 3)
-
-
-
+  // 参考 TRAE Agent 面板：hero 居中（图标+标题+副标题），输入框钉底，不展示最近对话列表
+  // （历史统一走头部「历史对话」按钮进面板，空状态保持纯净）。
   return (
-    <div className="h-full overflow-y-auto">
-      <div
-        className="px-4"
-        style={{ paddingTop: 'max(22vh, 48px)', paddingBottom: 24 }}
-      >
-        {/* 标题 */}
-        <div className="mb-1 pl-1 text-base font-semibold" style={{ color: 'var(--color-text)' }}>
-          Vela
+    <div className="flex flex-col h-full">
+      {/* 居中 hero 区 */}
+      <div className="flex-1 flex flex-col items-center justify-center px-6 text-center overflow-y-auto">
+        {/* 应用图标方块 */}
+        <div
+          className="flex items-center justify-center mb-5"
+          style={{
+            width: 56,
+            height: 56,
+            borderRadius: 'var(--radius-lg, 12px)',
+            backgroundColor: 'var(--color-accent)',
+            color: '#ffffff',
+          }}
+        >
+          <Sparkles size={26} strokeWidth={2} />
+        </div>
+        {/* 大标题 */}
+        <div className="mb-2 text-xl font-semibold" style={{ color: 'var(--color-text)' }}>
+          与 <span style={{ color: 'var(--color-accent)' }}>Vela</span> 协作
         </div>
         {/* 副标题 */}
-        <div className="mb-3 pl-1 text-xs" style={{ color: 'var(--color-text-muted)' }}>
-          你的 AI 创作助手 — 支持 <code className="px-1 py-0.5 rounded text-[0.68rem]" style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-accent)' }}>/</code> 命令和 <code className="px-1 py-0.5 rounded text-[0.68rem]" style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-accent)' }}>@</code> 引用
+        <div
+          className="text-xs leading-relaxed max-w-[260px]"
+          style={{ color: 'var(--color-text-muted)' }}
+        >
+          你的 AI 创作助手 — 支持{' '}
+          <code className="px-1 py-0.5 rounded text-[0.68rem]" style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-accent)' }}>/</code>{' '}
+          命令与{' '}
+          <code className="px-1 py-0.5 rounded text-[0.68rem]" style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-accent)' }}>@</code>{' '}
+          引用项目上下文
         </div>
+      </div>
 
-        {/* 输入框 */}
+      {/* 底部固定输入区（与对话视图一致） */}
+      <div
+        className="flex-shrink-0 px-3 pb-3 pt-2"
+        style={{ borderTop: '1px solid var(--color-border)' }}
+      >
         <AgentInputBox />
-
-
-
-        {/* 最近会话（如有） */}
-        {recentConvs.length > 0 && (
-          <div className="mt-6">
-            <div className="flex flex-col gap-0">
-              {recentConvs.map(conv => (
-                <RecentConversationItem
-                  key={conv.id}
-                  title={conv.title}
-                  updatedAt={conv.updatedAt}
-                  onClick={() => selectConversation(conv.id)}
-                  onDelete={() => useAgentStore.getState().deleteConversation(conv.id)}
-                />
-              ))}
-            </div>
-            {conversations.filter(c => c.messageCount > 0).length > 3 && (
-              <button
-                onClick={() => useAgentStore.getState().setShowHistory(true)}
-                className="mt-4 text-left text-xs transition-all hover:underline"
-                style={{ color: 'var(--color-text-muted)' }}
-                onMouseEnter={e => (e.currentTarget.style.opacity = '0.8')}
-                onMouseLeave={e => (e.currentTarget.style.opacity = '1')}
-              >
-                查看全部对话
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* 底部提示 */}
-        <div className="pt-8 text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-          AI 生成内容仅供参考，重要信息请自行核实。
-        </div>
       </div>
     </div>
   )

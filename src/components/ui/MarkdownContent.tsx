@@ -1,16 +1,23 @@
 import React, { useRef, useState } from 'react'
 import { Brain, ChevronRight } from 'lucide-react'
+import { tryPrettyJson, highlightJson, tryParseJsonObject } from './jsonHighlight'
+import JsonCard from './JsonCard'
+
+/** JSON 块渲染方式：code=高亮代码块（默认），card=资料卡（工具结果用） */
+type JsonRender = 'code' | 'card'
 
 interface MarkdownContentProps {
   content: string
   streaming?: boolean
+  /** ```json 块的渲染方式，默认 code（高亮代码块）。工具结果传 card 渲染成资料卡。 */
+  jsonRender?: JsonRender
 }
 
-/** 
+/**
  * Markdown 渲染组件（含 <think> 思考过程折叠支持）
  * 用于 Agent 对话、AI 输出面板的正文格式化显示
  */
-export default function MarkdownContent({ content, streaming }: MarkdownContentProps) {
+export default function MarkdownContent({ content, streaming, jsonRender = 'code' }: MarkdownContentProps) {
   // 解析 <think> 标签：将内容拆分为 [thinking?, ...markdownSegments]
   const segments = parseThinkSegments(content)
 
@@ -21,7 +28,7 @@ export default function MarkdownContent({ content, streaming }: MarkdownContentP
           <ThinkingBlock key={`think-${i}`} content={seg.content} streaming={streaming && i === segments.length - 1} />
         ) : (
           <React.Fragment key={`md-${i}`}>
-            {renderLines(seg.content.split('\n'))}
+            {renderLines(seg.content.split('\n'), jsonRender)}
           </React.Fragment>
         )
       )}
@@ -31,7 +38,7 @@ export default function MarkdownContent({ content, streaming }: MarkdownContentP
 }
 
 /** 渲染行列表为 React 元素 */
-function renderLines(lines: string[]): React.ReactNode {
+function renderLines(lines: string[], jsonRender: JsonRender = 'code'): React.ReactNode {
   const elements: React.ReactNode[] = []
   let i = 0
 
@@ -48,7 +55,7 @@ function renderLines(lines: string[]): React.ReactNode {
         i++
       }
       elements.push(
-        <CodeBlock key={i} lang={lang} code={codeLines.join('\n')} />
+        <CodeBlock key={i} lang={lang} code={codeLines.join('\n')} jsonRender={jsonRender} />
       )
       i++ // 跳过结束的 ```
       continue
@@ -203,11 +210,34 @@ function renderInline(text: string): React.ReactNode {
 
 // ===== 代码块组件 =====
 
-function CodeBlock({ lang, code }: { lang: string; code: string }) {
+/** 超过此行数的 JSON 默认折叠 */
+const JSON_COLLAPSE_LINES = 20
+
+function CodeBlock({ lang, code, jsonRender = 'code' }: { lang: string; code: string; jsonRender?: JsonRender }) {
+  // JSON 美化高亮：显式标 json，或未标语言但内容本身是 JSON 对象/数组
+  const langLower = lang.toLowerCase()
+  const maybeJson = langLower === 'json' || langLower === ''
+  const pretty = maybeJson ? tryPrettyJson(code) : null
+  const isJson = pretty !== null
+  const display = pretty ?? code
+  const lineCount = display.split('\n').length
+  const collapsible = isJson && lineCount > JSON_COLLAPSE_LINES
+
+  // 所有 hook 必须在任何条件返回之前无条件调用（hooks 规则）——
+  // 否则流式时同一块从"不可解析"变"可解析"会改变 hook 数量、触发 React 报错。
   const codeRef = useRef<HTMLElement>(null)
+  const [collapsed, setCollapsed] = useState(collapsible)
+
+  // 资料卡模式（工具结果）：JSON 块渲染成键值资料卡，而非代码块（在所有 hook 之后再返回）
+  if (jsonRender === 'card' && maybeJson) {
+    const parsed = tryParseJsonObject(code)
+    if (parsed !== null) {
+      return <JsonCard data={parsed} />
+    }
+  }
 
   const handleCopy = () => {
-    navigator.clipboard.writeText(code).catch(() => {})
+    navigator.clipboard.writeText(display).catch(() => {})
   }
 
   return (
@@ -224,29 +254,44 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
         }}
       >
         <span className="text-[0.7rem] font-mono" style={{ color: 'var(--color-text-muted)' }}>
-          {lang || 'text'}
+          {isJson ? 'json' : (lang || 'text')}
         </span>
-        <button
-          onClick={handleCopy}
-          className="text-[0.7rem] px-2 py-0.5 rounded transition-opacity hover:opacity-100 opacity-60"
-          style={{ color: 'var(--color-text-secondary)' }}
-          onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'var(--color-border)')}
-          onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
-        >
-          复制
-        </button>
+        <div className="flex items-center gap-2">
+          {collapsible && (
+            <button
+              onClick={() => setCollapsed(v => !v)}
+              className="text-[0.7rem] px-2 py-0.5 rounded transition-opacity hover:opacity-100 opacity-60"
+              style={{ color: 'var(--color-text-secondary)' }}
+              onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'var(--color-border)')}
+              onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+            >
+              {collapsed ? `展开 (${lineCount} 行)` : '折叠'}
+            </button>
+          )}
+          <button
+            onClick={handleCopy}
+            className="text-[0.7rem] px-2 py-0.5 rounded transition-opacity hover:opacity-100 opacity-60"
+            style={{ color: 'var(--color-text-secondary)' }}
+            onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'var(--color-border)')}
+            onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+          >
+            复制
+          </button>
+        </div>
       </div>
       {/* 代码内容 */}
-      <pre
-        className="p-3 text-xs leading-relaxed font-mono whitespace-pre-wrap break-all"
-        style={{
-          backgroundColor: 'var(--color-editor-bg)',
-          color: 'var(--color-text)',
-          margin: 0,
-        }}
-      >
-        <code ref={codeRef}>{code}</code>
-      </pre>
+      {!collapsed && (
+        <pre
+          className="p-3 text-xs leading-relaxed font-mono whitespace-pre-wrap break-all"
+          style={{
+            backgroundColor: 'var(--color-editor-bg)',
+            color: 'var(--color-text)',
+            margin: 0,
+          }}
+        >
+          <code ref={codeRef}>{isJson ? highlightJson(display) : display}</code>
+        </pre>
+      )}
     </div>
   )
 }

@@ -45,6 +45,11 @@
   font-weight: 600;
   color: var(--color-text);
   white-space: nowrap;
+  /* 可收缩 + 超长省略：避免长工具名把右侧状态顶得不靠右 */
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tool-call-source-badge {
@@ -76,6 +81,7 @@
   align-items: center;
   gap: 4px;
   font-size: 0.7rem;
+  flex-shrink: 0;
 }
 
 .tool-call-status.completed {
@@ -116,7 +122,7 @@
   color: var(--color-text);
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 200px;
+  max-height: 420px;
   overflow-y: auto;
 }
 
@@ -150,7 +156,9 @@
 }
 
 .tool-call-arrow {
-  margin-left: auto;
+  /* 不再用 margin-left:auto——否则与状态组的 auto 平分右侧空白，状态浮中间不贴右。
+     右对齐由状态组的 margin-left:auto 统一负责，箭头紧跟其后。 */
+  flex-shrink: 0;
   transition: transform 0.2s ease;
   color: var(--color-text-muted);
   opacity: 0.5;

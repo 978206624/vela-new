@@ -7,6 +7,7 @@ import {
   Image,
   AtSign,
   Workflow,
+  Sparkles,
 } from 'lucide-react'
 import { useAgentStore, type AgentMode } from '../../../stores/agent-store'
 import { useLLMStore } from '../../../stores/llm-store'
@@ -244,6 +245,21 @@ export default function AgentInputBox() {
         </div>
       )}
 
+      {/* 顶部 chip 行（上下文指示，参考 TRAE @Agent chip） */}
+      <div className="flex items-center gap-1.5 px-1.5 pt-0.5 pb-1">
+        <span
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[0.7rem] font-medium select-none"
+          style={{
+            backgroundColor: 'var(--color-bg)',
+            color: 'var(--color-text-secondary)',
+            border: '1px solid var(--color-border)',
+          }}
+        >
+          <Sparkles size={11} style={{ color: 'var(--color-accent)' }} />
+          Vela 助手
+        </span>
+      </div>
+
       {/* 输入区域 */}
       <div className="relative w-full">
           <textarea
@@ -265,11 +281,11 @@ export default function AgentInputBox() {
         {/* 占位文字颜色已通过 tailwind placeholder 设置 */}
       </div>
 
-      {/* 底部工具栏 */}
-      <div className="flex items-center justify-between gap-1 px-1 mt-0.5">
+      {/* 底部工具栏：左(+/模式) · 中(模型+状态点) · 右(发送) 三段式 */}
+      <div className="flex items-center gap-1 px-1 mt-0.5">
 
-        {/* 左侧工具按钮组 */}
-        <div className="flex items-center gap-0.5 min-w-0 flex-1">
+        {/* 左侧：添加上下文 + 模式 */}
+        <div className="flex items-center gap-0.5 flex-shrink-0">
 
           {/* + 添加上下文 */}
           <div ref={contextRef}>
@@ -342,7 +358,10 @@ export default function AgentInputBox() {
               </div>
             )}
           </div>
+        </div>
 
+        {/* 中间：模型选择 + 连接状态点（居中） */}
+        <div className="flex items-center justify-center flex-1 min-w-0">
           {/* 模型选择 */}
           <div ref={modelRef} className="relative min-w-0">
             <button
@@ -366,10 +385,19 @@ export default function AgentInputBox() {
                 e.currentTarget.style.opacity = '0.75'
               }}
             >
-              <ChevronDown size={13} strokeWidth={1.5} className="flex-shrink-0" />
+              {/* 连接状态点：已选中可用模型=accent，未配置=灰 */}
+              <span
+                className="flex-shrink-0 rounded-full"
+                style={{
+                  width: 6,
+                  height: 6,
+                  backgroundColor: currentModel ? 'var(--color-accent)' : 'var(--color-text-muted)',
+                }}
+              />
               <span className="truncate select-none">
                 {currentModel?.name ?? (chatModels.length === 0 ? '未配置模型' : '选择模型')}
               </span>
+              <ChevronDown size={13} strokeWidth={1.5} className="flex-shrink-0" />
             </button>
 
             {/* 模型选择下拉 */}
@@ -415,7 +443,7 @@ export default function AgentInputBox() {
           <button
             onClick={handleSendOrStop}
             disabled={!generating && !canSend}
-            className="flex items-center justify-center w-6 h-6 transition-all duration-150"
+            className="flex items-center justify-center w-7 h-7 transition-all duration-150"
             style={{
               borderRadius: 'var(--radius-md)',
               backgroundColor: generating

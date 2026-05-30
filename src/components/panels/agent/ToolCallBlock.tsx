@@ -17,6 +17,9 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import type { ToolCallInfo } from '../../../services/agent/agent-engine'
+import { highlightJson, tryParseJsonObject } from '../../ui/jsonHighlight'
+import MarkdownContent from '../../ui/MarkdownContent'
+import JsonCard from '../../ui/JsonCard'
 
 interface Props {
   toolCall: ToolCallInfo
@@ -117,17 +120,26 @@ export default function ToolCallBlock({ toolCall }: Props) {
       {/* 展开区域 */}
       {expanded && (
         <div className="tool-call-body">
-          {/* 参数 */}
+          {/* 参数（JSON 高亮） */}
           {Object.keys(args).length > 0 && (
             <div className="tool-call-params">
-              {JSON.stringify(args, null, 2)}
+              {highlightJson(JSON.stringify(args, null, 2))}
             </div>
           )}
 
-          {/* 结果 */}
+          {/* 结果：Markdown 走 md 渲染、```json 块走资料卡（jsonRender=card） */}
           {result && (
-            <div className="tool-call-result" style={{ position: 'relative' }}>
-              {result}
+            <div
+              className="tool-call-result"
+              style={{ position: 'relative', whiteSpace: 'normal' }}
+            >
+              {(() => {
+                // 整段就是一坨裸 JSON（无围栏）→ 直接资料卡；否则交给 Markdown（md→md、```json→资料卡）
+                const wholeJson = tryParseJsonObject(result)
+                return wholeJson !== null
+                  ? <JsonCard data={wholeJson} />
+                  : <MarkdownContent content={result} jsonRender="card" />
+              })()}
               <button
                 onClick={() => navigator.clipboard.writeText(result).catch(() => {})}
                 className="absolute top-1 right-1 text-[0.65rem] px-1.5 py-0.5 rounded transition-opacity opacity-0 hover:opacity-100"

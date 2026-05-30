@@ -19,6 +19,7 @@ interface Props {
 
 export default function AgentMessage({ message }: Props) {
   const { role, content, streaming, toolCalls, artifacts } = message
+  const hasToolCalls = !!(toolCalls && toolCalls.length > 0)
 
   if (role === 'user') {
     return (
@@ -44,18 +45,9 @@ export default function AgentMessage({ message }: Props) {
         className="max-w-full text-xs leading-relaxed break-words w-full"
         style={{ color: 'var(--color-text)' }}
       >
-        {/* 文本内容 */}
-        {content ? (
-          <MarkdownContent content={content} streaming={streaming} />
-        ) : streaming ? (
-          <span className="inline-flex items-center h-4">
-            <StreamingCursor />
-          </span>
-        ) : null}
-
-        {/* Tool 调用区块列表 */}
+        {/* Tool 调用区块列表（置于正文前：先展示「做了什么」，再给结论） */}
         {toolCalls && toolCalls.length > 0 && (
-          <div className="mt-2">
+          <div>
             {toolCalls.map(tc => (
               tc.status === 'waiting_confirm' ? (
                 <ConfirmCard key={tc.id} toolCall={tc} />
@@ -65,6 +57,17 @@ export default function AgentMessage({ message }: Props) {
             ))}
           </div>
         )}
+
+        {/* 文本内容（结论，置于工具调用之后） */}
+        {content ? (
+          <div className={hasToolCalls ? 'mt-2' : ''}>
+            <MarkdownContent content={content} streaming={streaming} />
+          </div>
+        ) : streaming ? (
+          <span className={`inline-flex items-center h-4 ${hasToolCalls ? 'mt-2' : ''}`}>
+            <StreamingCursor />
+          </span>
+        ) : null}
 
         {/* 产物卡片列表 */}
         {artifacts && artifacts.length > 0 && (

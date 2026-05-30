@@ -219,6 +219,11 @@
 
     /* 编辑器 */
     --color-editor-bg: #F7F9FC;
+    /* JSON 语法高亮专用色（text-grade，浅底主题=深色高对比，≥4.5；paper/ivory 同为浅底继承此处） */
+    --json-key: #0B5FB0;
+    --json-string: #0A7A33;
+    --json-number: #A8480C;
+    --json-literal: #8327A8;
     --color-editor-line-highlight: rgba(91, 158, 214, 0.04);
     --color-editor-selection: rgba(91, 158, 214, 0.14);
 
@@ -329,6 +334,11 @@
     --color-activity-indicator: #7EC8E3;
 
     --color-editor-bg: #091525;
+    /* JSON 语法高亮专用色（暗底主题=浅色高对比） */
+    --json-key: #7C9EFF;
+    --json-string: #4EC9A8;
+    --json-number: #D7A36B;
+    --json-literal: #C586C0;
     --color-editor-line-highlight: rgba(126, 200, 227, 0.04);
     --color-editor-selection: rgba(126, 200, 227, 0.18);
 
@@ -460,6 +470,11 @@
     --color-activity-indicator: #FFFFFF;
 
     --color-editor-bg: #1E1E1E;
+    /* JSON 语法高亮专用色（暗底主题=浅色高对比） */
+    --json-key: #7C9EFF;
+    --json-string: #4EC9A8;
+    --json-number: #D7A36B;
+    --json-literal: #C586C0;
     --color-editor-line-highlight: rgba(255, 255, 255, 0.04);
     --color-editor-selection: rgba(38, 79, 120, 0.6);
 
@@ -527,6 +542,11 @@
     --color-activity-indicator: #D97757;
 
     --color-editor-bg: #141413;
+    /* JSON 语法高亮专用色（暗底主题=浅色高对比） */
+    --json-key: #7C9EFF;
+    --json-string: #4EC9A8;
+    --json-number: #D7A36B;
+    --json-literal: #C586C0;
     --color-editor-line-highlight: rgba(217, 119, 87, 0.05);
     --color-editor-selection: rgba(217, 119, 87, 0.16);
 
@@ -714,6 +734,15 @@
 
   .ivory ::-webkit-scrollbar-thumb:hover {
     background: rgba(140, 120, 100, 0.38);
+  }
+
+  /* 正文/草稿/架构文件（均为 CodeMirror）内容区隐藏滚动条（仍可滚动）。
+     精准作用于 .cm-scroller——只命中 CodeMirror 的内容滚动元素，
+     不影响表单编辑器、Select/弹层下拉、左树、AI 面板等其它滚动区域。 */
+  .cm-scroller::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
   }
 }
 
