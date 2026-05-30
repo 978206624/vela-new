@@ -76,7 +76,9 @@ export function PostProcessStatusPanel({
   // 状态变化时回调给父组件
   useEffect(() => {
     if (!status) return
-    const isFailed = Object.values(status.steps).some(s => !s.ok)
+    // 仅「尝试过且未成功」才算真失败；attemptCount===0 是尚未执行的 pending 步骤，
+    // 后处理流水线串行执行期间它们的 ok 仍为 false，不能误报为失败
+    const isFailed = Object.values(status.steps).some(s => !s.ok && s.attemptCount > 0)
     if (onStatusLoad) {
       onStatusLoad(isFailed)
     }
@@ -86,11 +88,28 @@ export function PostProcessStatusPanel({
   if (loading || !status) return null
 
   const steps = Object.entries(status.steps)
-  const failedSteps = steps.filter(([, s]) => !s.ok)
+  // 三态区分：成功(ok) / 失败(!ok 且尝试过) / 进行中(!ok 且从未尝试，attemptCount===0)
+  const failedSteps = steps.filter(([, s]) => !s.ok && s.attemptCount > 0)
   const successCount = steps.filter(([, s]) => s.ok).length
   const totalCount = steps.length
+  const pendingCount = steps.filter(([, s]) => !s.ok && s.attemptCount === 0).length
   const hasFailure = failedSteps.length > 0
   const hasCriticalFailure = failedSteps.some(([, s]) => s.critical)
+  const isProcessing = !hasFailure && pendingCount > 0
+
+  // 无失败但仍有未执行步骤 → 后处理仍在进行，显示中性「处理中」而非误报失败
+  if (isProcessing) {
+    return (
+      <div className={cn(
+        'flex items-center gap-1.5 px-2 py-1 rounded text-[10px] text-[var(--color-text-muted)]',
+        'bg-[var(--color-hover)]',
+        className,
+      )}>
+        <RefreshCw size={12} className="animate-spin" />
+        <span>{status.sourceLabel} 处理中（{successCount}/{totalCount}）</span>
+      </div>
+    )
+  }
 
   if (!hasFailure) {
     return (
@@ -138,7 +157,10 @@ export function PostProcessStatusPanel({
       {/* 展开详情 */}
       {expanded && (
         <div className="px-3 pb-2.5 space-y-1">
-          {steps.map(([key, step]) => (
+          {steps.map(([key, step]) => {
+            const stepFailed = !step.ok && step.attemptCount > 0
+            const stepPending = !step.ok && step.attemptCount === 0
+            return (
             <div
               key={key}
               className="flex items-center justify-between gap-2 py-1 text-[11px]"
@@ -146,8 +168,10 @@ export function PostProcessStatusPanel({
               <div className="flex items-center gap-1.5 min-w-0">
                 {step.ok ? (
                   <CheckCircle2 size={12} className="text-[var(--color-success,#22c55e)] shrink-0" />
-                ) : (
+                ) : stepFailed ? (
                   <XCircle size={12} className="text-[var(--color-error,#ef4444)] shrink-0" />
+                ) : (
+                  <Clock size={12} className="text-[var(--color-text-muted)] shrink-0" />
                 )}
                 <span className={cn(
                   'truncate',
@@ -155,7 +179,7 @@ export function PostProcessStatusPanel({
                 )}>
                   {step.label}
                 </span>
-                {step.critical && !step.ok && (
+                {step.critical && stepFailed && (
                   <span className="shrink-0 px-1 py-0.5 rounded text-[9px] bg-red-500/15 text-red-400">
                     关键
                   </span>
@@ -167,6 +191,8 @@ export function PostProcessStatusPanel({
                   <span className="text-[10px] text-[var(--color-text-muted)]">
                     {step.completedAt ? new Date(step.completedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : ''}
                   </span>
+                ) : stepPending ? (
+                  <span className="text-[10px] text-[var(--color-text-muted)]">等待中</span>
                 ) : (
                   <>
                     <span className="text-[10px] text-[var(--color-error,#ef4444)] max-w-[120px] truncate" title={step.error}>
@@ -185,7 +211,8 @@ export function PostProcessStatusPanel({
                 )}
               </div>
             </div>
-          ))}
+            )
+          })}
 
           {/* 底部操作栏 */}
           <div className="flex items-center justify-between pt-1.5 border-t border-[var(--color-border)]">

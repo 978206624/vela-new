@@ -219,7 +219,10 @@ export default function WorldBuildingEditor() {
           const words = wordCounts[f.key] ?? 0
           const isCharacters = f.key === 'characters'
           // 角色图谱卡片：提取失败时显示红色警告
-          const charExtractFailed = isCharacters && charExtractStatus && !charExtractStatus.allCriticalPassed
+          // 仅「关键步骤尝试过且未成功」才算失败；run 级 allCriticalPassed 默认 0，
+          // 提取进行中（步骤 attemptCount===0、尚未 markStepOk）时它也是 false，不能据此误报失败
+          const charExtractFailed = isCharacters && !!charExtractStatus &&
+            Object.values(charExtractStatus.steps).some(s => s.critical && !s.ok && s.attemptCount > 0)
           // 动态边框颜色：提取失败 → 红 | 已生成 → 绿 | 未生成 → 默认
           const cardBorderColor = charExtractFailed
             ? 'var(--color-error, #ef4444)'
