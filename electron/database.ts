@@ -43,7 +43,7 @@ export function getProjectDb(): BetterSqlite3.Database | null {
   return projectDb
 }
 
-/** 创建完整表结构（9 张核心表 + 2 张沿用表） */
+/** 创建完整表结构（9 张核心表 + 3 张沿用表） */
 function createTables(db: BetterSqlite3.Database) {
   db.exec(`
     -- ============================================================
@@ -239,7 +239,26 @@ function createTables(db: BetterSqlite3.Database) {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- ============================================================
+    -- 沿用表：Agent 对话持久化（按项目库隔离，跟项目走）
+    -- messages 列存整个会话 messages 数组的 JSON：AgentMessage[]
+    --   （含 role/content/toolCalls/artifacts/thinkingBlocks/reasoningContent，
+    --    形状由 renderer 端 agent-store.ts 的 AgentMessage 拥有，持久化层视为不透明 blob）
+    -- message_count 冗余列：列表懒加载（listMeta 不取 messages）时用于 UI 空状态判定/计数
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS agent_conversations (
+      id TEXT PRIMARY KEY,                        -- 会话 UUID
+      title TEXT NOT NULL DEFAULT '',             -- 会话标题（取首条用户消息）
+      messages TEXT NOT NULL DEFAULT '[]',        -- JSON: AgentMessage[]
+      mode TEXT NOT NULL DEFAULT 'planning',      -- planning | fast
+      model_id TEXT,                              -- 会话使用的模型 ID（null=默认）
+      message_count INTEGER NOT NULL DEFAULT 0,   -- messages.length 冗余缓存
+      created_at INTEGER NOT NULL,                -- 创建时间（ms epoch）
+      updated_at INTEGER NOT NULL                 -- 更新时间（ms epoch）
+    );
+
     -- 索引
     CREATE INDEX IF NOT EXISTS idx_llm_calls_time ON llm_calls(created_at);
+    CREATE INDEX IF NOT EXISTS idx_agent_conversations_updated ON agent_conversations(updated_at DESC);
   `)
 }

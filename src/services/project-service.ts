@@ -16,6 +16,7 @@ import { globalEventBus } from '../shared/event-bus'
 import { useProjectStore } from '../stores/project-store'
 import { useCharacterStore } from '../stores/character-store'
 import { useDraftStore } from '../stores/draft-store'
+import { useAgentStore } from '../stores/agent-store'
 import { ipc } from './ipc-client'
 
 /** 存放解绑函数，用于 dispose 时清理 */
@@ -125,10 +126,11 @@ export async function onProjectOpened(): Promise<void> {
   const project = useProjectStore.getState().currentProject
   if (!project) return
 
-  // 并行加载角色卡和草稿列表
+  // 并行加载角色卡、草稿列表、Agent 对话列表（此时项目库已 open，建表已完成）
   await Promise.all([
     useCharacterStore.getState().load(),
     useDraftStore.getState().loadAllDrafts(),
+    useAgentStore.getState().loadConversations(),
   ])
 
   // 广播项目已就绪事件
@@ -139,9 +141,17 @@ export async function onProjectOpened(): Promise<void> {
 
 /**
  * 项目关闭时的清理 — 重置所有 Layer 2 Store
- * 由 project-store.closeProject 调用
+ * 由 project-store.closeProject 调用（可 await，确保切库前收尾完成）
+ *
+ * @param closingToken 关闭中项目的 token，传给 Agent 取消收尾，
+ *   保证「源项目库已切走后到达的落库」被主进程 token guard 丢弃，不串库。
  */
-export function onProjectClosed(): void {
+export async function onProjectClosed(closingToken?: number): Promise<void> {
+  // 先取消 Agent 在途生成并把收尾进度落进「源项目库」（用 closingToken），
+  // 再清空内存对话，防上个项目对话串到下个项目。
+  await useAgentStore.getState().cancelGenerationWithToken(closingToken)
+  useAgentStore.getState().resetConversations()
+
   // 清空编辑器 Tab
   import('../stores/editor-store').then(m => {
     m.useEditorStore.getState().clearTabs()

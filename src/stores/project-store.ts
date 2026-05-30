@@ -33,7 +33,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 // 延迟导入 ProjectService，避免循环依赖
 let _onProjectOpened: (() => Promise<void>) | null = null
-let _onProjectClosed: (() => void) | null = null
+let _onProjectClosed: ((closingToken?: number) => Promise<void>) | null = null
 async function callProjectOpened() {
   if (!_onProjectOpened) {
     const { onProjectOpened } = await import('../services/project-service')
@@ -41,12 +41,12 @@ async function callProjectOpened() {
   }
   await _onProjectOpened()
 }
-async function callProjectClosed() {
+async function callProjectClosed(closingToken?: number) {
   if (!_onProjectClosed) {
     const { onProjectClosed } = await import('../services/project-service')
     _onProjectClosed = onProjectClosed
   }
-  _onProjectClosed()
+  await _onProjectClosed(closingToken)
 }
 
 interface ProjectState {
@@ -85,8 +85,8 @@ interface ProjectState {
   loadRecentProjects: () => Promise<void>
   /** 移除单个最近项目 */
   removeRecentProject: (projectPath: string) => Promise<void>
-  /** 关闭项目 */
-  closeProject: () => void
+  /** 关闭项目（可 await：确保 Agent 取消收尾 + 内存重置在切库前完成） */
+  closeProject: () => Promise<void>
   /** 更新角色状态（内存 + 持久化） */
   updateCharacterStates: (states: string) => Promise<void>
 }
@@ -121,6 +121,12 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
 
 
   openProject: async (projectPath) => {
+    // 多入口切项目（ActivityBar / HomeSidebarPanel 等）若不先关旧项目，会绕过生命周期：
+    // 旧项目的 Agent 取消收尾不触发、内存对话不清空 → 串库/串台。
+    // 顶部先 await 关闭当前项目，确保切库前收尾完成（后端 token guard 为第二层兜底）。
+    if (get().currentProject) {
+      await get().closeProject()
+    }
     set({ loading: true })
     try {
       const result = await ipc.invoke('project:open', projectPath)
@@ -203,11 +209,12 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
     }))
   },
 
-  closeProject: () => {
+  closeProject: async () => {
     const closingPath = get().currentProject?.path ?? null
     const closingToken = get().currentToken ?? undefined
-    // 统一清空 Layer 2 Store + 编辑器 Tab
-    callProjectClosed()
+    // 统一清空 Layer 2 Store + 编辑器 Tab + Agent 取消收尾（用 closingToken 落进源项目库）。
+    // await 确保收尾在「主进程切库」之前完成——openProject 顶部先 await closeProject 即靠此。
+    await callProjectClosed(closingToken)
     set({ currentProject: null, currentToken: null, fileTree: [] })
     // 通知主进程清空"当前项目"，避免 KB 等 IPC 仍命中旧项目。
     // 带 path + token 双 guard：如果此调用晚于下一次 open 到达主进程，

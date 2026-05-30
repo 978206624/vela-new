@@ -9,7 +9,8 @@ import { toolRegistry } from '../services/agent/tool-registry'
 import type { ToolArtifact } from '../services/agent/tool-registry'
 import { ipc } from '../services/ipc-client'
 import { globalEventBus } from '../shared/event-bus'
-import type { TokenUsage, ClaudeThinkingBlock } from '../shared/ipc-channels'
+import type { TokenUsage, ClaudeThinkingBlock, ConversationRecord } from '../shared/ipc-channels'
+import { useProjectStore } from './project-store'
 
 // ===== 类型定义 =====
 
@@ -53,6 +54,16 @@ export interface AgentConversation {
   mode: AgentMode
   /** 当前会话使用的模型 ID（null 表示使用默认） */
   modelId: string | null
+  /**
+   * messages 是否已从库加载。
+   * 列表懒加载（listMeta）只填 meta，messages=[] 且 messagesLoaded=false（空壳）；
+   * selectConversation 拉取后置 true。新建会话天然已加载（true）。
+   * 防御点：sendMessage 对 messagesLoaded===false 的活跃会话先 get(id) 加载，
+   * 避免空壳被新消息 upsert 覆盖库内旧 messages。
+   */
+  messagesLoaded: boolean
+  /** message 数量缓存（懒加载下用于 UI 空状态判定/计数，不依赖 messages.length） */
+  messageCount: number
 }
 
 // ===== Store 状态接口 =====
@@ -82,12 +93,23 @@ interface AgentState {
   initializeTools: () => void
   /** 新建会话并激活 */
   createConversation: () => AgentConversation
-  /** 激活指定会话 */
-  selectConversation: (id: string) => void
+  /** 激活指定会话（异步：懒加载 messages 后原子更新，含竞态保护） */
+  selectConversation: (id: string) => Promise<void>
   /** 删除指定会话 */
   deleteConversation: (id: string) => void
   /** 清空所有会话 */
   clearAll: () => void
+  /**
+   * 确保指定会话的 messages 已从库加载（懒加载空壳防御的统一入口）。
+   * 返回是否可安全继续操作该会话：
+   * - 已加载 / 加载成功 / 确属空会话 → true
+   * - 本应有历史（messageCount>0）却 get 返回 null 或抛错 → false（调用方必须中止，绝不覆盖库内历史）
+   */
+  ensureConversationLoaded: (id: string) => Promise<boolean>
+  /** 从当前项目库加载会话列表（仅 meta，懒加载）——项目打开时调用 */
+  loadConversations: () => Promise<void>
+  /** 仅清空内存中的会话（不删库）——项目关闭时调用，防跨项目串台 */
+  resetConversations: () => void
   /** 切换历史面板 */
   toggleHistory: () => void
   /** 设置历史面板可见性 */
@@ -98,8 +120,16 @@ interface AgentState {
   setModelId: (modelId: string | null) => void
   /** 发送消息（触发 Agent ReAct 循环） */
   sendMessage: (content: string) => Promise<void>
-  /** 取消当前生成 */
+  /**
+   * 取消当前生成（public 无参包装：入口即时捕获 current token 后委托内部带 token 版）。
+   * 保持无参签名以兼容 AgentInputBox / 现有调用点，勿改成必填参数。
+   */
   cancelGeneration: () => Promise<void>
+  /**
+   * 取消当前生成（内部实现，接收显式 token）。
+   * 项目关闭收尾时由 project-service 用 closingToken 调用，保证收尾落库写进源项目库。
+   */
+  cancelGenerationWithToken: (expectedToken?: number) => Promise<void>
   /** 响应 Tool 确认（用于 ConfirmCard） */
   resolveToolConfirmation: (toolCallId: string, confirmed: boolean) => void
 }
@@ -155,6 +185,12 @@ let activeAbortController: AbortController | null = null
 /** 当前在途流式请求 ID（每轮 LLM 调用一个，用于真正中断 in-flight 流） */
 let activeStreamRequestId: string | null = null
 
+/**
+ * selectConversation 单调递增序号：快速连点不同历史会话时，
+ * 仅最后一次选择的异步结果允许落状态，丢弃先发起但后返回的旧选择（防串内容）。
+ */
+let selectSeq = 0
+
 /** 判定取消类错误（用户主动中止），不计入调用统计 */
 const isCancellation = (msg: string): boolean => msg.includes('已取消') || msg.includes('取消')
 
@@ -192,6 +228,69 @@ function logAgentLLMCall(p: {
     .catch(() => { /* 统计写入失败不影响主流程 */ })
 }
 
+// ===== 持久化辅助 =====
+
+/**
+ * 读取「当前项目 token」。token 用作主进程 stale-write guard：
+ * 调用方必须在「动作产生时」捕获并显式传递，绝不能在异步写 IPC 时现读 live token
+ * （否则 A 的延迟回调会带上已切到 B 的 token 通过校验、把 A 的对话写进 B 库）。
+ */
+const getProjectToken = (): number | undefined =>
+  useProjectStore.getState().currentToken ?? undefined
+
+/** 把内存会话映射为持久化记录（messages 作为不透明数组直接序列化） */
+const toRecord = (conv: AgentConversation): ConversationRecord => ({
+  id: conv.id,
+  title: conv.title,
+  messages: conv.messages,
+  mode: conv.mode,
+  modelId: conv.modelId,
+  messageCount: conv.messages.length,
+  createdAt: conv.createdAt,
+  updatedAt: conv.updatedAt,
+})
+
+/**
+ * 落库单个会话（消息边界调用，禁止逐字流式调用），返回写入完成的 Promise。
+ * - 空会话（无消息）跳过：避免满库空壳
+ * - expectedToken 由调用方在动作产生时捕获并显式传入
+ * - 写失败静默吞掉，不影响主流程
+ */
+const persistConversationAsync = (conv: AgentConversation | undefined, expectedToken?: number): Promise<void> => {
+  if (!conv || conv.messages.length === 0) return Promise.resolve()
+  return ipc.invoke('db:conversation-upsert', toRecord(conv), expectedToken)
+    .then(() => { /* ok */ })
+    .catch(() => { /* 持久化失败不影响主流程 */ })
+}
+
+/** 落库单个会话（fire-and-forget 版，普通消息边界用） */
+const persistConversation = (conv: AgentConversation | undefined, expectedToken?: number): void => {
+  void persistConversationAsync(conv, expectedToken)
+}
+
+/**
+ * 重开后清洗「僵尸态」：应用关闭时未收尾的流式消息 / 卡在确认或运行中的工具调用。
+ * 切回历史会话续聊不应再触发死按钮或永远「生成中」。
+ */
+const cleanseZombieState = (messages: AgentMessage[]): AgentMessage[] =>
+  messages.map(m => {
+    let next = m
+    if (m.streaming) {
+      next = { ...next, streaming: false, content: (next.content || '') + '\n\n_(应用已关闭，生成中断)_' }
+    }
+    if (m.toolCalls?.some(tc => tc.status === 'waiting_confirm' || tc.status === 'running')) {
+      next = {
+        ...next,
+        toolCalls: next.toolCalls!.map(tc =>
+          tc.status === 'waiting_confirm' || tc.status === 'running'
+            ? { ...tc, status: 'failed' as const, error: '操作已因应用重启而失效' }
+            : tc
+        ),
+      }
+    }
+    return next
+  })
+
 // ===== Zustand Store =====
 
 export const useAgentStore = create<AgentState>()((set, get) => ({
@@ -220,6 +319,9 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     // 确保 Tool 已初始化
     get().initializeTools()
 
+    // 作废在途 selectConversation：新建会立刻激活新会话，旧 select 晚返回不得把 active 改回去
+    ++selectSeq
+
     const llmStore = useLLMStore.getState()
     const newConv: AgentConversation = {
       id: genId(),
@@ -229,6 +331,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       updatedAt: Date.now(),
       mode: get().defaultMode,
       modelId: llmStore.defaultModelId,
+      messagesLoaded: true,   // 新建会话内存即真相，无需懒加载
+      messageCount: 0,
     }
     set(state => ({
       conversations: [newConv, ...state.conversations],
@@ -238,11 +342,97 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     return newConv
   },
 
-  selectConversation: (id) => {
-    set({ activeConversationId: id, showHistory: false })
+  selectConversation: async (id) => {
+    // 入口第一行就递增 seq，让本次选择成为「最新选择」——无论走已加载快路径还是异步慢路径，
+    // 都作废先前在途的旧选择（否则先点未加载 A、再点已加载 B，A 的 get 返回会把 active 改回 A → Codex BLOCKER）。
+    const seq = ++selectSeq
+    const conv = get().conversations.find(c => c.id === id)
+    // 已加载（新建会话或之前已拉取）→ 直接激活，无需查库
+    if (conv?.messagesLoaded) {
+      set({ activeConversationId: id, showHistory: false })
+      return
+    }
+
+    // 懒加载空壳：先 await 拉 messages，再「单次原子 set」同时落 activeConversationId + messages，
+    // 绝不先激活空壳（否则加载返回前用户发消息，旧 DB 结果会覆盖新消息）。
+    try {
+      const record = await ipc.invoke('db:conversation-get', id)
+      // 竞态保护：期间又发起了新的选择 → 丢弃本次结果（防快速连点串内容）
+      if (seq !== selectSeq) return
+      if (!record) {
+        // 与 ensureConversationLoaded 口径一致：本应有历史却读不到 → 不激活空壳，保留可重试；
+        // 仅确属空会话（messageCount===0）才标记已加载并激活。
+        if ((conv?.messageCount ?? 0) > 0) {
+          console.warn('[Agent] 选择会话失败：库内读不到历史，保留可重试')
+          return
+        }
+        set(state => ({
+          activeConversationId: id,
+          showHistory: false,
+          conversations: state.conversations.map(c =>
+            c.id === id && !c.messagesLoaded ? { ...c, messagesLoaded: true } : c
+          ),
+        }))
+        return
+      }
+      const messages = cleanseZombieState(record.messages as AgentMessage[])
+      set(state => ({
+        activeConversationId: id,
+        showHistory: false,
+        conversations: state.conversations.map(c => {
+          if (c.id !== id) return c
+          // 非覆盖：若期间已被 sendMessage/ensure 加载并追加新消息，不用旧 DB 结果覆盖
+          if (c.messagesLoaded) return c
+          return { ...c, messages, messagesLoaded: true, messageCount: messages.length }
+        }),
+      }))
+    } catch (e) {
+      if (seq !== selectSeq) return
+      // 加载失败不激活空壳（避免显示空内容），保留可重试
+      console.warn('[Agent] 加载会话失败:', e)
+    }
+  },
+
+  ensureConversationLoaded: async (id) => {
+    const conv = get().conversations.find(c => c.id === id)
+    if (!conv) return false
+    if (conv.messagesLoaded) return true
+    try {
+      const record = await ipc.invoke('db:conversation-get', id)
+      if (record) {
+        const messages = cleanseZombieState(record.messages as AgentMessage[])
+        set(state => ({
+          conversations: state.conversations.map(c =>
+            c.id === id && !c.messagesLoaded   // 非覆盖：已被并发加载则不重置
+              ? { ...c, messages, messagesLoaded: true, messageCount: messages.length }
+              : c
+          ),
+        }))
+        return true
+      }
+      // get 返回 null：本应有历史却读不到 → 中止（绝不按空会话覆盖库内历史）
+      if (conv.messageCount > 0) return false
+      set(state => ({
+        conversations: state.conversations.map(c =>
+          c.id === id ? { ...c, messagesLoaded: true } : c
+        ),
+      }))
+      return true
+    } catch (e) {
+      console.warn('[Agent] 加载会话失败:', e)
+      if (conv.messageCount > 0) return false
+      set(state => ({
+        conversations: state.conversations.map(c =>
+          c.id === id ? { ...c, messagesLoaded: true } : c
+        ),
+      }))
+      return true
+    }
   },
 
   deleteConversation: (id) => {
+    // 作废在途 select：删除会改 activeConversationId，旧 select 晚返回不得指向已删/过期 id
+    ++selectSeq
     set(state => {
       const filtered = state.conversations.filter(c => c.id !== id)
       // 如果删除的是当前会话，激活下一条或 null
@@ -251,10 +441,47 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         : state.activeConversationId
       return { conversations: filtered, activeConversationId: nextId }
     })
+    // 同步删库（token 在动作入口捕获）
+    ipc.invoke('db:conversation-delete', id, getProjectToken()).catch(() => { /* 删库失败不影响内存状态 */ })
   },
 
   clearAll: () => {
+    // 作废在途 select：清空后旧 select 晚返回不得把 active 指向已清掉的会话
+    ++selectSeq
     set({ conversations: [], activeConversationId: null })
+    ipc.invoke('db:conversation-clear', getProjectToken()).catch(() => { /* 清库失败不影响内存状态 */ })
+  },
+
+  loadConversations: async () => {
+    // 作废任何在途的 selectConversation（切项目时旧项目的 get 可能晚返回，不得落到新列表）
+    ++selectSeq
+    try {
+      const metas = await ipc.invoke('db:conversation-list-meta')
+      // meta 空壳：messages 未加载，messagesLoaded=false；点开某会话时再 get(id)
+      const conversations: AgentConversation[] = metas.map(m => ({
+        id: m.id,
+        title: m.title,
+        messages: [],
+        createdAt: m.createdAt,
+        updatedAt: m.updatedAt,
+        mode: (m.mode as AgentMode) ?? 'planning',
+        modelId: m.modelId,
+        messagesLoaded: false,
+        messageCount: m.messageCount,
+      }))
+      // active=null：不指向空壳（避免 sendMessage 误判首条消息覆盖库内 messages）
+      set({ conversations, activeConversationId: null })
+    } catch (e) {
+      console.warn('[Agent] 加载会话列表失败:', e)
+      set({ conversations: [], activeConversationId: null })
+    }
+  },
+
+  resetConversations: () => {
+    // 作废在途 selectConversation，防旧项目的 get 晚返回污染已清空的状态
+    ++selectSeq
+    // 仅清内存，不删库（项目关闭时调用，防上个项目对话串到下个项目）
+    set({ conversations: [], activeConversationId: null, showHistory: false })
   },
 
   toggleHistory: () => {
@@ -271,22 +498,26 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       set({ defaultMode: mode })
       return
     }
+    const token = getProjectToken()   // 动作入口捕获 token
     set(state => ({
       defaultMode: mode,
       conversations: state.conversations.map(c =>
-        c.id === conv.id ? { ...c, mode } : c
+        c.id === conv.id ? { ...c, mode, updatedAt: Date.now() } : c
       ),
     }))
+    persistConversation(get().conversations.find(c => c.id === conv.id), token)
   },
 
   setModelId: (modelId) => {
     const conv = get().getActiveConversation()
     if (!conv) return
+    const token = getProjectToken()   // 动作入口捕获 token
     set(state => ({
       conversations: state.conversations.map(c =>
-        c.id === conv.id ? { ...c, modelId } : c
+        c.id === conv.id ? { ...c, modelId, updatedAt: Date.now() } : c
       ),
     }))
+    persistConversation(get().conversations.find(c => c.id === conv.id), token)
   },
 
   sendMessage: async (content) => {
@@ -304,11 +535,18 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           case 'clear': {
             const activeConv = get().getActiveConversation()
             if (activeConv) {
+              // 已持久化会话（曾有消息）被清空 → 删库记录，否则重开会「死灰复燃」；
+              // 新建未发消息的空壳会话本就没落库，跳过即可。
+              const wasPersisted = activeConv.messages.length > 0 || activeConv.messageCount > 0
+              const token = getProjectToken()
               set(state => ({
                 conversations: state.conversations.map(c =>
-                  c.id === activeConv.id ? { ...c, messages: [] } : c
+                  c.id === activeConv.id ? { ...c, messages: [], messageCount: 0 } : c
                 ),
               }))
+              if (wasPersisted) {
+                ipc.invoke('db:conversation-delete', activeConv.id, token).catch(() => { /* 删库失败不影响内存 */ })
+              }
             }
             return
           }
@@ -318,14 +556,23 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           case 'help': {
             // 构造帮助信息作为系统消息
             const helpConv = get().getActiveConversation() ?? get().createConversation()
+            // 空壳防御：若 active 是懒加载 meta 空壳，必须先拉回库内历史再追加，
+            // 否则会把库内历史覆盖成只剩 help 一条（Codex BLOCKER 3）。加载失败则中止。
+            const helpOk = await get().ensureConversationLoaded(helpConv.id)
+            if (!helpOk) {
+              console.error('[Agent] /help 中止：会话历史加载失败，避免覆盖库内历史')
+              return
+            }
+            const token = getProjectToken()
             const helpMsg: AgentMessage = {
               id: genId(), role: 'assistant', content: generateHelpText(), createdAt: Date.now(),
             }
             set(state => ({
               conversations: state.conversations.map(c =>
-                c.id === helpConv.id ? { ...c, messages: [...c.messages, helpMsg] } : c
+                c.id === helpConv.id ? { ...c, messages: [...c.messages, helpMsg], messageCount: c.messages.length + 1, updatedAt: Date.now() } : c
               ),
             }))
+            persistConversation(get().conversations.find(c => c.id === helpConv.id), token)
             return
           }
           case 'status': {
@@ -354,6 +601,22 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       conv = get().createConversation()
     }
     const convId = conv.id
+
+    // 动作起始即捕获源项目 token：本轮所有落库都用它，绝不在异步回调里现读 live token
+    const convToken = getProjectToken()
+
+    // 空壳防御：活跃会话若是懒加载未拉取的空壳（messagesLoaded=false），
+    // 先把库内 messages 拉回来，否则下面按 messages.length===0 误判为首条消息，
+    // 新消息 upsert 会覆盖库内旧 messages（丢历史）。
+    // 加载失败且本应有历史（messageCount>0）→ 中止发送，绝不覆盖（Codex MAJOR）。
+    if (!conv.messagesLoaded) {
+      const loadedOk = await get().ensureConversationLoaded(convId)
+      if (!loadedOk) {
+        console.error('[Agent] 中止发送：会话历史加载失败，避免覆盖库内历史')
+        return
+      }
+      conv = get().conversations.find(c => c.id === convId)!
+    }
 
     // 构建用户消息
     const userMsg: AgentMessage = {
@@ -387,11 +650,16 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               ...c,
               title: newTitle,
               messages: [...c.messages, userMsg, assistantMsg],
+              messageCount: c.messages.length + 2,
               updatedAt: Date.now(),
             }
           : c
       ),
     }))
+
+    // 用户消息 + 标题落库（消息边界）：即便后续生成因崩溃中断，用户的提问也已持久化。
+    // 流式占位助手消息此刻 streaming=true，若崩溃重开由 cleanseZombieState 收尾。
+    persistConversation(get().conversations.find(c => c.id === convId), convToken)
 
     // 辅助函数：更新助手消息
     const updateAssistantMsg = (updater: (msg: AgentMessage) => AgentMessage) => {
@@ -419,6 +687,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           ...m, content: '⚠️ 请先在设置中配置 AI 模型。', streaming: false,
         }))
         set({ generating: false })
+        persistConversation(get().conversations.find(c => c.id === convId), convToken)
         return
       }
 
@@ -557,6 +826,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
                 tc.id === toolCall.id ? { ...tc, status: 'waiting_confirm' as const } : tc
               ),
             }))
+            // 工具确认是一个消息边界（等待用户、可能长时间挂起）→ 落库当前累积进度
+            persistConversation(get().conversations.find(c => c.id === convId), convToken)
 
             // 返回 Promise，等待用户通过 resolveToolConfirmation 响应
             return new Promise<boolean>((resolve) => {
@@ -576,9 +847,13 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               generating: false,
               activeRequestId: null,
               conversations: state.conversations.map(c =>
-                c.id === convId ? { ...c, updatedAt: Date.now() } : c
+                c.id === convId
+                  ? { ...c, updatedAt: Date.now(), messageCount: c.messages.length }
+                  : c
               ),
             }))
+            // 助手消息定稿 → 落库（消息边界，含 thinkingBlocks 原样保真供多轮回传）
+            persistConversation(get().conversations.find(c => c.id === convId), convToken)
           },
           onError: (error) => {
             updateAssistantMsg(m => ({
@@ -587,6 +862,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               streaming: false,
             }))
             set({ generating: false, activeRequestId: null })
+            persistConversation(get().conversations.find(c => c.id === convId), convToken)
           },
         },
         abortController.signal,
@@ -598,10 +874,16 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         streaming: false,
       }))
       set({ generating: false, activeRequestId: null })
+      persistConversation(get().conversations.find(c => c.id === convId), convToken)
     }
   },
 
   cancelGeneration: async () => {
+    // public 无参包装：入口即时捕获 current token，委托内部带 token 版
+    await get().cancelGenerationWithToken(getProjectToken())
+  },
+
+  cancelGenerationWithToken: async (expectedToken) => {
     // P1-7: 触发 AbortSignal，使 ReAct 循环在轮次边界停止
     if (activeAbortController) {
       activeAbortController.abort()
@@ -620,6 +902,9 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     }
     pendingConfirmations.clear()
 
+    // 记录被中断的活跃会话，便于收尾后落库
+    const activeId = get().activeConversationId
+
     // 找到正在 streaming 的消息，关闭其状态
     set(state => ({
       generating: false,
@@ -631,6 +916,12 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         ),
       })),
     }))
+
+    // 取消收尾也是消息边界 → 用显式 token 落库（项目关闭时为 closingToken，写进源项目库）。
+    // await 写完再返回：项目关闭路径靠此保证收尾在「主进程切库」前落地，不被 token guard 误丢。
+    if (activeId) {
+      await persistConversationAsync(get().conversations.find(c => c.id === activeId), expectedToken)
+    }
   },
 
   resolveToolConfirmation: (toolCallId, confirmed) => {

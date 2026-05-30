@@ -1,5 +1,6 @@
 import { ipcMain } from 'electron'
 import { closeProjectDatabase } from '../database'
+import { getCurrentProjectToken } from '../utils/current-project'
 
 // 导入所有 Repository
 import { ProjectCoreRepository, ProjectCoreData } from '../repositories/project-core-repository'
@@ -13,6 +14,7 @@ import { PostProcessRepository } from '../repositories/post-process-repository'
 // 沿用的旧表
 import { LLMHistoryRepository } from '../repositories/llm-repository'
 import { SummaryRepository } from '../repositories/summary-repository'
+import { ConversationRepository, ConversationRecord } from '../repositories/conversation-repository'
 
 export function registerDatabaseController() {
   ipcMain.handle('db:close', async () => {
@@ -398,5 +400,57 @@ ipcMain.handle('db:revision-create', async (_event, params: {
 
   ipcMain.handle('db:get-latest-summary', async () => {
     return SummaryRepository.getLatestSnapshot()
+  })
+
+  // ============================================================
+  // Agent 对话持久化（agent_conversations）
+  //
+  // 写操作（upsert/delete/clear）带 expectedToken：复用 project:set-current 的
+  // stale-write guard 范式。token 由「动作产生时」前端捕获并显式传入（绝非写 IPC
+  // 时现读 live），主进程比对 getCurrentProjectToken()，不匹配则静默丢弃，
+  // 防止 A 的延迟落库（如 onDone 回调）在已切到项目 B 后把 A 的对话写进 B 库。
+  // ============================================================
+  ipcMain.handle('db:conversation-list-meta', async () => {
+    return ConversationRepository.listMeta()
+  })
+
+  ipcMain.handle('db:conversation-get', async (_event, id: string) => {
+    return ConversationRepository.get(id)
+  })
+
+  ipcMain.handle('db:conversation-upsert', async (_event, conv: ConversationRecord, expectedToken?: number) => {
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      ConversationRepository.upsert(conv)
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:conversation-delete', async (_event, id: string, expectedToken?: number) => {
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      ConversationRepository.remove(id)
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:conversation-clear', async (_event, expectedToken?: number) => {
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      ConversationRepository.clear()
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
   })
 }

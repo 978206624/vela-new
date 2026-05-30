@@ -337,6 +337,9 @@ import type { DraftMeta, DraftFull } from '../../electron/repositories/draft-rep
 import type { RevisionMeta, RevisionFull } from '../../electron/repositories/revision-repository'
 import type { ReviewMeta, ReviewFull } from '../../electron/repositories/review-repository'
 import type { PostProcessRunData, PostProcessStepData } from '../../electron/repositories/post-process-repository'
+import type { ConversationRecord, ConversationMeta } from '../../electron/repositories/conversation-repository'
+// 供 renderer（agent-store 等）复用，避免直接 reach 进 electron 层
+export type { ConversationRecord, ConversationMeta } from '../../electron/repositories/conversation-repository'
 
 // ===== 数据库操作 =====
 export interface DatabaseChannels {
@@ -404,6 +407,13 @@ export interface DatabaseChannels {
   'db:get-llm-history': { args: [limit?: number]; return: unknown[] }
   'db:save-summary-snapshot': { args: [chapterNumber: number, characterStates: string]; return: { success: boolean } }
   'db:get-latest-summary': { args: []; return: { characterStates: string; chapterNumber: number } | null }
+
+  // Agent 对话持久化（写操作带 expectedToken 做 stale-write guard）
+  'db:conversation-list-meta': { args: []; return: ConversationMeta[] }
+  'db:conversation-get': { args: [id: string]; return: ConversationRecord | null }
+  'db:conversation-upsert': { args: [conv: ConversationRecord, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:conversation-delete': { args: [id: string, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:conversation-clear': { args: [expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
 }
 
 // ===== 知识库频道 =====

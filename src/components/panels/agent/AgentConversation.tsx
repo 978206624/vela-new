@@ -33,9 +33,11 @@ export default function AgentConversation() {
 
 function EmptyState() {
   const { conversations, selectConversation } = useAgentStore()
-  // 取最近 3 条历史会话（不包含当前空会话）
+  // 取最近 3 条历史会话（不包含当前空会话）。
+  // 用 messageCount 而非 messages.length：懒加载下列表项是 meta 空壳（messages=[]），
+  // 用 messages.length 会把所有历史会话误判为空而过滤掉。
   const recentConvs = conversations
-    .filter(c => c && c.messages.length > 0)
+    .filter(c => c && c.messageCount > 0)
     .slice(0, 3)
 
 
@@ -74,7 +76,7 @@ function EmptyState() {
                 />
               ))}
             </div>
-            {conversations.filter(c => c.messages.length > 0).length > 3 && (
+            {conversations.filter(c => c.messageCount > 0).length > 3 && (
               <button
                 onClick={() => useAgentStore.getState().setShowHistory(true)}
                 className="mt-4 text-left text-xs transition-all hover:underline"
