@@ -14,7 +14,7 @@
 
 import { globalEventBus } from '../shared/event-bus'
 import { useProjectStore } from '../stores/project-store'
-import { useCharacterStore } from '../stores/character-store'
+import { useCharacterStore, coerceRole } from '../stores/character-store'
 import { useDraftStore } from '../stores/draft-store'
 import { useAgentStore } from '../stores/agent-store'
 import { ipc } from './ipc-client'
@@ -119,6 +119,36 @@ export function initProjectService(): void {
 }
 
 /**
+ * 一次性归一历史脏数据：列表外角色 role → coerceRole → 4 枚举，逐个写回（只动 role 变了的）。
+ * 幂等：合法 role 满足 `role === coerceRole(role)`，跳过；故重复打开项目不会反复写。
+ * 单个失败跳过、不阻塞项目打开。
+ */
+async function normalizeCharacterRoles(): Promise<void> {
+  const store = useCharacterStore.getState()
+  const offList = store.characters.filter(c => c.role !== coerceRole(c.role))
+  if (offList.length === 0) return
+  let fixed = 0
+  for (const c of offList) {
+    const role = coerceRole(c.role)
+    try {
+      // upsert 用 c（含 currentState，rowToData 已带出）整卡写回、仅 role 变更；项目打开期无并发后处理，无 cs_* 竞态
+      const res = await ipc.invoke('db:character-upsert', { ...c, role })
+      // 该 IPC 写库失败时返回 {success:false} 而非抛错——必须检查，
+      // 否则内存被改成合法值、库没改，下次打开幻影又回来（清洗形同未做）。
+      if (!res.success) {
+        console.warn(`[ProjectService] 角色定位归一失败：${c.name}`, res.error)
+        continue
+      }
+      store.updateField(c.name, 'role', role)
+      fixed++
+    } catch {
+      /* 单个失败跳过 */
+    }
+  }
+  if (fixed > 0) console.log(`[ProjectService] 已归一 ${fixed}/${offList.length} 个列表外角色定位`)
+}
+
+/**
  * 项目打开后的初始化 — 并行加载所有 Layer 2 数据
  * 由 project-store.openProject 成功后调用
  */
@@ -132,6 +162,10 @@ export async function onProjectOpened(): Promise<void> {
     useDraftStore.getState().loadAllDrafts(),
     useAgentStore.getState().loadConversations(),
   ])
+
+  // 一次性归一历史脏数据：把列表外的角色 role（旧版定稿后处理存的中文如「配角」）
+  // 经 coerceRole 归一为 4 枚举并写回，消除「定位」下拉幻影选项。幂等：已合法的跳过。
+  await normalizeCharacterRoles()
 
   // 广播项目已就绪事件
   globalEventBus.emit('PROJECT_CHANGED', { projectPath: project.path })
