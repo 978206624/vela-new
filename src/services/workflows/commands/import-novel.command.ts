@@ -12,6 +12,7 @@ import { useProjectStore } from '../../../stores/project-store'
 import { getPromptTemplate } from '../../prompt-templates'
 import { ImportPromptBuilder } from '../../prompts/prompt-builder'
 import { ipc } from '../../ipc-client'
+import { coerceChapterRole } from '../../../shared/chapter-roles'
 import type { CharacterData } from '../../../../electron/repositories/character-repository'
 
 /** 拆分后的章节数据（从 context.data 中传递） */
@@ -330,7 +331,7 @@ export class InferBlueprintsPerChapterCommand extends BaseWorkflowCommand<void> 
         const finalBlueprint = {
           chapterNumber: ch.number,
           title: (blueprint.title as string) || ch.title,
-          role: (blueprint.role as string) || '发展',
+          role: coerceChapterRole(blueprint.role),
           purpose: (blueprint.purpose as string) || '',
           keyEvents: (blueprint.keyEvents as string) || '',
           characters: Array.isArray(blueprint.characters) ? blueprint.characters as string[] : [],
@@ -338,6 +339,7 @@ export class InferBlueprintsPerChapterCommand extends BaseWorkflowCommand<void> 
           userGuidance: '',
           notes: '',
           notesUpdatedAt: '',
+          targetWords: 0,
         }
 
         await ipc.invoke('db:blueprint-upsert', finalBlueprint)

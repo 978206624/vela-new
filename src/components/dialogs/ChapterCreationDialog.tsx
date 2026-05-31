@@ -5,6 +5,7 @@ import { useLLMStore } from '../../stores/llm-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 
 import { createChapterWorkflow, type ChapterInfo } from '../../services/workflows/chapter-workflow'
+import { normalizeTargetWords } from '../../services/workflows/directory-workflow'
 import { buildChapterContext, type ChapterContextResult } from '../../services/prompts/chapter-context'
 import ContextPreview from '../panels/ContextPreview'
 import { guardChapterWriting } from '../../services/workflow-guards'
@@ -18,6 +19,7 @@ import { Input } from '../ui/Input'
 import { Textarea } from '../ui/Textarea'
 import { Label } from '../ui/Label'
 import { Select } from '../ui/Select'
+import { CHAPTER_ROLES, coerceChapterRole } from '../../shared/chapter-roles'
 
 interface Props {
   isOpen: boolean
@@ -85,19 +87,22 @@ export default function ChapterCreationDialog({ isOpen, onClose, prefill }: Prop
           // 章节号自动 +1
           setChapterNumber((last.chapterNumber || 0) + 1)
           setTitle('') // 标题不继承，让用户自填
-          setRole(last.role || '发展')
+          setRole(coerceChapterRole(last.role))
           setPurpose(last.purpose || '')
           setKeyEvents(last.keyEvents || '')
           setCharacters(last.characters || '')
           setUserGuidance(last.userGuidance || '')
-          setWordsTarget(last.wordsTarget || currentProject.novelConfig.wordsPerChapter || 3000)
+          // 目标字数以蓝图为单一数据源：读下一章蓝图有效目标（0/无 → 全局）
+          const histBp = await ipc.invoke('db:blueprint-get', (last.chapterNumber || 0) + 1).catch(() => null)
+          setWordsTarget(histBp && histBp.targetWords > 0 ? histBp.targetWords : (currentProject.novelConfig.wordsPerChapter || 3000))
           setLoadedFromHistory(true)
           return
         }
       }
     } catch { /* 文件不存在，使用默认值 */ }
     // 默认值：根据已有稿件数量推断下一章节号
-    setWordsTarget(currentProject.novelConfig.wordsPerChapter || 3000)
+    const defBp = await ipc.invoke('db:blueprint-get', 1).catch(() => null)
+    setWordsTarget(defBp && defBp.targetWords > 0 ? defBp.targetWords : (currentProject.novelConfig.wordsPerChapter || 3000))
     setChapterNumber(1)
     setLoadedFromHistory(false)
   }, [currentProject])
@@ -112,12 +117,13 @@ export default function ChapterCreationDialog({ isOpen, onClose, prefill }: Prop
         // 使用章节蓝图预填数据
         setChapterNumber(Number(prefill.chapterNumber) || 1)
         setTitle(String(prefill.title || ''))
-        setRole(String(prefill.role || '发展'))
+        setRole(coerceChapterRole(prefill.role))
         setPurpose(String(prefill.purpose || ''))
         setKeyEvents(String(prefill.keyEvents || ''))
         setCharacters(String(prefill.characters || ''))
         setUserGuidance(String(prefill.userGuidance || ''))
-        setWordsTarget(currentProject.novelConfig.wordsPerChapter || 3000)
+        // 「写作此章」由 ChapterCardEditor 直接带来蓝图有效目标字数（省一次查询，同为蓝图单一数据源）
+        setWordsTarget(Number(prefill.wordsTarget) > 0 ? Number(prefill.wordsTarget) : (currentProject.novelConfig.wordsPerChapter || 3000))
         setLoadedFromBlueprint(true)
         setLoadedFromHistory(false)
       } else {
@@ -188,6 +194,7 @@ export default function ChapterCreationDialog({ isOpen, onClose, prefill }: Prop
       keyEvents,
       userGuidance,
       knowledgeQueryHint: knowledgeHint.trim() || undefined,
+      wordsTarget: Number(wordsTarget) || 0,
     }
 
     // 先拼装上下文 → 弹预览，确认后才发送（可控创作透明度，设计屏 14）
@@ -202,9 +209,19 @@ export default function ChapterCreationDialog({ isOpen, onClose, prefill }: Prop
     }
   }
 
-  /** 预览确认 → 复用已拼装上下文启动写作管线（所发即所览） */
-  const handleConfirmPreview = () => {
-    if (!preview) return
+  /** 预览确认 → 先回写蓝图目标字数（单一数据源），成功后复用已拼装上下文启动写作管线（所发即所览） */
+  const handleConfirmPreview = async () => {
+    if (!preview || !currentProject) return
+    // 跟随全局语义：normalizeTargetWords（=全局或空 → 0）。失败则停留预览、不启动。
+    const res = await ipc.invoke(
+      'db:blueprint-update-target-words',
+      preview.chapterInfo.chapterNumber,
+      normalizeTargetWords(preview.chapterInfo.wordsTarget || 0, currentProject.novelConfig.wordsPerChapter || 3000),
+    )
+    if (!res.success) {
+      toast.error(`目标字数写入蓝图失败：${res.error || '未知错误'}`)
+      return
+    }
     const workflow = createChapterWorkflow(preview.chapterInfo, preview.ctx)
     startWorkflow(workflow, false)
     setPreview(null)
@@ -284,7 +301,7 @@ export default function ChapterCreationDialog({ isOpen, onClose, prefill }: Prop
                   <Select
                     value={role}
                     onValueChange={setRole}
-                    options={['开篇', '铺垫', '发展', '冲突', '高潮', '转折', '收尾'].map(r => ({ value: r, label: r }))}
+                    options={CHAPTER_ROLES.map(r => ({ value: r, label: r }))}
                   />
                 </div>
                 <div>

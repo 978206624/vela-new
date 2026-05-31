@@ -27,6 +27,8 @@ export function initProjectDatabase(projectPath: string): void {
 
   // 创建表结构
   createTables(projectDb)
+  // 轻量迁移：对已存在的老库补加新列（CREATE TABLE IF NOT EXISTS 加不了列）
+  runMigrations(projectDb)
   console.log(`[Vela DB] 项目数据库已打开: ${dbPath}`)
 }
 
@@ -41,6 +43,21 @@ export function closeProjectDatabase(): void {
 /** 获取当前数据库实例 */
 export function getProjectDb(): BetterSqlite3.Database | null {
   return projectDb
+}
+
+/**
+ * 轻量迁移：对已存在的库补加新列。
+ * `CREATE TABLE IF NOT EXISTS` 对已存在的表是 no-op、加不了列，故老库需 ALTER。
+ * 每条迁移先查 `pragma table_info` 确认列不存在再 ALTER，幂等、可重复执行；
+ * 新库经 createTables 已含新列，pragma 命中后跳过。SQLite ADD COLUMN 带常量 DEFAULT 安全、不重写整表。
+ */
+function runMigrations(db: BetterSqlite3.Database) {
+  // blueprints.target_words（Phase 18：章节目标字数，0=跟随全局每章字数）
+  const blueprintCols = db.pragma('table_info(blueprints)') as Array<{ name: string }>
+  if (!blueprintCols.some((c) => c.name === 'target_words')) {
+    db.exec(`ALTER TABLE blueprints ADD COLUMN target_words INTEGER NOT NULL DEFAULT 0`)
+    console.log('[Vela DB] migration: blueprints.target_words 已添加')
+  }
 }
 
 /** 创建完整表结构（9 张核心表 + 3 张沿用表） */
@@ -90,6 +107,7 @@ function createTables(db: BetterSqlite3.Database) {
       user_guidance TEXT DEFAULT '',              -- 用户预设指导
       notes TEXT DEFAULT '',                      -- 后处理提取的章节要点
       notes_updated_at TEXT DEFAULT '',           -- notes 提取时间
+      target_words INTEGER NOT NULL DEFAULT 0,    -- 本章目标字数（Phase 18，0=跟随全局每章字数）
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );

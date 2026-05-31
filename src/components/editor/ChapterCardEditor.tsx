@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import {
   Save, BookOpen, RefreshCw, Plus, Trash2,
   Sparkles, PenLine
@@ -6,12 +6,14 @@ import {
 import { useProjectStore } from '../../stores/project-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 import { useLayoutStore } from '../../stores/layout-store'
+import { useDraftStore } from '../../stores/draft-store'
 import { ipc } from '../../services/ipc-client'
 import {
   loadDirectoryBlueprints,
   saveChapterBlueprint,
   saveAllBlueprints,
   createDirectoryWorkflow,
+  normalizeTargetWords,
   type ChapterBlueprint,
   type DirectoryWorkflowParams,
 } from '../../services/workflows/directory-workflow'
@@ -26,20 +28,15 @@ import { cn } from '../../lib/utils'
 import { toast } from '../ui/Toast'
 import { confirm } from '../ui/Confirm'
 import { globalEventBus } from '../../shared/event-bus'
+import { CHAPTER_ROLES, CHAPTER_ROLE_COLORS, coerceChapterRole } from '../../shared/chapter-roles'
 
-const ROLES = ['建置', '铺垫', '发展', '冲突', '高潮', '转折', '收尾']
-
-const ROLE_COLORS: Record<string, string> = {
-  高潮: 'bg-red-500/20 text-red-400',
-  冲突: 'bg-orange-500/20 text-orange-400',
-  转折: 'bg-purple-500/20 text-purple-400',
-  建置: 'bg-blue-500/20 text-blue-400',
-  收尾: 'bg-green-500/20 text-green-400',
-}
+// 章节定位常量（7 项口径 + 配色）已迁至 src/shared/chapter-roles.ts，统一引用
 
 /** 章节蓝图编辑器 — 读写 directory.json */
 export default function ChapterCardEditor() {
   const currentProject = useProjectStore(s => s.currentProject)
+  // 实际已写字数来源：订阅各章草稿元数据（草稿增删/定稿时变化，非流式高频，重渲染可接受）
+  const draftsByChapter = useDraftStore(s => s.draftsByChapter)
   // ✅ action 用 getState() 获取，不订阅 workflow store 高频更新
   const startWorkflow = useWorkflowStore.getState().startWorkflow
   const addLog = useWorkflowStore.getState().addLog
@@ -68,7 +65,9 @@ export default function ChapterCardEditor() {
     if (!background) setLoading(true)
     try {
       const data = await loadDirectoryBlueprints()
-      setBlueprints(data)
+      // role 加载兜底（Phase 18）：列表外值经 coerceChapterRole 归一，显示与手动保存都只写规范值
+      const normalized = data.map(b => ({ ...b, role: coerceChapterRole(b.role) }))
+      setBlueprints(normalized)
       if (background) setSelectedIdx(idx => Math.min(idx, Math.max(0, data.length - 1)))
       else if (data.length > 0) setSelectedIdx(0)
       // 获取下一个待写章节号
@@ -110,6 +109,16 @@ export default function ChapterCardEditor() {
 
   const selected = blueprints[selectedIdx] ?? null
 
+  // 每章实际已写字数：定稿优先、否则最新草稿（version 降序首条）的 word_count。useMemo 限制重复计算。
+  const actualWordsByChapter = useMemo(() => {
+    const m: Record<number, number> = {}
+    for (const [ch, list] of Object.entries(draftsByChapter)) {
+      const fin = list.find(d => d.status === 'finalized')
+      m[Number(ch)] = (fin ?? list[0])?.wordCount ?? 0
+    }
+    return m
+  }, [draftsByChapter])
+
   /** 更新选中章节蓝图的字段 */
   const updateField = <K extends keyof ChapterBlueprint>(key: K, value: ChapterBlueprint[K]) => {
     setBlueprints(prev =>
@@ -122,7 +131,11 @@ export default function ChapterCardEditor() {
   const handleSaveOne = async () => {
     if (!currentProject || !selected) return
     setSaving(true)
-    await saveChapterBlueprint(selected)
+    // 跟随全局语义：目标字数经 normalizeTargetWords（=全局或空 → 0），与弹窗写回口径一致
+    const toSave = { ...selected, targetWords: normalizeTargetWords(selected.targetWords, currentProject.novelConfig.wordsPerChapter) }
+    await saveChapterBlueprint(toSave)
+    // 同步本地状态为归一后的值，避免"输入全局值保存后仍显示正数(像钉住)"与 0=跟随全局 UI 不一致
+    setBlueprints(prev => prev.map((b, i) => (i === selectedIdx ? toSave : b)))
     setSaving(false)
     setDirty(false)
     addLog('info', `✅ 第 ${selected.chapterNumber} 章蓝图已保存`)
@@ -132,7 +145,9 @@ export default function ChapterCardEditor() {
   const handleSaveAll = async () => {
     if (!currentProject) return
     setSaving(true)
-    await saveAllBlueprints(blueprints)
+    const toSaveAll = blueprints.map(b => ({ ...b, targetWords: normalizeTargetWords(b.targetWords, currentProject.novelConfig.wordsPerChapter) }))
+    await saveAllBlueprints(toSaveAll)
+    setBlueprints(toSaveAll)  // 同步归一后的值（理由同 handleSaveOne）
     setSaving(false)
     setDirty(false)
     addLog('info', `✅ 已保存全部 ${blueprints.length} 章蓝图`)
@@ -152,6 +167,7 @@ export default function ChapterCardEditor() {
       userGuidance: '',
       notes: '',
       notesUpdatedAt: '',
+      targetWords: 0,
     }
     setBlueprints(prev => [...prev, newBlueprint])
     setSelectedIdx(blueprints.length)
@@ -212,6 +228,8 @@ export default function ChapterCardEditor() {
       keyEvents: bp.keyEvents,
       characters: bp.characters.join('、'),
       userGuidance: bp.userGuidance || '',
+      // 带上蓝图有效目标字数（弹窗预填，蓝图单一数据源）
+      wordsTarget: bp.targetWords > 0 ? bp.targetWords : (currentProject?.novelConfig.wordsPerChapter || 3000),
     })
   }
 
@@ -333,9 +351,16 @@ export default function ChapterCardEditor() {
                 <div className="flex items-center gap-1 mt-0.5">
                   <span className={cn(
                     'text-[0.7rem] px-1 py-0.5 rounded',
-                    ROLE_COLORS[bp.role] || 'bg-[var(--color-hover)] text-[var(--color-text-muted)]'
+                    CHAPTER_ROLE_COLORS[bp.role] || 'bg-[var(--color-hover)] text-[var(--color-text-muted)]'
                   )}>
                     {bp.role}
+                  </span>
+                  <span
+                    className="text-[0.7rem] px-1 py-0.5 rounded font-mono"
+                    style={{ color: 'var(--color-text-muted)' }}
+                    title="已写 / 目标字数"
+                  >
+                    {actualWordsByChapter[bp.chapterNumber] ?? 0}/{bp.targetWords > 0 ? bp.targetWords : currentProject.novelConfig.wordsPerChapter}
                   </span>
                   {bp.userGuidance && (
                     <span
@@ -423,7 +448,7 @@ export default function ChapterCardEditor() {
                     <Select
                       value={selected.role}
                       onValueChange={v => updateField('role', v)}
-                      options={ROLES.map(r => ({ value: r, label: r }))}
+                      options={CHAPTER_ROLES.map(r => ({ value: r, label: r }))}
                     />
                   </div>
                   <div>
@@ -433,6 +458,30 @@ export default function ChapterCardEditor() {
                       onChange={e => updateField('characters', e.target.value.split(/[,，、\s]+/).filter(Boolean))}
                       placeholder="如：主角、反派A"
                     />
+                  </div>
+                </div>
+
+                {/* 字数：目标（可编辑，0=跟随全局）+ 实际已写（只读） */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <Label>目标字数 <span className="text-[0.7rem] opacity-50">（留空 = 跟随全局）</span></Label>
+                    <Input
+                      type="number"
+                      value={selected.targetWords || ''}
+                      placeholder={`跟随全局 (${currentProject.novelConfig.wordsPerChapter})`}
+                      onChange={e => updateField('targetWords', e.target.value === '' ? 0 : (parseInt(e.target.value) || 0))}
+                      min={0}
+                      step={500}
+                    />
+                  </div>
+                  <div>
+                    <Label>实际已写 / 目标</Label>
+                    <div
+                      className="flex h-9 items-center rounded-md border px-3 text-sm font-mono"
+                      style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-panel)', color: 'var(--color-text-muted)' }}
+                    >
+                      {actualWordsByChapter[selected.chapterNumber] ?? 0} / {selected.targetWords > 0 ? selected.targetWords : currentProject.novelConfig.wordsPerChapter} 字
+                    </div>
                   </div>
                 </div>
 

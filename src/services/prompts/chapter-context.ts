@@ -161,7 +161,15 @@ export async function buildChapterContext(
   if (!template) throw new Error(`未找到模板: ${templateKey}`)
 
   const writingStyle = project.novelConfig.writingStyle || ''
-  const wordNumber = project.novelConfig.wordsPerChapter
+  // 目标字数三级回退（Phase 18）：本次 carrier(>0) → 本章蓝图 target_words(>0) → 全局每章字数。
+  // 覆盖弹窗、AI 对话写稿等所有入口——蓝图是生成时的权威单一数据源。
+  let wordNumber = project.novelConfig.wordsPerChapter
+  if (chapterInfo.wordsTarget && chapterInfo.wordsTarget > 0) {
+    wordNumber = chapterInfo.wordsTarget
+  } else {
+    const bp = await ipc.invoke('db:blueprint-get', chapterInfo.chapterNumber).catch(() => null)
+    if (bp && bp.targetWords > 0) wordNumber = bp.targetWords
+  }
   const userGuidance = chapterInfo.userGuidance?.trim() || '（无微操指导）'
 
   // ---- 缓存命中区（跨章稳定，前缀对齐）----

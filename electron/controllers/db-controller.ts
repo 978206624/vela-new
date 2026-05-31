@@ -77,6 +77,16 @@ export function registerDatabaseController() {
     }
   })
 
+  ipcMain.handle('db:blueprint-update-target-words', async (_event, chapterNumber: number, targetWords: number) => {
+    try {
+      const ok = BlueprintRepository.updateTargetWords(chapterNumber, targetWords)
+      if (!ok) return { success: false, error: `第 ${chapterNumber} 章尚无蓝图，无法写入目标字数（请先在「章节蓝图」生成本章）` }
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
   // ============================================================
   // 3. characters — 角色卡
   // ============================================================

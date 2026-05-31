@@ -3,6 +3,7 @@ import { useProjectStore } from '../../stores/project-store'
 import { ipc } from '../ipc-client'
 import type { BlueprintData } from '../../../electron/repositories/blueprint-repository'
 import { stripThinkingTags } from './workflow-utils'
+import { coerceChapterRole } from '../../shared/chapter-roles'
 
 // ==========================================
 // 1. 结构与类型导出 (保留对外的向后兼容)
@@ -21,6 +22,7 @@ const EMPTY_BLUEPRINT: ChapterBlueprint = {
   userGuidance: '',
   notes: '',
   notesUpdatedAt: '',
+  targetWords: 0,
 }
 
 export interface DirectoryWorkflowParams {
@@ -60,7 +62,7 @@ export function parseTextBlueprints(content: string, startNum: number, endNum: n
             ...EMPTY_BLUEPRINT,
             chapterNumber: Number(p.chapterNumber || p.chapter_number || 0),
             title: String(p.title || `第${p.chapterNumber}章`),
-            role: String(p.role || '发展'),
+            role: coerceChapterRole(p.role),
             purpose: String(p.purpose || ''),
             keyEvents: String(p.keyEvents || p.key_events || ''),
             characters: Array.isArray(p.characters) ? p.characters : [],
@@ -96,6 +98,15 @@ export async function saveChapterBlueprint(blueprint: ChapterBlueprint): Promise
 
 export async function saveAllBlueprints(blueprints: ChapterBlueprint[]): Promise<void> {
   await ipc.invoke('db:blueprint-upsert-many', blueprints)
+}
+
+/**
+ * 归一目标字数写入值（Phase 18，"跟随全局"语义）。
+ * 仅当用户显式设成「与当前全局不同的正数」才写正数钉住该章；
+ * 接受全局预填值或留空（input<=0 或 ===global）一律存 0 = 跟随全局。
+ */
+export function normalizeTargetWords(input: number, global: number): number {
+  return input > 0 && input !== global ? input : 0
 }
 
 export async function getBlueprintCount(): Promise<number> {

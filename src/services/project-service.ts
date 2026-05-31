@@ -15,6 +15,7 @@
 import { globalEventBus } from '../shared/event-bus'
 import { useProjectStore } from '../stores/project-store'
 import { useCharacterStore, coerceRole } from '../stores/character-store'
+import { coerceChapterRole } from '../shared/chapter-roles'
 import { useDraftStore } from '../stores/draft-store'
 import { useAgentStore } from '../stores/agent-store'
 import { ipc } from './ipc-client'
@@ -149,6 +150,31 @@ async function normalizeCharacterRoles(): Promise<void> {
 }
 
 /**
+ * 一次性归一历史脏数据：列表外章节定位 role → coerceChapterRole → 7 项，逐个写回（只动 role 变了的）。
+ * 与角色 role 同思路（消「章节定位」下拉幻影选项）。幂等：合法 role 满足 role === coerceChapterRole(role)，跳过。
+ * 单个失败跳过、不阻塞项目打开。
+ */
+async function normalizeChapterRoles(): Promise<void> {
+  const blueprints = await ipc.invoke('db:blueprint-get-all').catch(() => [])
+  const offList = blueprints.filter((b) => b.role !== coerceChapterRole(b.role))
+  if (offList.length === 0) return
+  let fixed = 0
+  for (const b of offList) {
+    try {
+      const res = await ipc.invoke('db:blueprint-upsert', { ...b, role: coerceChapterRole(b.role) })
+      if (!res.success) {
+        console.warn(`[ProjectService] 章节定位归一失败：第${b.chapterNumber}章`, res.error)
+        continue
+      }
+      fixed++
+    } catch {
+      /* 单个失败跳过 */
+    }
+  }
+  if (fixed > 0) console.log(`[ProjectService] 已归一 ${fixed}/${offList.length} 个列表外章节定位`)
+}
+
+/**
  * 项目打开后的初始化 — 并行加载所有 Layer 2 数据
  * 由 project-store.openProject 成功后调用
  */
@@ -166,6 +192,8 @@ export async function onProjectOpened(): Promise<void> {
   // 一次性归一历史脏数据：把列表外的角色 role（旧版定稿后处理存的中文如「配角」）
   // 经 coerceRole 归一为 4 枚举并写回，消除「定位」下拉幻影选项。幂等：已合法的跳过。
   await normalizeCharacterRoles()
+  // 同思路归一章节定位 role（消下拉幻影选项），幂等、单个失败不阻塞
+  await normalizeChapterRoles()
 
   // 广播项目已就绪事件
   globalEventBus.emit('PROJECT_CHANGED', { projectPath: project.path })

@@ -4,6 +4,7 @@ import { getPromptTemplate } from '../../prompt-templates'
 import { DirectoryPromptBuilder } from '../../prompts/prompt-builder'
 import { DirectoryWorkflowParams, ChapterBlueprint, parseTextBlueprints, saveAllBlueprints } from '../directory-workflow'
 import { globalEventBus } from '../../../shared/event-bus'
+import { coerceChapterRole } from '../../../shared/chapter-roles'
 
 /**
  * 从流式 JSON（裸数组 [...] 或 {"blueprints":[...]}）中抽取「已闭合的顶层对象」字符串。
@@ -46,7 +47,7 @@ function normalizeBlueprint(p: Record<string, unknown>): ChapterBlueprint {
   return {
     chapterNumber,
     title: String(p.title || `第${chapterNumber}章`),
-    role: String(p.role || '发展'),
+    role: coerceChapterRole(p.role),
     purpose: String(p.purpose || ''),
     keyEvents: String(p.keyEvents ?? p.key_events ?? ''),
     characters: Array.isArray(p.characters) ? p.characters as string[] : [],
@@ -54,6 +55,7 @@ function normalizeBlueprint(p: Record<string, unknown>): ChapterBlueprint {
     userGuidance: '',
     notes: '',
     notesUpdatedAt: '',
+    targetWords: Number(p.targetWords) || 0,
   }
 }
 

@@ -17,6 +17,7 @@ export interface BlueprintRow {
     user_guidance: string
     notes: string
     notes_updated_at: string
+    target_words: number
     created_at: string
     updated_at: string
 }
@@ -33,6 +34,8 @@ export interface BlueprintData {
     userGuidance: string
     notes: string
     notesUpdatedAt: string
+    /** 本章目标字数（Phase 18）。0 = 跟随全局每章字数；>0 = 钉住该章 */
+    targetWords: number
 }
 
 function rowToData(row: BlueprintRow): BlueprintData {
@@ -49,6 +52,7 @@ function rowToData(row: BlueprintRow): BlueprintData {
         userGuidance: row.user_guidance,
         notes: row.notes,
         notesUpdatedAt: row.notes_updated_at,
+        targetWords: row.target_words ?? 0,
     }
 }
 
@@ -97,8 +101,8 @@ export class BlueprintRepository {
         db.prepare(`
       INSERT INTO blueprints (
         chapter_number, title, role, purpose, key_events, characters,
-        suspense_hook, user_guidance, notes, notes_updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        suspense_hook, user_guidance, notes, notes_updated_at, target_words
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(chapter_number) DO UPDATE SET
         title = excluded.title,
         role = excluded.role,
@@ -109,6 +113,7 @@ export class BlueprintRepository {
         user_guidance = excluded.user_guidance,
         notes = excluded.notes,
         notes_updated_at = excluded.notes_updated_at,
+        target_words = excluded.target_words,
         updated_at = datetime('now')
     `).run(
             data.chapterNumber,
@@ -121,6 +126,7 @@ export class BlueprintRepository {
             data.userGuidance,
             data.notes,
             data.notesUpdatedAt,
+            data.targetWords ?? 0,
         )
     }
 
@@ -155,5 +161,19 @@ export class BlueprintRepository {
       SET notes = ?, notes_updated_at = datetime('now'), updated_at = datetime('now')
       WHERE chapter_number = ?
     `).run(notes, chapterNumber)
+    }
+
+    /** 仅更新 target_words 字段（Phase 18：章节目标字数，0=跟随全局每章字数）。
+     *  返回是否命中行（false = 该章无蓝图、未写入），供 IPC 层如实上报，避免"假成功"。 */
+    static updateTargetWords(chapterNumber: number, targetWords: number): boolean {
+        const db = getProjectDb()
+        if (!db) return false
+
+        const info = db.prepare(`
+      UPDATE blueprints
+      SET target_words = ?, updated_at = datetime('now')
+      WHERE chapter_number = ?
+    `).run(targetWords, chapterNumber)
+        return info.changes > 0
     }
 }

@@ -19,6 +19,8 @@ export interface ChapterInfo {
   userGuidance?: string
   /** 用户自定义知识库检索关键词（追加到向量搜索 query） */
   knowledgeQueryHint?: string
+  /** 本章目标字数（Phase 18，>0 时覆盖；缺失/0 由 chapter-context 回退蓝图 target→全局） */
+  wordsTarget?: number
 }
 
 export interface RefineOnlyParams {

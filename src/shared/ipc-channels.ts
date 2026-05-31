@@ -355,6 +355,7 @@ export interface DatabaseChannels {
   'db:blueprint-upsert': { args: [data: BlueprintData]; return: { success: boolean; error?: string } }
   'db:blueprint-upsert-many': { args: [items: BlueprintData[]]; return: { success: boolean; error?: string } }
   'db:blueprint-update-notes': { args: [chapterNumber: number, notes: string]; return: { success: boolean; error?: string } }
+  'db:blueprint-update-target-words': { args: [chapterNumber: number, targetWords: number]; return: { success: boolean; error?: string } }
 
   // 3. characters
   'db:character-get-all': { args: []; return: CharacterData[] }
