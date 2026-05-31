@@ -99,6 +99,10 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
   loading: false,
 
   createProject: async (config) => {
+    // 必须先关旧项目再 create：project:create 会 initProjectDatabase 切到新库但不改 token，
+    // 若旧项目还开着，关旧项目时的 Agent 取消收尾落库会 guard 放行写进新库（串库）。
+    // 先 await closeProject：此时旧库仍是当前库、token 仍是旧值，收尾落进旧库，且 db:close 后再 create。
+    if (get().currentProject) await get().closeProject()
     set({ loading: true })
     try {
       const result = await ipc.invoke('project:create', config)
@@ -221,6 +225,9 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
     // token 已经递增（不再等于 closingToken），主进程跳过清空，避免误清。
     // 单 path 在 close A → reopen A 的同路径场景下挡不住，token 单调递增可以。
     void ipc.invoke('project:set-current', null, closingPath, closingToken)
+    // 关闭项目库：否则 projectDb 仍开着，无项目时 Agent 面板仍可发消息/清空，
+    // 会写进上一个项目的对话表（串库）。收尾落库已在 callProjectClosed 内完成。
+    try { await ipc.invoke('db:close') } catch { /* 关库失败不阻塞 */ }
   },
 
   updateCharacterStates: async (states) => {

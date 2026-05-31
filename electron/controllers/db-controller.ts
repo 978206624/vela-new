@@ -433,7 +433,8 @@ ipcMain.handle('db:revision-create', async (_event, params: {
   })
 
   ipcMain.handle('db:conversation-upsert', async (_event, conv: ConversationRecord, expectedToken?: number) => {
-    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+    // 写操作必须带 token：undefined（无项目）也拒绝，防止关项目后 projectDb 仍开着时写进残留库
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
       return { success: false, stale: true }
     }
     try {
@@ -445,7 +446,7 @@ ipcMain.handle('db:revision-create', async (_event, params: {
   })
 
   ipcMain.handle('db:conversation-delete', async (_event, id: string, expectedToken?: number) => {
-    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
       return { success: false, stale: true }
     }
     try {
@@ -457,7 +458,7 @@ ipcMain.handle('db:revision-create', async (_event, params: {
   })
 
   ipcMain.handle('db:conversation-clear', async (_event, expectedToken?: number) => {
-    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
       return { success: false, stale: true }
     }
     try {

@@ -258,6 +258,8 @@ const toRecord = (conv: AgentConversation): ConversationRecord => ({
  */
 const persistConversationAsync = (conv: AgentConversation | undefined, expectedToken?: number): Promise<void> => {
   if (!conv || conv.messages.length === 0) return Promise.resolve()
+  // 无 token（无项目/项目已关）→ 跳过：项目库可能已 db:close，写也会被后端 token guard 拒绝
+  if (expectedToken === undefined) return Promise.resolve()
   return ipc.invoke('db:conversation-upsert', toRecord(conv), expectedToken)
     .then(() => { /* ok */ })
     .catch(() => { /* 持久化失败不影响主流程 */ })
@@ -441,15 +443,15 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         : state.activeConversationId
       return { conversations: filtered, activeConversationId: nextId }
     })
-    // 同步删库（token 在动作入口捕获）
-    ipc.invoke('db:conversation-delete', id, getProjectToken()).catch(() => { /* 删库失败不影响内存状态 */ })
+    // 同步删库（token 在动作入口捕获）；无项目时跳过
+    { const t = getProjectToken(); if (t !== undefined) ipc.invoke('db:conversation-delete', id, t).catch(() => { /* 删库失败不影响内存状态 */ }) }
   },
 
   clearAll: () => {
     // 作废在途 select：清空后旧 select 晚返回不得把 active 指向已清掉的会话
     ++selectSeq
     set({ conversations: [], activeConversationId: null })
-    ipc.invoke('db:conversation-clear', getProjectToken()).catch(() => { /* 清库失败不影响内存状态 */ })
+    { const t = getProjectToken(); if (t !== undefined) ipc.invoke('db:conversation-clear', t).catch(() => { /* 清库失败不影响内存状态 */ }) }
   },
 
   loadConversations: async () => {
@@ -544,7 +546,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
                   c.id === activeConv.id ? { ...c, messages: [], messageCount: 0 } : c
                 ),
               }))
-              if (wasPersisted) {
+              if (wasPersisted && token !== undefined) {
                 ipc.invoke('db:conversation-delete', activeConv.id, token).catch(() => { /* 删库失败不影响内存 */ })
               }
             }
