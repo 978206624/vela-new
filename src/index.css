@@ -735,15 +735,6 @@
   .ivory ::-webkit-scrollbar-thumb:hover {
     background: rgba(140, 120, 100, 0.38);
   }
-
-  /* 正文/草稿/架构文件（均为 CodeMirror）内容区隐藏滚动条（仍可滚动）。
-     精准作用于 .cm-scroller——只命中 CodeMirror 的内容滚动元素，
-     不影响表单编辑器、Select/弹层下拉、左树、AI 面板等其它滚动区域。 */
-  .cm-scroller::-webkit-scrollbar {
-    width: 0;
-    height: 0;
-    display: none;
-  }
 }
 
 /* =====================================================================

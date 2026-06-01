@@ -344,7 +344,9 @@ export default function CodeMirrorEditor({
           if (aiResult) return;
           // setBubbleOpen(false) 交给 handleUpdate 里面的 selection empty 判断即可
         }}>
-        <div className="absolute inset-0">
+        {/* 右侧留出间距：让编辑器滚动条整体内移，不贴着面板右缘，
+            避免压住 AI 面板拖拽手柄导致难以拖动调整宽度 */}
+        <div className="absolute inset-0 pr-2">
           <CodeMirror
             ref={editorRef}
             value={editorContent}
