@@ -1,4 +1,4 @@
-import { X, FileText, Settings, Users, ArrowLeftRight, MoreHorizontal, BookOpen, History, ClipboardCheck, Globe, ChevronLeft, ChevronRight, PenTool } from 'lucide-react'
+import { X, FileText, Settings, Users, ArrowLeftRight, MoreHorizontal, BookOpen, History, ClipboardCheck, Globe, ChevronLeft, ChevronRight, PenTool, Copy, Check } from 'lucide-react'
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { ContextMenu, type ContextMenuEntry } from '../ui/ContextMenu'
 import {
@@ -37,7 +37,21 @@ function ProseEditorWrapper({
 }) {
   const [wordCount, setWordCount] = useState(0)
   const [jumpHover, setJumpHover] = useState(false)
+  const [copied, setCopied] = useState(false)
   const fileName = tab.name
+
+  /** 复制正文全文到剪贴板 */
+  const doCopy = async () => {
+    const body = tab.content ?? ''
+    if (!body) return
+    try {
+      await navigator.clipboard.writeText(body)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch (e) {
+      toast.error(`复制失败：${e}`)
+    }
+  }
 
   // 跳转到该定稿正文对应的定稿草稿。
   // 核实：vela://manuscript/{id} 的 id == 该章 finalized 草稿的 draft id（ProjectTree 构造 + readVelaContent 同源解析），
@@ -99,6 +113,18 @@ function ProseEditorWrapper({
               {wordCount.toLocaleString()} 字
             </span>
           )}
+          <button
+            className="flex items-center gap-1 text-xs px-2 h-6 rounded transition-colors flex-shrink-0 whitespace-nowrap"
+            style={{
+              color: 'var(--color-text-secondary)',
+              border: '1px solid var(--color-border)',
+            }}
+            onClick={doCopy}
+            title="复制正文全文到剪贴板"
+          >
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+            {copied ? '已复制' : '复制'}
+          </button>
           <button
             className="flex items-center gap-1 text-xs px-2 h-6 rounded transition-colors"
             style={{

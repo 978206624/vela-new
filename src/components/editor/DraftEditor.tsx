@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Sparkles, Search, BadgeCheck, Save, FileStack, FileText, Wrench, FilePenLine, Trash2 } from 'lucide-react'
+import { Sparkles, Search, BadgeCheck, Save, FileStack, FileText, Wrench, FilePenLine, Trash2, Copy, Check } from 'lucide-react'
 
 import { useProjectStore } from '../../stores/project-store'
 import { useEditorStore } from '../../stores/editor-store'
@@ -118,6 +118,7 @@ export default function DraftEditor({ filePath, content }: Props) {
     Object.fromEntries(REVIEW_DIMS.map(d => [d.key, true]))
   )
   const [charCount, setCharCount] = useState(0)
+  const [copied, setCopied] = useState(false)
   const isDirty = useEditorStore(s => s.tabs.find(t => t.filePath === filePath)?.dirty ?? false)
   const currentBodyRef = useRef(content)
 
@@ -149,6 +150,19 @@ export default function DraftEditor({ filePath, content }: Props) {
       }
     } finally {
       setSaving(false)
+    }
+  }
+
+  /** 复制正文全文到剪贴板 */
+  const doCopy = async () => {
+    try {
+      const body = currentBodyRef.current ?? content
+      if (!body) return
+      await navigator.clipboard.writeText(body)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch (e) {
+      toast.error(`复制失败：${e}`)
     }
   }
 
@@ -400,6 +414,17 @@ export default function DraftEditor({ filePath, content }: Props) {
               </span>
             )}
 
+            {/* 复制正文 */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={doCopy}
+              title="复制正文全文到剪贴板"
+            >
+              {copied ? <Check size={12} /> : <Copy size={12} />}
+              {copied ? '已复制' : '复制'}
+            </Button>
+
             {/* 未保存指示灯 */}
             {isDirty && (
               <span
@@ -509,6 +534,16 @@ export default function DraftEditor({ filePath, content }: Props) {
             <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
               {status === 'finalized' ? '已定稿（只读）' : '已归档（只读）'}
             </span>
+            {/* 复制正文 */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={doCopy}
+              title="复制正文全文到剪贴板"
+            >
+              {copied ? <Check size={12} /> : <Copy size={12} />}
+              {copied ? '已复制' : '复制'}
+            </Button>
             {/* 已定稿 → 修改此定稿（派生可编辑副本，老定稿保留生效） */}
             {status === 'finalized' && meta && (
               <Button
