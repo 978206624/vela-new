@@ -47,6 +47,29 @@ async function execFileWithRetry(file, args, retryCount = 5) {
   throw lastError;
 }
 
+// Windows 上刚解压/写入的 electron.exe 常被实时扫描（Defender）短暂锁定，
+// 导致 copyFile 抛 UNKNOWN/EBUSY/EPERM。和 rcedit 同样用退避重试兜住瞬时锁。
+async function copyFileWithRetry(src, dest, retryCount = 8) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    try {
+      await copyFile(src, dest);
+      return;
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === retryCount) {
+        break;
+      }
+
+      await delay(500 * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+}
+
 exports.afterExtract = async function afterExtract(context) {
   if (context.electronPlatformName !== "win32") {
     return;
@@ -105,13 +128,13 @@ exports.afterExtract = async function afterExtract(context) {
   );
 
   try {
-    await copyFile(executablePath, tempExecutablePath);
+    await copyFileWithRetry(executablePath, tempExecutablePath);
 
     const tempArgs = [...args];
     tempArgs[0] = tempExecutablePath;
 
     await execFileWithRetry(appBuilderPath, ["rcedit", "--args", JSON.stringify(tempArgs)]);
-    await copyFile(tempExecutablePath, executablePath);
+    await copyFileWithRetry(tempExecutablePath, executablePath);
   } finally {
     await rm(tempExecutablePath, { force: true });
   }
