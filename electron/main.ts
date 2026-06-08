@@ -46,6 +46,10 @@ function createWindow() {
       // 安全性设置
       nodeIntegration: false,
       contextIsolation: true,
+      // 关闭后台节流：写作管线编排（step 状态机、取消轮询、流式 append）全在渲染进程，
+      // 默认 backgroundThrottling=true 会在窗口被遮挡/最小化时把定时器掐到 1Hz、暂停 rAF，
+      // 导致切后台时生成卡住、IPC chunk 积压。生成属于长任务，后台必须照常推进。
+      backgroundThrottling: false,
     },
   })
 

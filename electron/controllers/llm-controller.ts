@@ -1,9 +1,44 @@
-import { ipcMain, BrowserWindow } from 'electron'
+import { app, ipcMain, BrowserWindow, powerSaveBlocker } from 'electron'
 import { readJsonFile, writeJsonFile, MODELS_CONFIG_PATH, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG } from '../utils/config-utils'
 import { ModelProfile, GlobalConfig, LLMRequest } from '../../src/shared/ipc-channels'
 import { LLMFactory } from '../llm/llm-factory'
 
-const activeStreams = new Map<string, AbortController>()
+// 每条在途流的记录：controller 用于中断，finalize 由 generate-stream 闭包注入，
+// 是唯一的收尾权威——onDone / onError / promise 兜底 / 窗口销毁 / 主动取消 / 退出 六入口都走它，
+// 单次幂等，保证 activeStreams 删除与 powerSaveBlocker 释放不被任何路径绕过。
+interface ActiveStream {
+  controller: AbortController
+  finalize: (notify?: () => void) => void
+  // 主动取消：中断 + 收尾，并向渲染端补发 stream-error('已取消生成')。
+  // 必须发这条事件——渲染端 llm-store 仅在 stream-done/stream-error 里解绑监听、settle 业务 Promise，
+  // 静默收尾会让前端监听器泄漏、workflow/Agent 的 generateStream Promise 永不兑现。
+  cancel: () => void
+}
+const activeStreams = new Map<string, ActiveStream>()
+
+// 生成期间阻止系统挂起（休眠/息屏）。长章节生成可能持续数分钟，
+// 若 OS 把进程挂起，主进程的流式请求也会停。只要有活跃流就持有 blocker，全部结束即释放。
+let powerSaveBlockerId: number | null = null
+function refreshPowerSaveBlocker() {
+  if (activeStreams.size > 0) {
+    if (powerSaveBlockerId === null || !powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+      powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension')
+    }
+  } else if (powerSaveBlockerId !== null) {
+    if (powerSaveBlocker.isStarted(powerSaveBlockerId)) powerSaveBlocker.stop(powerSaveBlockerId)
+    powerSaveBlockerId = null
+  }
+}
+
+// 向渲染进程发送：窗口或 webContents 可能在流结束前已销毁，send 会抛错并阻断调用方后续清理，
+// 这里统一判活并吞掉异常（含判活与发送之间窗口被销毁的竞态），保证收尾逻辑始终能执行。
+function safeSend(win: BrowserWindow | null, channel: string, payload: unknown) {
+  try {
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send(channel, payload)
+    }
+  } catch { /* 销毁竞态，忽略 */ }
+}
 
 function loadModelConfigs(): ModelProfile[] {
   return readJsonFile<ModelProfile[]>(MODELS_CONFIG_PATH, [])
@@ -79,41 +114,84 @@ export function registerLLMController() {
     if (!model) return { requestId, started: false }
 
     const abortController = new AbortController()
-    activeStreams.set(requestId, abortController)
     const win = BrowserWindow.fromWebContents(event.sender)
+
+    // 单次收尾：onDone / onError / promise 兜底 / 窗口销毁 / 主动取消 / 退出 都可能触发。
+    // settled 门闩保证只发一次终止消息、只解绑一次监听、只清理一次资源；
+    // notify 放进 try/finally——即便发送逻辑抛错，activeStreams 删除与 blocker 释放也必然执行。
+    let settled = false
+    const finalize = (notify?: () => void) => {
+      if (settled) return
+      settled = true
+      event.sender.off('destroyed', onSenderDestroyed)
+      try {
+        notify?.()
+      } finally {
+        activeStreams.delete(requestId)
+        refreshPowerSaveBlocker()
+      }
+    }
+    // 窗口/渲染进程销毁后流已无消费者：中断主进程请求并收尾，避免 blocker 永久悬挂。
+    function onSenderDestroyed() {
+      abortController.abort()
+      finalize()
+    }
+    event.sender.once('destroyed', onSenderDestroyed)
+
+    // 主动取消：中断后补发 stream-error('已取消生成')，复用渲染端既有的 stream-error cleanup 路径。
+    // （字符串与各 provider 的 AbortError 文案一致，前端 isCancellation 据此识别为取消而非真失败。）
+    const cancel = () => {
+      abortController.abort()
+      finalize(() => safeSend(win, 'llm:stream-error', { requestId, error: '已取消生成' }))
+    }
+
+    activeStreams.set(requestId, { controller: abortController, finalize, cancel })
+    refreshPowerSaveBlocker()
 
     const provider = LLMFactory.getProvider(model)
 
-    // We do not await this globally since it's streaming independently
-    provider.generateStream(model, request.messages, {
+    // 不 await：流式独立推进。但补 .catch 兜底——一旦 provider 直接 reject 或回调自身抛错，
+    // 仍能收尾，不把资源释放完全托付给 onDone/onError 回调契约。
+    void provider.generateStream(model, request.messages, {
       temperature: request.temperature ?? model.temperature,
       maxTokens: request.maxTokens ?? model.maxTokens,
       responseFormat: request.responseFormat,
       thinking: resolveThinking(model, request.thinking),
       tools: request.tools,
       signal: abortController.signal,
-      onChunk: (chunk: string) => win?.webContents.send('llm:stream-chunk', { requestId, chunk }),
+      onChunk: (chunk: string) => safeSend(win, 'llm:stream-chunk', { requestId, chunk }),
       onDone: (fullText, usage, toolCalls, thinkingBlocks, reasoningContent) => {
-        win?.webContents.send('llm:stream-done', { requestId, fullText, usage, toolCalls, thinkingBlocks, reasoningContent })
-        activeStreams.delete(requestId)
+        finalize(() => safeSend(win, 'llm:stream-done', { requestId, fullText, usage, toolCalls, thinkingBlocks, reasoningContent }))
       },
       onError: (error: string) => {
-        win?.webContents.send('llm:stream-error', { requestId, error })
-        activeStreams.delete(requestId)
+        finalize(() => safeSend(win, 'llm:stream-error', { requestId, error }))
       },
+    }).catch((err) => {
+      finalize(() => safeSend(win, 'llm:stream-error', { requestId, error: String(err) }))
     })
 
     return { requestId, started: true }
   })
 
   ipcMain.handle('llm:cancel', async (_event, requestId: string) => {
-    const controller = activeStreams.get(requestId)
-    if (controller) {
-      controller.abort()
-      activeStreams.delete(requestId)
+    const stream = activeStreams.get(requestId)
+    if (stream) {
+      // 走闭包 cancel：中断 + 收尾 + 补发 stream-error('已取消生成')，不依赖 provider 的取消回调一定到达
+      // （防御 provider 吞掉 abort），同时驱动渲染端 cleanup 与 Promise settle。
+      stream.cancel()
       return { success: true }
     }
     return { success: false }
+  })
+
+  // 应用退出时统一收尾：中断所有在途流并经各自 finalize 释放资源（解绑监听 + 删除 + 释放 blocker）。
+  // 先快照再遍历，避免 finalize 在迭代中删除 Map 条目。
+  app.on('before-quit', () => {
+    for (const stream of [...activeStreams.values()]) {
+      stream.controller.abort()
+      stream.finalize()
+    }
+    refreshPowerSaveBlocker()
   })
 
   ipcMain.handle('llm:list-models', async () => loadModelConfigs())

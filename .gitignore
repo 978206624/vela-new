@@ -39,3 +39,5 @@ tailwind.config.js.bak
 # AI 工具会话产物（tk 多模型会审 / playwright MCP 截图等，不入库）
 .tk-meeting/
 .playwright-mcp/
+
+*.tsbuildinfo
