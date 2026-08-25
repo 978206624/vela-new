@@ -60,7 +60,7 @@ function runMigrations(db: BetterSqlite3.Database) {
   }
 }
 
-/** 创建完整表结构（9 张核心表 + 3 张沿用表） */
+/** 创建完整表结构（10 张核心表 + 3 张沿用表） */
 function createTables(db: BetterSqlite3.Database) {
   db.exec(`
     -- ============================================================
@@ -228,6 +228,29 @@ function createTables(db: BetterSqlite3.Database) {
       completed_at TEXT DEFAULT '',
       last_attempt_at TEXT DEFAULT '',
       FOREIGN KEY (run_id) REFERENCES post_process_runs(id) ON DELETE CASCADE
+    );
+
+    -- ============================================================
+    -- 10. volumes — 分卷（Phase 19）
+    -- 空表 = 单卷模式：所有读卷方经 src/services/volume-service.ts 回落到
+    --   project_core.synopsis + novelConfig.totalChapters，行为与分卷前逐字一致。
+    --   故老库首次打开自动建空表即可，无需 migration、无需数据迁移。
+    -- open_threads 列存未回收伏笔数组的 JSON：
+    --   [{ chapter: number, thread: string, urgency: 'high' | 'mid' | 'low' }]
+    -- ============================================================
+    CREATE TABLE IF NOT EXISTS volumes (
+      volume_number INTEGER PRIMARY KEY,          -- 卷序号，从 1 起
+      title TEXT NOT NULL DEFAULT '',             -- 卷名，如「第二卷 · 北境风雪」
+      start_chapter INTEGER NOT NULL,             -- 起始章号（含）
+      end_chapter INTEGER NOT NULL,               -- 结束章号（含）
+      premise TEXT DEFAULT '',                    -- 本卷主线目标 + 核心冲突
+      synopsis TEXT DEFAULT '',                   -- 本卷大纲（按结构模式在卷内展开）
+      opening_state TEXT DEFAULT '',              -- 开卷状态（= 上一卷 closing_state）
+      closing_state TEXT DEFAULT '',              -- 收卷状态（AI 从本卷实际写作结果提炼）
+      open_threads TEXT DEFAULT '[]',             -- 未回收伏笔 (JSON Array)
+      status TEXT DEFAULT 'planned',              -- planned=未开始 / writing=写作中 / done=已完成
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
     );
 
     -- ============================================================

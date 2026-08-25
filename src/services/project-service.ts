@@ -18,6 +18,7 @@ import { useCharacterStore, coerceRole } from '../stores/character-store'
 import { coerceChapterRole } from '../shared/chapter-roles'
 import { useDraftStore } from '../stores/draft-store'
 import { useAgentStore } from '../stores/agent-store'
+import { useVolumeStore } from '../stores/volume-store'
 import { ipc } from './ipc-client'
 
 /** 存放解绑函数，用于 dispose 时清理 */
@@ -113,6 +114,9 @@ export function initProjectService(): void {
       if (resources.includes('all') || resources.includes('fileTree')) {
         await useProjectStore.getState().refreshFileTree()
       }
+      if (resources.includes('all') || resources.includes('volumes')) {
+        await useVolumeStore.getState().loadAll()
+      }
     })
   )
 
@@ -182,11 +186,13 @@ export async function onProjectOpened(): Promise<void> {
   const project = useProjectStore.getState().currentProject
   if (!project) return
 
-  // 并行加载角色卡、草稿列表、Agent 对话列表（此时项目库已 open，建表已完成）
+  // 并行加载角色卡、草稿列表、Agent 对话列表、分卷（此时项目库已 open，建表已完成）
+  // 分卷：老项目为空表，loadAll 拿到 [] 即单卷模式，不报错、不迁移
   await Promise.all([
     useCharacterStore.getState().load(),
     useDraftStore.getState().loadAllDrafts(),
     useAgentStore.getState().loadConversations(),
+    useVolumeStore.getState().loadAll(),
   ])
 
   // 一次性归一历史脏数据：把列表外的角色 role（旧版定稿后处理存的中文如「配角」）
@@ -222,6 +228,7 @@ export async function onProjectClosed(closingToken?: number): Promise<void> {
   // 重置 Layer 2 Store
   useCharacterStore.getState().reset()
   useDraftStore.getState().reset()
+  useVolumeStore.getState().reset()
 
   console.log('[ProjectService] 项目已关闭，Layer 2 Store 已重置')
 }

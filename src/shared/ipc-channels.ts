@@ -332,6 +332,7 @@ export interface ModelProfile {
 // ===== 引入 DB 类型 =====
 import type { ProjectCoreData } from '../../electron/repositories/project-core-repository'
 import type { BlueprintData } from '../../electron/repositories/blueprint-repository'
+import type { VolumeData, VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
 import type { CharacterData, CharacterStateData } from '../../electron/repositories/character-repository'
 import type { DraftMeta, DraftFull } from '../../electron/repositories/draft-repository'
 import type { RevisionMeta, RevisionFull } from '../../electron/repositories/revision-repository'
@@ -356,6 +357,7 @@ export interface DatabaseChannels {
   'db:blueprint-upsert-many': { args: [items: BlueprintData[]]; return: { success: boolean; error?: string } }
   'db:blueprint-update-notes': { args: [chapterNumber: number, notes: string]; return: { success: boolean; error?: string } }
   'db:blueprint-update-target-words': { args: [chapterNumber: number, targetWords: number]; return: { success: boolean; error?: string } }
+  'db:blueprint-delete-range': { args: [startChapter: number, endChapter: number, expectedToken?: number]; return: { success: boolean; deleted: number; stale?: boolean; error?: string } }
 
   // 3. characters
   'db:character-get-all': { args: []; return: CharacterData[] }
@@ -417,6 +419,16 @@ export interface DatabaseChannels {
   'db:conversation-upsert': { args: [conv: ConversationRecord, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:conversation-delete': { args: [id: string, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:conversation-clear': { args: [expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+
+  // 10. volumes — 分卷（Phase 19）。空表 = 单卷模式，读侧返回 [] / null，由 volume-service 统一回落
+  // 写侧一律带 expectedToken 跨项目守卫（同 db:conversation-*），token 须在动作发起时捕获
+  'db:volume-get-all': { args: []; return: VolumeData[] }
+  'db:volume-get': { args: [volumeNumber: number]; return: VolumeData | null }
+  'db:volume-get-by-chapter': { args: [chapterNumber: number]; return: VolumeData | null }
+  'db:volume-upsert': { args: [data: VolumeData, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:volume-update-status': { args: [volumeNumber: number, status: VolumeStatus, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:volume-update-threads': { args: [volumeNumber: number, threads: OpenThread[], expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:volume-delete': { args: [volumeNumber: number, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
 }
 
 // ===== 知识库频道 =====

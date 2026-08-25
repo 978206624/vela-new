@@ -151,6 +151,51 @@ export class BlueprintRepository {
         db.prepare('DELETE FROM blueprints WHERE chapter_number = ?').run(chapterNumber)
     }
 
+    /**
+     * 批量删除章号闭区间内的蓝图（Phase 19：孤儿蓝图「清除并随新卷重新生成」策略）。
+     *
+     * **破坏性操作，事务内强制两道保护**：
+     * 1. 参数必须是 ≥1 的整数且 start ≤ end —— 否则 `(1, 999999)` 这类错误调用会删光全部蓝图。
+     * 2. 区间内不得存在已定稿章节 —— 定稿章的蓝图承载标题、notes（定稿后处理从正文提炼的
+     *    章节要点，是续卷「接着事实续」的唯一数据源）与目标字数，删掉不可恢复。
+     *
+     * 跨项目 token 守卫只能防「删错项目」，防不了「在对的项目里删错范围」，故必须有本层校验。
+     * 孤儿蓝图按定义位于「已定稿最大章号之后」，正常调用不会命中 finalized，不影响预期用途。
+     *
+     * @returns 实际删除条数，供 UI 如实回报「已清除 N 条」
+     */
+    static deleteRange(startChapter: number, endChapter: number): number {
+        if (!Number.isInteger(startChapter) || startChapter < 1) {
+            throw new Error(`起始章号非法：${startChapter}（须为 ≥1 的整数）`)
+        }
+        if (!Number.isInteger(endChapter) || endChapter < startChapter) {
+            throw new Error(`章号区间非法：${startChapter}–${endChapter}（结束章须 ≥ 起始章）`)
+        }
+
+        const db = getProjectDb()
+        if (!db) throw new Error('项目数据库未打开，无法删除章节蓝图')
+
+        const tx = db.transaction(() => {
+            const finalized = db.prepare(`
+        SELECT COUNT(*) as cnt FROM drafts
+        WHERE status = 'finalized' AND chapter_number BETWEEN ? AND ?
+      `).get(startChapter, endChapter) as { cnt: number }
+
+            if (finalized.cnt > 0) {
+                throw new Error(
+                    `第 ${startChapter}–${endChapter} 章中有 ${finalized.cnt} 章已定稿，不可删除其蓝图` +
+                    `（定稿章蓝图的 notes 是续卷推演的数据源）`
+                )
+            }
+
+            return db.prepare(
+                'DELETE FROM blueprints WHERE chapter_number BETWEEN ? AND ?'
+            ).run(startChapter, endChapter).changes
+        })
+
+        return tx() as number
+    }
+
     /** 仅更新 notes 字段 */
     static updateNotes(chapterNumber: number, notes: string): void {
         const db = getProjectDb()

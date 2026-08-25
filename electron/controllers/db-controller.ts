@@ -10,6 +10,7 @@ import { DraftRepository } from '../repositories/draft-repository'
 import { RevisionRepository } from '../repositories/revision-repository'
 import { ReviewRepository } from '../repositories/review-repository'
 import { PostProcessRepository } from '../repositories/post-process-repository'
+import { VolumeRepository, VolumeData, VolumeStatus, OpenThread } from '../repositories/volume-repository'
 
 // 沿用的旧表
 import { LLMHistoryRepository } from '../repositories/llm-repository'
@@ -84,6 +85,21 @@ export function registerDatabaseController() {
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:blueprint-delete-range', async (_event, startChapter: number, endChapter: number, expectedToken?: number) => {
+    // 破坏性写入 + 由续卷长流程（跨 LLM 调用）触发 → 必须比对项目 token，
+    // 防「在 A 项目发起续卷、中途切到 B」把 B 的蓝图删掉（同 commit 80283dd 的串库修复）
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, deleted: 0, stale: true }
+    }
+    try {
+      const deleted = BlueprintRepository.deleteRange(startChapter, endChapter)
+      return { success: true, deleted }
+    } catch (err) {
+      console.error('[db:blueprint-delete-range] 失败:', err)
+      return { success: false, deleted: 0, error: String(err) }
     }
   })
 
@@ -473,6 +489,79 @@ ipcMain.handle('db:revision-create', async (_event, params: {
     }
     try {
       ConversationRepository.clear()
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  // ============================================================
+  // 10. volumes — 分卷（Phase 19）
+  // 空表 = 单卷模式。读侧一律返回空数组 / null，由渲染层 volume-service 统一回落，
+  // 本层不做回落判断（避免回落逻辑在主进程与渲染层各写一份而分叉）。
+  // ============================================================
+  ipcMain.handle('db:volume-get-all', async () => {
+    return VolumeRepository.getAll()
+  })
+
+  ipcMain.handle('db:volume-get', async (_event, volumeNumber: number) => {
+    return VolumeRepository.get(volumeNumber)
+  })
+
+  ipcMain.handle('db:volume-get-by-chapter', async (_event, chapterNumber: number) => {
+    return VolumeRepository.getByChapter(chapterNumber)
+  })
+
+  // 写侧一律带 expectedToken 跨项目守卫：Task 19.2 的 commitNextVolume 跨越两次 LLM 调用
+  // （收卷提炼 + 卷大纲流式生成，分钟级）后才落库，且是「新卷 + 扩总章数 + 追加全书大纲」四连写。
+  // 用户在生成中切项目会把整套结构数据写进另一个项目库，破坏性高于 conversation 串库。
+  // token 须由调用方在**动作发起时**捕获（见 agent-store.ts:236 注释），不可在写入时再取。
+  ipcMain.handle('db:volume-upsert', async (_event, data: VolumeData, expectedToken?: number) => {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      VolumeRepository.upsert(data)
+      return { success: true }
+    } catch (err) {
+      console.error('[db:volume-upsert] 失败:', err)
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:volume-update-status', async (_event, volumeNumber: number, status: VolumeStatus, expectedToken?: number) => {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      const ok = VolumeRepository.updateStatus(volumeNumber, status)
+      if (!ok) return { success: false, error: `第 ${volumeNumber} 卷不存在，无法更新状态` }
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:volume-update-threads', async (_event, volumeNumber: number, threads: OpenThread[], expectedToken?: number) => {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      const ok = VolumeRepository.updateOpenThreads(volumeNumber, threads)
+      if (!ok) return { success: false, error: `第 ${volumeNumber} 卷不存在，无法更新未回收伏笔` }
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:volume-delete', async (_event, volumeNumber: number, expectedToken?: number) => {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      const ok = VolumeRepository.remove(volumeNumber)
+      if (!ok) return { success: false, error: `第 ${volumeNumber} 卷不存在` }
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
