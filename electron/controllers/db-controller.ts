@@ -11,6 +11,7 @@ import { RevisionRepository } from '../repositories/revision-repository'
 import { ReviewRepository } from '../repositories/review-repository'
 import { PostProcessRepository } from '../repositories/post-process-repository'
 import { VolumeRepository, VolumeData, VolumeStatus, OpenThread } from '../repositories/volume-repository'
+import { commitNextVolume, inspectFirstVolume, type CommitNextVolumePayload } from '../repositories/volume-commit'
 
 // 沿用的旧表
 import { LLMHistoryRepository } from '../repositories/llm-repository'
@@ -415,7 +416,13 @@ ipcMain.handle('db:revision-create', async (_event, params: {
   // ============================================================
   // 沿用旧表
   // ============================================================
-  ipcMain.handle('db:log-llm-call', async (_event, call) => {
+  // expectedToken 为**可选**：既有调用方一律不传、行为不变（向后兼容）；
+  // 延迟写入的统计（续卷工作流的 logPolicy:'defer'）必须传起点 token——
+  // 那两次 LLM 调用长达分钟级，期间切项目会把统计写进另一个项目库。
+  ipcMain.handle('db:log-llm-call', async (_event, call, expectedToken?: number) => {
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
     try {
       LLMHistoryRepository.logCall(call)
       return { success: true }
@@ -564,6 +571,24 @@ ipcMain.handle('db:revision-create', async (_event, params: {
       if (!ok) return { success: false, error: `第 ${volumeNumber} 卷不存在` }
       return { success: true }
     } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:volume-inspect-first', async () => {
+    return inspectFirstVolume()
+  })
+
+  // 续卷的单次事务性提交：五项（首卷 / 收卷 / 新卷 / project_core / 孤儿蓝图）
+  // 要么全成要么全不成。token 在此校验一次，事务内不再有跨项目窗口。
+  ipcMain.handle('db:volume-commit-next', async (_event, payload: CommitNextVolumePayload, expectedToken?: number) => {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      return commitNextVolume(payload)
+    } catch (err) {
+      console.error('[db:volume-commit-next] 失败:', err)
       return { success: false, error: String(err) }
     }
   })

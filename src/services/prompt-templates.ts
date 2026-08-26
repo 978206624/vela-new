@@ -540,6 +540,7 @@ export const BUILTIN_PROMPTS: PromptTemplate[] = [
       volume_end: '本卷结束章号',
       chapter_count: '本卷章数',
       pacing_guidance: '节奏/风格指导（可选）',
+      retained_blueprints: '本卷区间内已存在、用户选择保留的旧章节蓝图（可选）',
     },
     content: `请为本书推演**下一卷**的主线与卷内大纲。本卷覆盖 第{{volume_start}}章 到 第{{volume_end}}章，共 {{chapter_count}} 章。
 
@@ -561,6 +562,9 @@ export const BUILTIN_PROMPTS: PromptTemplate[] = [
 
 【本卷结构指导】
 {{structure_guide}}
+
+【本卷区间内已有的旧章节蓝图（如有，必须兼容）】
+{{retained_blueprints}}
 
 【推演守则】
 1. **承接而非重启**：本卷开篇的世界格局、人物处境、敌我关系必须与上面的收束状态严丝合缝。不得让已经解决的冲突重新出现，不得让已经离场的人物无理由回归，不得推翻既有设定。

@@ -12,6 +12,8 @@
     "build": "tsc && vite build && electron-builder",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "harness:volume": "node scripts/diagnostics/run-volume-harness.mjs",
+    "harness:volume-workflow": "node scripts/diagnostics/run-volume-harness.mjs workflow",
     "preview": "vite preview",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build"

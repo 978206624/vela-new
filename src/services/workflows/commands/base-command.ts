@@ -1,5 +1,6 @@
 import type { WorkflowContext, StepCallbacks } from '../../../stores/workflow-store'
 import { useLLMStore } from '../../../stores/llm-store'
+import { getProjectToken } from '../../../stores/volume-store'
 import { globalEventBus, EventPayloadMap } from '../../../shared/event-bus'
 import { ipc } from '../../ipc-client'
 import type { TokenUsage } from '../../../shared/ipc-channels'
@@ -22,7 +23,61 @@ interface CallLLMOptions {
    * 注意：回调里不要 await；解析失败请自行吞掉，不影响主流程。
    */
   onStreamChunk?: (fullText: string) => void
+  /**
+   * `onStreamChunk` 的触发时机。默认 `'object-close'`（既有行为）。
+   *
+   * - `'object-close'`：仅当本段含 `}` 时触发。适合**增量入库**类消费方
+   *   （目录生成逐条解析 JSON 对象），跳过不可能解析成功的片段以省扫描。
+   * - `'every'`：每段都触发。**打字机预览必须用这个**——单个 JSON 对象里
+   *   `}` 只出现在最末尾，用 object-close 会导致整场生成一个回调都不发，
+   *   预览停在空白直到全部结束，"边生成边看"完全失效。
+   */
+  streamChunkMode?: 'object-close' | 'every'
+  /**
+   * llm_calls 统计的写入时机。默认 `'immediate'`（既有行为，调用完成即写）。
+   *
+   * `'defer'`：**不立即写库**，把统计条目暂存到 `context.data.__deferredLLMLogs`，
+   * 由调用方在确认落库时统一 flush、取消时直接丢弃。
+   *
+   * 为什么需要：续卷工作流承诺「用户在预览里点取消 = 零副作用」，而 `logLLMCall`
+   * 会经 `db:log-llm-call` 写项目库——取消后会残留孤儿统计；更严重的是该 handler
+   * 无 token 守卫，两次 LLM 调用长达分钟级，期间切项目会把统计写进另一个项目库。
+   *
+   * ⚠️ 只作用于**成功**的调用。失败（onError）一律立即写：那不是用户取消，
+   * 成本已实际发生，而工作流会就此中止、永远走不到 flush 点，延迟等于丢弃。
+   */
+  logPolicy?: 'immediate' | 'defer'
 }
+
+/** 延迟写入的 llm_calls 条目（logPolicy: 'defer' 时暂存于 context.data） */
+export interface DeferredLLMLog {
+  modelId: string
+  modelName: string
+  purpose: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  durationMs: number
+  success: boolean
+  errorMessage: string
+}
+
+/** context.data 中暂存延迟日志的固定键名 */
+export const DEFERRED_LLM_LOGS_KEY = '__deferredLLMLogs'
+
+/**
+ * context.data 中「工作流起点 token」的固定键名。
+ *
+ * 工作流一旦写入本键，`callLLM` 就切换到**严格模式**：每次发模前核对当前项目 token，
+ * 不一致直接抛错终止，且统计一律记在起点 token 名下。
+ *
+ * 为什么不能每次调用现取：跨多次 LLM 调用的长流程（续卷跨两次、分钟级），
+ * 用户在第一次和第二次之间切了项目时，第二次会读到 B 的 `project_core`
+ * 拼出「A 的收卷报告 + B 的世界设定」这种混合 prompt，失败统计也会合法写进 B 库。
+ *
+ * 不设本键的既有工作流行为完全不变（回退到调用时取当前 token）。
+ */
+export const WORKFLOW_TOKEN_KEY = '__workflowToken'
 
 export interface CommandExecuteParams {
   step: unknown
@@ -56,6 +111,19 @@ export abstract class BaseWorkflowCommand<TResult = string> {
     const modelName = llmStore.models.find(m => m.id === modelId)?.name || modelId
     const purposeStat = options?.purposeLabel ?? options?.purpose ?? ''
     const startTime = Date.now()
+
+    // ⚠️ token 必须在**任何 await 之前**取。llm_calls 的写入发生在流式结束之后
+    // （可能是几分钟），那时 getProjectToken() 已是用户切过去的新项目，
+    // 而 db:log-llm-call 对缺省 token 是放行的——结果把 A 项目的调用统计
+    // 记进 B 项目的库。成功与失败两条路径都要带上它。
+    //
+    // 跨多次调用的长流程会把**起点 token** 放进 context（见 WORKFLOW_TOKEN_KEY）：
+    // 此时不能现取，否则第二次调用会捕获切换后的新 token 并被判为合法。
+    const workflowToken = context?.data[WORKFLOW_TOKEN_KEY] as number | undefined
+    const capturedToken = workflowToken ?? getProjectToken()
+    if (workflowToken !== undefined && getProjectToken() !== workflowToken) {
+        throw new Error('项目已切换，工作流已终止（未发起本次模型调用）')
+    }
 
     const manageProgress = options?.manageProgress !== false
     if (manageProgress) callbacks.setProgress(10)
@@ -95,8 +163,10 @@ export abstract class BaseWorkflowCommand<TResult = string> {
             if (context?.cancelled) return
             fullContent += chunk
             callbacks.appendText(chunk)
-            // 增量解析钩子（如目录边生成边入库）。仅在出现对象闭合括号时触发，减少无谓扫描
-            if (options?.onStreamChunk && chunk.includes('}')) {
+            // 增量钩子。默认仅在出现对象闭合括号时触发（减少无谓扫描，供目录增量入库用）；
+            // 打字机预览须传 streamChunkMode: 'every'，否则单对象 JSON 全程零回调
+            const shouldFire = options?.streamChunkMode === 'every' || chunk.includes('}')
+            if (options?.onStreamChunk && shouldFire) {
               try { options.onStreamChunk(fullContent) } catch { /* 增量解析失败不影响主流程 */ }
             }
           },
@@ -114,6 +184,7 @@ export abstract class BaseWorkflowCommand<TResult = string> {
               modelId, modelName, purpose: purposeStat,
               systemPrompt, prompt, output: raw, usage,
               durationMs: Date.now() - startTime, success: true,
+              logPolicy: options?.logPolicy, context, capturedToken,
             })
             resolve(cleaned)
           },
@@ -126,6 +197,9 @@ export abstract class BaseWorkflowCommand<TResult = string> {
                 modelId, modelName, purpose: purposeStat,
                 systemPrompt, prompt, output: fullContent, usage: undefined,
                 durationMs: Date.now() - startTime, success: false, errorMessage: msg,
+                // 刻意不传 logPolicy：失败一律立即写（见 CallLLMOptions.logPolicy 注释）。
+                // 但必须带上起点 token，否则会把 A 的失败统计写进已切换的 B 库
+                capturedToken,
               })
             }
             reject(new Error(msg))
@@ -161,6 +235,19 @@ export abstract class BaseWorkflowCommand<TResult = string> {
     return this.callLLM(builder.build(), builder.getSystemRole(), callbacks, options, context)
   }
 
+  /**
+   * 若 context 里带了工作流起点 token，核对当前项目是否仍是同一个。
+   *
+   * 用在**发起读取之前**：`callLLM` 自己会核对，但那已经在读完 project_core 之后了，
+   * 命令若先读了 B 的核心设定再被 callLLM 拦下，虽然没发出去，也白读一趟。
+   */
+  protected assertProjectUnchanged(context?: WorkflowContext): void {
+    const workflowToken = context?.data[WORKFLOW_TOKEN_KEY] as number | undefined
+    if (workflowToken !== undefined && getProjectToken() !== workflowToken) {
+      throw new Error('项目已切换，工作流已终止')
+    }
+  }
+
   /** 取消类错误（用户主动中止），不计入调用统计 */
   private isCancellation(msg: string): boolean {
     return msg.includes('已取消') || msg.includes('取消')
@@ -182,12 +269,17 @@ export abstract class BaseWorkflowCommand<TResult = string> {
     durationMs: number
     success: boolean
     errorMessage?: string
+    /** 'defer' 时不写库，暂存到 context.data 供调用方在确认落库时 flush */
+    logPolicy?: 'immediate' | 'defer'
+    context?: WorkflowContext
+    /** callLLM 发起时捕获的项目 token，防止延迟到达的统计写进已切换的另一个项目库 */
+    capturedToken?: number
   }): void {
     // 兜底估算计入 system + user 两条消息（实际请求两者都发送）
     const promptTokens = p.usage?.promptTokens ?? Math.ceil((p.systemPrompt.length + p.prompt.length) / 1.5)
     const completionTokens = p.usage?.completionTokens ?? Math.ceil(p.output.length / 1.5)
     const totalTokens = p.usage?.totalTokens ?? (promptTokens + completionTokens)
-    ipc.invoke('db:log-llm-call', {
+    const entry: DeferredLLMLog = {
       modelId: p.modelId,
       modelName: p.modelName,
       purpose: p.purpose,
@@ -197,7 +289,22 @@ export abstract class BaseWorkflowCommand<TResult = string> {
       durationMs: p.durationMs,
       success: p.success,
       errorMessage: p.errorMessage ?? '',
-    })
+    }
+
+    if (p.logPolicy === 'defer') {
+      // 暂存不写库。context 缺失时宁可丢掉统计，也不退回立即写——
+      // 退回会让「取消即零副作用」的承诺在无声中失效。
+      if (!p.context) {
+        console.warn('[BaseWorkflowCommand] logPolicy=defer 但未传 context，本条统计已丢弃')
+        return
+      }
+      const bucket = (p.context.data[DEFERRED_LLM_LOGS_KEY] as DeferredLLMLog[] | undefined) ?? []
+      bucket.push(entry)
+      p.context.data[DEFERRED_LLM_LOGS_KEY] = bucket
+      return
+    }
+
+    ipc.invoke('db:log-llm-call', { ...entry }, p.capturedToken)
       .then(() => globalEventBus.emit('LLM_CALL_LOGGED', { success: p.success }))
       .catch(() => { /* 统计写入失败不影响主流程 */ })
   }

@@ -46,6 +46,7 @@ export type WorkflowType =
   | 'post_process'            // 后处理任务（角色卡提取等）
   | 'novel_import'            // 导入已有小说（逆向推演全流程）
   | 'character_profile'       // AI 补全角色人设（从出场正文反向推断）
+  | 'volume'                  // 续写下一卷（盘点上一卷→提炼收束→生成卷大纲→确认写入）
 
 /** 工作流步骤执行器 */
 export type StepExecutor = (
@@ -94,6 +95,18 @@ export interface WorkflowDefinition {
   }>
   /** 工作流完成后的通知/跳转动作（可选） */
   onComplete?: WorkflowCompleteAction
+  /**
+   * 工作流成功完成时，从 context 提取要交给 UI 的产物（可选）。
+   *
+   * 在 `activeContexts.delete()` **之前**调用，结果存进 store 的 `results`，
+   * 由消费方经 `takeWorkflowResult(runId)` 取走（取走即释放）。
+   *
+   * 为什么需要：`context.data` 是模块私有的，工作流完成时会被销毁，而
+   * `WORKFLOW_COMPLETE` 事件只携带 `{ type }`，`startWorkflow()` 又在销毁之后
+   * 才返回 runId——没有本通道，任何「生成后交由 UI 预览确认再落库」的工作流
+   * 都拿不到自己的产物。
+   */
+  collectResult?: (context: WorkflowContext) => unknown
 }
 
 // ===== Store =====
@@ -111,6 +124,17 @@ interface WorkflowState {
 
   /** 步进模式：各工作流的等待状态 */
   waitingRuns: Record<string, { waitingForConfirm: boolean; waitingAfterStepIndex: number }>
+
+  /**
+   * 工作流产物（由 `WorkflowDefinition.collectResult` 在销毁 context 前收集）。
+   * key = runId。消费方用 `takeWorkflowResult(runId)` 取走，**取走即释放**，
+   * 避免产物在 store 里长期驻留（其中可能含整卷大纲这类大文本）。
+   */
+  results: Record<string, unknown>
+  /** 取走并释放某次运行的产物；无产物返回 null */
+  takeWorkflowResult: (runId: string) => unknown
+  /** 丢弃某次运行的产物（用户在预览里点取消时调用） */
+  discardWorkflowResult: (runId: string) => void
 
   // ===== 旧接口兼容（映射到第一个 activeRun） =====
   waitingForConfirm: boolean
@@ -163,6 +187,27 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
   history: [],
   globalLogs: [],
   waitingRuns: {},
+  results: {},
+
+  takeWorkflowResult: (runId) => {
+    const r = get().results[runId]
+    if (r === undefined) return null
+    set(s => {
+      const next = { ...s.results }
+      delete next[runId]
+      return { results: next }
+    })
+    return r
+  },
+
+  discardWorkflowResult: (runId) => {
+    set(s => {
+      if (!(runId in s.results)) return {}
+      const next = { ...s.results }
+      delete next[runId]
+      return { results: next }
+    })
+  },
 
   // 兼容属性初始值
   currentRun: null,
@@ -333,6 +378,20 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
           // silent 模式不做额外操作
         } catch (e) {
           get().addLog('warn', `⚠️ onComplete 执行失败: ${e}`)
+        }
+      }
+    }
+
+    // 收集产物：必须在销毁 context 之前。仅成功完成的运行才收集——
+    // 失败/取消的工作流没有可交付的产物，留下半成品反而会诱导 UI 误用。
+    const doneRun = get().activeRuns.find(r => r.id === run.id)
+    if (doneRun?.status === 'completed' && definition.collectResult) {
+      const ctx = activeContexts.get(run.id)
+      if (ctx) {
+        try {
+          set(s => ({ results: { ...s.results, [run.id]: definition.collectResult!(ctx) } }))
+        } catch (e) {
+          get().addLog('warn', `⚠️ 工作流产物收集失败: ${e}`)
         }
       }
     }

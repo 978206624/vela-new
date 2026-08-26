@@ -333,6 +333,7 @@ export interface ModelProfile {
 import type { ProjectCoreData } from '../../electron/repositories/project-core-repository'
 import type { BlueprintData } from '../../electron/repositories/blueprint-repository'
 import type { VolumeData, VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
+import type { CommitNextVolumePayload, CommitNextVolumeResult, FirstVolumeInspection } from '../../electron/repositories/volume-commit'
 import type { CharacterData, CharacterStateData } from '../../electron/repositories/character-repository'
 import type { DraftMeta, DraftFull } from '../../electron/repositories/draft-repository'
 import type { RevisionMeta, RevisionFull } from '../../electron/repositories/revision-repository'
@@ -407,7 +408,7 @@ export interface DatabaseChannels {
   'db:post-process-is-all-passed': { args: [sourceType: string, sourceId: string]; return: boolean }
 
   // 沿用旧表
-  'db:log-llm-call': { args: [call: Record<string, unknown>]; return: { success: boolean } }
+  'db:log-llm-call': { args: [call: Record<string, unknown>, expectedToken?: number]; return: { success: boolean; stale?: boolean } }
   'db:get-llm-stats': { args: []; return: { totalCalls: number; totalTokens: number; totalPromptTokens: number; totalCompletionTokens: number; todayCalls: number; todayTokens: number } }
   'db:get-llm-history': { args: [limit?: number]; return: unknown[] }
   'db:save-summary-snapshot': { args: [chapterNumber: number, characterStates: string]; return: { success: boolean } }
@@ -429,6 +430,8 @@ export interface DatabaseChannels {
   'db:volume-update-status': { args: [volumeNumber: number, status: VolumeStatus, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:volume-update-threads': { args: [volumeNumber: number, threads: OpenThread[], expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:volume-delete': { args: [volumeNumber: number, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:volume-inspect-first': { args: []; return: FirstVolumeInspection }
+  'db:volume-commit-next': { args: [payload: CommitNextVolumePayload, expectedToken?: number]; return: CommitNextVolumeResult & { stale?: boolean } }
 }
 
 // ===== 知识库频道 =====

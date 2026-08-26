@@ -122,27 +122,70 @@ export function createConfigGenerationWorkflow(params: ConfigGenerationWorkflowP
 // 3. 工具与指导文本
 // ==========================================
 
-export function getPlotStructureGuide(structure: string, totalChapters: number): string {
-  const ch20 = Math.round(totalChapters * 0.2)
-  const ch25 = Math.round(totalChapters * 0.25)
-  const ch50 = Math.round(totalChapters * 0.5)
-  const ch75 = Math.round(totalChapters * 0.75)
+/** 结构模型 key → 中文标签（短篇分支与各 case 标题共用同一套称谓） */
+const STRUCTURE_LABELS: Record<string, string> = {
+  heros_journey: '英雄之旅',
+  save_the_cat: '节拍表',
+  kishotenketsu: '起承转合',
+  multi_thread: '多线叙事',
+  freeform: '自由结构',
+  three_act: '三幕结构',
+}
+
+/**
+ * 生成叙事结构指导文本。
+ *
+ * @param structure 故事模型 key
+ * @param totalChapters 覆盖的章数（全书场景传全书总章数；**分卷场景传本卷章数**）
+ * @param opts.scopeLabel 范围称谓，默认「全书」。分卷场景传「本卷」——
+ *   否则文案会变成「全书共 60 章」，误导 AI 以为整本书只有这一卷长。
+ * @param opts.startChapter 起始章号，默认 1。**分卷场景必须传本卷起始章号**——
+ *   否则第 101–160 卷会生成「第1章~第15章」这样的错位区间（本函数内部按
+ *   比例算出的都是相对位置，需要加上偏移才是真实章号）。
+ */
+export function getPlotStructureGuide(
+  structure: string,
+  totalChapters: number,
+  opts?: { scopeLabel?: string; startChapter?: number },
+): string {
+  const scope = opts?.scopeLabel ?? '全书'
+  const start = opts?.startChapter ?? 1
+  const base = start - 1
+  // 章号区间后缀只在分卷场景出现：全书场景（不传 opts）的输出必须与本函数改造前
+  // 逐字一致，否则架构向导的既有 prompt 会因为分卷功能被动改变
+  const range = opts?.startChapter ? `（第${start}章~第${base + totalChapters}章）` : ''
+  const last = base + totalChapters
+
+  // 章数过少时不给分段章号：3 章要分三幕/四段本就无意义，且按比例取整必然产生
+  // 「第52章~第51章」这类倒挂区间（各段起点写作 chXX+1，无法靠单侧钳制修好）。
+  // 续卷向导允许用户自填本卷章数，收尾短卷填 1–3 章完全合理，故必须处理。
+  if (totalChapters < 4) {
+    return `【${STRUCTURE_LABELS[structure] ?? '三幕结构'}】
+${scope}共 ${totalChapters} 章${range}，篇幅很短，不再细分阶段。
+请在这 ${totalChapters} 章内完成一个完整的小段落：有起因、有推进、有一个明确的收束或钩子。`
+  }
+
+  const at = (ratio: number) => base + Math.round(totalChapters * ratio)
+  const ch20 = at(0.2)
+  const ch25 = at(0.25)
+  const ch50 = at(0.5)
+  const ch75 = at(0.75)
 
   switch (structure) {
     case 'heros_journey':
-      return `【英雄之旅·十二阶段】（严格按以下阶段组织大纲）\n建议章节分配：全书共 ${totalChapters} 章...` // 为了简洁截断，后台已由架构掌控
+      return `【英雄之旅·十二阶段】（严格按以下阶段组织大纲）\n建议章节分配：${scope}共 ${totalChapters} 章${range}...` // 为了简洁截断，后台已由架构掌控
     case 'save_the_cat':
-      return `【节拍表·十五拍】（严格按以下节拍组织大纲）\n建议章节分配：全书共 ${totalChapters} 章...`
+      return `【节拍表·十五拍】（严格按以下节拍组织大纲）\n建议章节分配：${scope}共 ${totalChapters} 章${range}...`
     case 'kishotenketsu':
       return `【起承转合·四段式】（严格按以下四段组织大纲）
-建议章节分配：全书共 ${totalChapters} 章
-起（约第1章~第${ch25}章，占总篇幅约25%）：介绍世界、角色和日常，建立读者认同
+建议章节分配：${scope}共 ${totalChapters} 章${range}
+起（约第${start}章~第${ch25}章，占总篇幅约25%）：介绍世界、角色和日常，建立读者认同
 承（约第${ch25 + 1}章~第${ch50}章，占总篇幅约25%）：延续与深化，展现角色关系和冲突苗头
 转（约第${ch50 + 1}章~第${ch75}章，占总篇幅约25%）：核心转折，出人意料的变化打破既有格局
-合（约第${ch75 + 1}章~第${totalChapters}章，占总篇幅约25%）：收束所有线索，揭示主题，给出结局`
+合（约第${ch75 + 1}章~第${last}章，占总篇幅约25%）：收束所有线索，揭示主题，给出结局`
     case 'multi_thread':
       return `【多线叙事】（按多条故事线并行推进的方式组织大纲）
-建议章节分配：全书共 ${totalChapters} 章
+建议章节分配：${scope}共 ${totalChapters} 章${range}
 需要明确以下要素：
 1. 主线数量：设定2-4条独立又交织的故事线，每条有独立主角或视角
 2. 交汇节点：每条线在第${ch25}章、第${ch50}章、第${ch75}章左右安排交汇碰撞
@@ -150,20 +193,20 @@ export function getPlotStructureGuide(structure: string, totalChapters: number):
 4. 最终合流：在第${ch75}章前后所有线索开始汇聚，走向统一高潮`
     case 'freeform':
       return `【自由结构】（不限定特定叙事框架，根据故事内容自然编排）
-全书共 ${totalChapters} 章。
+${scope}共 ${totalChapters} 章${range}。
 请根据故事类型和内容特点自行设计最合适的叙事节奏。
 核心原则：
 1. 保证每10-20章有一个小高潮或悬念释放点
-2. 全书应有清晰的开篇建置（前10-15%）和收尾段落（后10-15%）
+2. ${scope}应有清晰的开篇建置（前10-15%）和收尾段落（后10-15%）
 3. 中段避免节奏单一，适时安排转折点
 4. 允许插叙、倒叙、片段式叙事等灵活手法`
     case 'three_act':
     default:
       return `【三幕结构】（严格按以下结构组织大纲）
-建议章节分配：全书共 ${totalChapters} 章
-第一幕：建置（约第1章~第${ch20}章，占总篇幅约20%）
+建议章节分配：${scope}共 ${totalChapters} 章${range}
+第一幕：建置（约第${start}章~第${ch20}章，占总篇幅约20%）
 第二幕：对抗与发展（约第${ch20 + 1}章~第${ch75}章，占总篇幅约55%）
-第三幕：高潮与结局（约第${ch75 + 1}章~第${totalChapters}章，占总篇幅约25%）`
+第三幕：高潮与结局（约第${ch75 + 1}章~第${last}章，占总篇幅约25%）`
   }
 }
 

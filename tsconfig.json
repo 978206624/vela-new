@@ -21,7 +21,7 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "electron"],
+  "include": ["src", "electron", "scripts/diagnostics/**/*.ts"],
   "exclude": ["src/stories"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

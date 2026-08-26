@@ -29,11 +29,12 @@ export interface OpenThread {
 
 const VALID_URGENCY: readonly string[] = ['high', 'mid', 'low']
 
-/** 限额：防脏数据/超大数组在 Task 19.3 拼 prompt 时撑爆上下文预算 */
-export const MAX_OPEN_THREADS = 200
-export const MAX_THREAD_LEN = 500
-/** UTF-8 字节上限（非 UTF-16 code unit），防超大 blob 拖垮项目打开 */
-export const MAX_OPEN_THREADS_BYTES = 256 * 1024
+// 限额常量已移到 src/shared/volume-limits.ts 供渲染层共用后再 re-export。
+// 渲染层若直接**值导入**本文件，会把用到 Node `Buffer` 的代码打进渲染进程 bundle
+// （主窗口 nodeIntegration: false，调用即 ReferenceError，且 tsc/eslint 都不报）。
+// `electron/ → src/shared/` 是本项目的正向依赖，多个 controller 已如此引用 ipc-channels。
+import { MAX_OPEN_THREADS, MAX_THREAD_LEN, MAX_OPEN_THREADS_BYTES, utf8Bytes } from '../../src/shared/volume-limits'
+export { MAX_OPEN_THREADS, MAX_THREAD_LEN, MAX_OPEN_THREADS_BYTES }
 
 /**
  * **读侧**单条规范化（宽容）：尽量抢救能用的数据，救不了就返回 null 由调用方丢弃。
@@ -93,8 +94,10 @@ export function assertThreadForWrite(item: unknown, volumeNumber: number, index:
 export function parseOpenThreads(raw: string): OpenThread[] {
     if (!raw) return []
     // 必须按 UTF-8 字节算：raw.length 是 UTF-16 code unit，中文下同样的
-    // 256K「长度」实际可达 ~768KB，上限形同虚设
-    if (Buffer.byteLength(raw, 'utf8') > MAX_OPEN_THREADS_BYTES) {
+    // 256K「长度」实际可达 ~768KB，上限形同虚设。
+    // 用共享的 utf8Bytes 而非 Buffer.byteLength：渲染层的预检（volume-closing.command）
+    // 用同一函数度量，两侧判定必须逐字节一致，否则会出现「预检放行、写入被拒」
+    if (utf8Bytes(raw) > MAX_OPEN_THREADS_BYTES) {
         console.warn(`[volume-threads] open_threads 超过 ${MAX_OPEN_THREADS_BYTES} 字节，按空清单处理`)
         return []
     }
@@ -123,7 +126,7 @@ export function serializeOpenThreads(threads: OpenThread[] | undefined, volumeNu
         throw new Error(`第 ${volumeNumber} 卷未回收伏笔超过 ${MAX_OPEN_THREADS} 条上限（当前 ${list.length} 条）`)
     }
     const json = JSON.stringify(list.map((item, i) => assertThreadForWrite(item, volumeNumber, i)))
-    const bytes = Buffer.byteLength(json, 'utf8')
+    const bytes = utf8Bytes(json)
     if (bytes > MAX_OPEN_THREADS_BYTES) {
         throw new Error(
             `第 ${volumeNumber} 卷未回收伏笔序列化后 ${bytes} 字节，超过 ${MAX_OPEN_THREADS_BYTES} 字节上限`
