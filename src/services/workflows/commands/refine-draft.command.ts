@@ -35,7 +35,7 @@ export class RefineDraftCommand extends BaseWorkflowCommand<string> {
 
     const mergedGuidance = this.params.mergedGuidance || project.novelConfig.globalGuidance || ''
     const userPromptBlock = this.params.userRefinePrompt?.trim()
-      ? `★【用户额外修稿指导（绝对优先级）】★：\n${this.params.userRefinePrompt}`
+      ? `★【用户额外修稿指导（绝对优先级）】★：\n${this.params.userRefinePrompt.trim()}`
       : ''
 
     const promptBuilder = new ChapterPromptBuilder(template)

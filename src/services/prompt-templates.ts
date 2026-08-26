@@ -1511,12 +1511,38 @@ export async function deleteProjectCustomPrompt(projectPath: string, key: string
  * = 内置 systemSuffix（按变量渲染）+ 创作类模板追加的反 AI 味 checklist。
  * 供 renderPrompt 与 BasePromptBuilder.build() 共用，保证两条路径行为一致。
  */
+/**
+ * 变量替换的**唯一实现** —— 三个调用点共用：
+ * `renderPrompt` / `BasePromptBuilder.build()` / `buildSystemConstraints`。
+ *
+ * 收成一处的原因：这三处原本各自替换，导致「值以换行开头会骗过空段落判据」的缺陷
+ * 只在其中两处被修掉、systemSuffix 那处原样存活（9 个指导块标题受影响）。
+ * 任何替换口径的调整都必须只改这里。
+ *
+ * 做两件事：
+ * 1. **归一「标题与占位符之间的空行」**：`EDITABLE_PROMPT_KEYS` 里 12 个模板允许用户
+ *    自行编辑 content，用户为排版好看在标题下空一行，会让 `finalizePrompt` 的
+ *    「标题后是否为空行」判据把非空段落误判为空、裁掉标题。此处先折叠掉。
+ * 2. **trim 值**：值若以换行开头（如 `previousEnding` 取 `slice(-1000)` 恰好切在换行处）
+ *    同样会骗过该判据。prompt 注入场景下首尾空白无语义。
+ *    注意 JS `trim()` 会吃掉全角空格 U+3000——若正文用两个全角空格做段首缩进，注入内容的
+ *    首/尾段会掉缩进；因这些值是喂给模型的输入而非写回磁盘的正文，且模板的排版契约
+ *    靠空行而非缩进，判定无害。
+ */
+export function substituteVariables(text: string, variables: Record<string, string>): string {
+  let result = text.replace(
+    /((?:★【[^】]*】★[：:])|(?:【[^】]*（如有[^）]*）[^】]*】))[ \t\r]*\n(?:[ \t\r]*\n)+(?=[ \t]*\{\{)/g,
+    '$1\n',
+  )
+  for (const [k, value] of Object.entries(variables)) {
+    result = result.replaceAll(`{{${k}}}`, (value ?? '').trim())
+  }
+  return result
+}
+
 export function buildSystemConstraints(key: string, variables: Record<string, string>): string {
   const builtinTemplate = BUILTIN_PROMPTS.find((p) => p.key === key)
-  let suffix = builtinTemplate?.systemSuffix ?? ''
-  for (const [k, value] of Object.entries(variables)) {
-    suffix = suffix.replaceAll(`{{${k}}}`, value ?? '')
-  }
+  let suffix = substituteVariables(builtinTemplate?.systemSuffix ?? '', variables)
   // 创作类正文模板强制追加反 AI 味规则（不可被用户自定义覆盖）
   if (CREATIVE_PROMPT_KEYS.includes(key)) {
     suffix = suffix ? `${suffix}\n\n${ANTI_AI_CHECKLIST}` : ANTI_AI_CHECKLIST
@@ -1542,20 +1568,32 @@ export function finalizePrompt(content: string, key: string, variables: Record<s
   const suffix = buildSystemConstraints(key, variables)
   let result = suffix ? `${content}\n\n${suffix}` : content
 
-  // 空变量段落裁剪：当可选变量为空时，清除残留的空标签段落，避免分散 LLM 注意力
+  // 空变量段落裁剪：当可选变量为空时，清除残留的空标签段落，避免分散 LLM 注意力。
+  //
+  // ⚠️ 判定「该段为空」的结构判据：标题行之后必须是**空行或字符串真正末尾**。
+  // 依据是模板的书写惯例——变量填了值时内容紧跟在下一行（单个 `\n`），
+  // 变量为空时只剩下空行。这比枚举「下一个段落标题长什么样」更本质，
+  // 也能覆盖后面跟的是普通散文（如「请直接输出…」「## 输出格式」）的情形。
+  //
+  // 两条正则刻意**不带 `m` 标志**：带 `m` 时 `$` 匹配行尾，而标题后面总是紧跟 `\n`，
+  // 会让「后面是否还有内容」这个前提永远成立，导致标题被**无条件删除**——
+  // 非空段落的标题也被删掉、内容沦为无标签裸文本。该缺陷曾波及 12 个模板 / 19 个标题，
+  // 其中 next_chapter_draft 的「★【上一章结尾最后一小段…】★：」是每章必走路径。
   result = result
-    .replace(/\n★【[^】]*】★[：:]\s*\n?\s*$/gm, '')   // 清除空的 ★【...】★ 标签行
-    .replace(/\n【[^】]*（如有[^）]*）[^】]*】\s*\n?\s*$/gm, '') // 清除空的 【...如有...】 标签行
-    .replace(/\n{3,}/g, '\n\n') // 合并多余空行
+    .replace(/(?<=^|\n)★【[^】]*】★[：:][ \t\r]*(?=\r?\n[ \t\r]*(?:\r?\n|$))/g, '')   // 清除空的 ★【...】★ 标签行
+    .replace(/(?<=^|\n)【[^】]*（如有[^）]*）[^】]*】[ \t\r]*(?=\r?\n[ \t\r]*(?:\r?\n|$))/g, '') // 清除空的 【...如有...】 标签行
+    .replace(/(?:\r?\n){3,}/g, '\n\n') // 合并多余空行
+    // 边界收尾：上面两条用后视断言 `(?<=^|\n)` 不消费前导换行，靠 `{3,}` 合并善后；
+    // 但在串首/串尾只有 2 个换行、凑不满 3 个，合并不触发，会残留空行。
+    // （串尾这条尤其必要——旧实现的 `\s*\n?\s*$` 会连尾部空白一起吃掉，
+    //   新实现不消费，不补这两行会比修复前多出 4 个模板在 prompt 末尾带空行。）
+    .replace(/^(?:[ \t\r]*\r?\n)+/, '')
+    .replace(/(?:\r?\n)+[ \t\r]*$/, '\n')
 
   return result
 }
 
 /** 渲染 Prompt 模板（填充变量 + 自动追加系统约束 + 空段落裁剪） */
 export function renderPrompt(template: PromptTemplate, variables: Record<string, string>): string {
-  let content = template.content
-  for (const [key, value] of Object.entries(variables)) {
-    content = content.replaceAll(`{{${key}}}`, value)
-  }
-  return finalizePrompt(content, template.key, variables)
+  return finalizePrompt(substituteVariables(template.content, variables), template.key, variables)
 }

@@ -236,8 +236,12 @@ export async function buildChapterContext(
   const referenced = (k: string) => tmplText.includes(`{{${k}}}`)
   const seg = (
     key: string, label: string, description: string, zone: ContextZone, content: string
-  ): ContextSegment | null =>
-    referenced(key) ? { key, label, description, zone, content, tokens: estTokens(content) } : null
+  ): ContextSegment | null => {
+    // trim 与 substituteVariables 的替换口径一致：实际发送的值经过 trim，
+    // 预览若展示未 trim 的原值，就成了「执行时不长这样」的内容，破坏「预览==执行」
+    const v = (content ?? '').trim()
+    return referenced(key) ? { key, label, description, zone, content: v, tokens: estTokens(v) } : null
+  }
 
   const chapterInfoText = JSON.stringify(chapterInfo, null, 2)
   const styleAndWords = [writingStyle && `文风：${writingStyle}`, `目标字数：约 ${wordNumber} 字`]

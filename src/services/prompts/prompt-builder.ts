@@ -1,5 +1,5 @@
 import type { PromptTemplate } from '../prompt-templates'
-import { finalizePrompt, resolveSystemRole } from '../prompt-templates'
+import { finalizePrompt, resolveSystemRole, substituteVariables } from '../prompt-templates'
 
 /**
  * 基础抽象 Prompt 建造者
@@ -20,14 +20,13 @@ export class BasePromptBuilder {
 
   /** 打包输出最终经过所有合法性替换的字符串 */
   public build(): string {
-    let result = this.template.content
-    for (const [key, value] of Object.entries(this.variables)) {
-      // 使用 replaceAll 避免正则注入风险，安全替换所有匹配项
-      const safeValue = value || ''
-      result = result.replaceAll(`{{${key}}}`, safeValue)
-    }
+    // 变量替换走 substituteVariables 唯一实现（含空行归一 + trim），
+    // 与 renderPrompt / buildSystemConstraints 同源，避免三处口径分叉
+    let result = substituteVariables(this.template.content, this.variables)
 
-    // 追加系统约束 + 裁剪空段落（与 renderPrompt 共用 finalizePrompt，保证预览==执行）
+    // 追加系统约束 + 裁剪空段落。与 renderPrompt 共用 finalizePrompt + substituteVariables，
+    // 保证两条路径行为一致（注：renderPrompt 当前无调用点，保留作参考实现；
+    // 真正的「上下文预览」走 chapter-context.ts 的同一个 builder 实例，预览==执行由那里保证）
     result = finalizePrompt(result, this.template.key, this.variables)
 
     // 防御性校验：检查是否有未处理的模板占位符

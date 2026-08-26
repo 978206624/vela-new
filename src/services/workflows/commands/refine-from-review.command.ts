@@ -31,7 +31,7 @@ export class RefineFromReviewCommand extends BaseWorkflowCommand<string> {
     if (!template) throw new Error('未找到审稿修复模板')
 
     const userPromptBlock = this.params.userRefinePrompt?.trim()
-      ? `★【用户额外修稿指导（绝对优先级）】★：\n${this.params.userRefinePrompt}`
+      ? `★【用户额外修稿指导（绝对优先级）】★：\n${this.params.userRefinePrompt.trim()}`
       : ''
 
     const promptBuilder = new ChapterPromptBuilder(template)
