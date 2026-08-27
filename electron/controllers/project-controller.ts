@@ -4,40 +4,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { readJsonFile, writeJsonFile, RECENT_PROJECTS_PATH } from '../utils/config-utils'
 import { getCurrentProjectPath, getCurrentProjectToken, setCurrentProjectPath } from '../utils/current-project'
-import { ProjectData, type NovelConfig } from '../../src/shared/ipc-channels'
+import { ProjectData, type ProjectSavePatch } from '../../src/shared/ipc-channels'
 import { DIR_VELA_INTERNAL, DIR_PROMPTS } from '../../src/shared/project-paths'
 import { initProjectDatabase } from '../database'
-import { ProjectCoreRepository, type ProjectCoreData } from '../repositories/project-core-repository'
+import { applyProjectSave } from '../services/project-save'
+import { ProjectCoreRepository } from '../repositories/project-core-repository'
 
 interface RecentProject {
   name: string
   path: string
   updatedAt: string
-}
-
-/**
- * 把前端 NovelConfig 映射为 project_core 更新 patch。
- * 只包含调用方实际提供的字段（避免 Partial 调用把未传字段清空为空串）。
- * 含旧字段反向映射（核心大纲/世界观/主角人设 → synopsis/worldbuilding/charactersArch），
- * 与 project:open 的读取映射对称——否则这三项保存后不落库，重开即丢。
- */
-function novelConfigToCorePatch(nc: Partial<NovelConfig>): Partial<ProjectCoreData> {
-  const patch: Partial<ProjectCoreData> = {}
-  if (nc.genre !== undefined) patch.genre = nc.genre
-  if (nc.subGenre !== undefined) patch.subGenre = nc.subGenre
-  if (nc.targetAudience !== undefined) patch.targetAudience = nc.targetAudience
-  if (nc.totalChapters !== undefined) patch.totalChapters = nc.totalChapters
-  if (nc.wordsPerChapter !== undefined) patch.wordsPerChapter = nc.wordsPerChapter
-  if (nc.plotStructure !== undefined) patch.plotStructure = nc.plotStructure
-  if (nc.narrativePOV !== undefined) patch.narrativePov = nc.narrativePOV
-  if (nc.goldenFinger !== undefined) patch.goldenFinger = nc.goldenFinger
-  if (nc.globalGuidance !== undefined) patch.globalGuidance = nc.globalGuidance
-  if (nc.writingStyle !== undefined) patch.writingStyle = nc.writingStyle
-  if (nc.referenceWorks !== undefined) patch.referenceWorks = nc.referenceWorks
-  if (nc.coreOutline !== undefined) patch.synopsis = nc.coreOutline
-  if (nc.worldSetting !== undefined) patch.worldbuilding = nc.worldSetting
-  if (nc.protagonistProfile !== undefined) patch.charactersArch = nc.protagonistProfile
-  return patch
 }
 
 function loadRecentProjects(): RecentProject[] {
@@ -135,6 +111,9 @@ export function registerProjectController() {
 
       // 组装返回给前端的数据结构
       const updatedCoreData = ProjectCoreRepository.get()!
+      // 直接用这一行里的 revision：再调一次 getRevision() 是第二次 SELECT，
+      // 两次读之间若有写入落地，返回的 project 数据与版本号就对不上了
+      const coreRevision = updatedCoreData.revision
       const projectData: ProjectData = {
         id: 'main',
         name: updatedCoreData.projectName,
@@ -165,7 +144,7 @@ export function registerProjectController() {
       // 同步"当前项目"到主进程，供 KB 等 IPC 使用；recent[0] 不再作为真相来源
       const { token } = setCurrentProjectPath(projectPath)
 
-      return { success: true, project: projectData, currentToken: token }
+      return { success: true, project: projectData, currentToken: token, coreRevision }
     } catch (error) {
       return { success: false, project: null, error: String(error) }
     }
@@ -186,43 +165,44 @@ export function registerProjectController() {
     return { success: true, token }
   })
 
-  // 保存/更新项目配置
-  // 注意：这个接口前端可能还传了很多 novelConfig 中的字段，我们需要 mapping 给 DB。
-  ipcMain.handle('project:save', async (_event, _projectId: string, data: Partial<ProjectData>) => {
+  // 保存项目配置。
+  //
+  // 入参是**补丁**不是整份快照，且带 revision 做 CAS：
+  // 渲染层的配置快照可能读于某次主进程写入之前（续卷会直接改 synopsis/total_chapters），
+  // 整份落地就会把新值覆盖回旧值。这是 Phase 19 的上线阻塞项。
+  ipcMain.handle('project:save', async (
+    _event,
+    _projectId: string,
+    patch: ProjectSavePatch,
+    expectedRevision: number,
+    expectedToken: number | undefined,
+  ) => {
     try {
-      if (!data.path) return { success: false, error: '缺少项目路径' }
-
-      if (data.novelConfig) {
-        ProjectCoreRepository.update(novelConfigToCorePatch(data.novelConfig))
-      }
-
-      if (data.name) {
-        ProjectCoreRepository.update({ projectName: data.name })
-      }
-
-      if (data.characterStates !== undefined) {
-        ProjectCoreRepository.update({ characterStates: data.characterStates })
-      }
-
-      addRecentProject({
-        name: data.name ?? 'Unknown',
-        path: data.path,
-        updatedAt: new Date().toISOString(),
+      // 判定与写入全在 `applyProjectSave` 里，本 handler 只负责注入
+      // 「当前项目 token」并处理最近项目列表这类 IPC 层的副作用。
+      // 抽出去是为了让 harness 调**同一份**实现——垫片会说谎，共用实现不会
+      const outcome = applyProjectSave({
+        patch, expectedRevision, expectedToken,
+        currentToken: getCurrentProjectToken(),
       })
+      if (!outcome.success) return outcome
 
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: String(error) }
-    }
-  })
-
-  // project:update-config 同理
-  ipcMain.handle('project:update-config', async (_event, _projectId: string, data: Partial<ProjectData>) => {
-    try {
-      if (data.novelConfig) {
-        ProjectCoreRepository.update(novelConfigToCorePatch(data.novelConfig))
+      // ⚠️ 最近项目列表的写入失败**不得**影响本次保存的结论。
+      // 配置已经落库了；让一个「最近打开」列表的 IO 错误把结果翻成 error，
+      // 会让调用方以为配置没保存进去，从而保留脏标记、诱导用户重存一次
+      const projectPath = getCurrentProjectPath()
+      if (projectPath) {
+        try {
+          addRecentProject({
+            name: patch.name ?? ProjectCoreRepository.get()?.projectName ?? 'Unknown',
+            path: projectPath,
+            updatedAt: new Date().toISOString(),
+          })
+        } catch (e) {
+          console.warn('[project:save] 更新最近项目列表失败（不影响本次保存）:', e)
+        }
       }
-      return { success: true }
+      return outcome
     } catch (error) {
       return { success: false, error: String(error) }
     }

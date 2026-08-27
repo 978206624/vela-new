@@ -58,11 +58,13 @@ import { VolumeRepository, type VolumeData } from '../../electron/repositories/v
 import { commitNextVolume, inspectFirstVolume } from '../../electron/repositories/volume-commit'
 import { BlueprintRepository } from '../../electron/repositories/blueprint-repository'
 import { PostProcessRepository } from '../../electron/repositories/post-process-repository'
+import { ProjectCoreRepository } from '../../electron/repositories/project-core-repository'
+import { applyProjectSave, applyProjectCoreUpdate } from '../../electron/services/project-save'
 
 // ===== 3. 渲染层侧 =====
 
 import { useWorkflowStore } from '../../src/stores/workflow-store'
-import { useProjectStore } from '../../src/stores/project-store'
+import { useProjectStore, selectPendingConfigFields } from '../../src/stores/project-store'
 import { useLLMStore } from '../../src/stores/llm-store'
 import {
     createNextVolumeWorkflow,
@@ -377,9 +379,39 @@ invokeHandler = async (channel, ...args) => {
             fs.writeFileSync(String(args[0]), String(args[1]), 'utf-8')
             return { success: true }
         case 'db:project-core-get': {
-            const row = getProjectDb()!.prepare(`SELECT * FROM project_core WHERE id='main'`).get() as Record<string, string>
-            return { premise: row.premise, worldbuilding: row.worldbuilding, charactersArch: row.characters_arch, synopsis: row.synopsis }
+            const row = getProjectDb()!.prepare(`SELECT * FROM project_core WHERE id='main'`).get() as Record<string, unknown>
+            // 转发真实列（含 revision）：写死子集会让保存 CAS 与冲突重载在 harness 里
+            // 拿不到版本号，用例只能测个空壳
+            return {
+                projectName: row.project_name, genre: row.genre, subGenre: row.sub_genre,
+                targetAudience: row.target_audience, totalChapters: row.total_chapters,
+                wordsPerChapter: row.words_per_chapter, plotStructure: row.plot_structure,
+                narrativePov: row.narrative_pov, writingStyle: row.writing_style,
+                referenceWorks: row.reference_works, globalGuidance: row.global_guidance,
+                goldenFinger: row.golden_finger, premise: row.premise,
+                worldbuilding: row.worldbuilding, charactersArch: row.characters_arch,
+                synopsis: row.synopsis, characterStates: row.character_states,
+                revision: row.revision ?? 0,
+            } as never
         }
+        // ⚠️ 直接调**主进程的真实实现**，不再手写垫片。
+        // 本 Task 已经两次栽在「垫片与真实 handler 不一致」上（一次漏了版本号
+        // fail-closed，一次漏了 token 守卫），用例测的都是垫片自己的行为。
+        // `applyProjectSave` / `applyProjectCoreUpdate` 把判定与写入从 ipcMain
+        // handler 里抽了出来、当前项目 token 由调用方注入，两侧共用同一份代码。
+        case 'project:save':
+            return applyProjectSave({
+                patch: args[1] as never,
+                expectedRevision: args[2] as number,
+                expectedToken: args[3] as number | undefined,
+                currentToken,
+            }) as never
+        case 'db:project-core-update':
+            return applyProjectCoreUpdate({
+                patch: args[0] as never,
+                expectedToken: args[1] as number | undefined,
+                currentToken,
+            }) as never
         case 'db:volume-commit-next': {
             // 复刻 db-controller 的 token 守卫。**缺省也必须拒**——
             // 真实 controller 对本通道要求必传 token，垫片若放行 undefined，
@@ -1947,6 +1979,503 @@ ${prompt.slice(0, 500)}`)
         assertEq((failed as { ok?: number }).ok, 0, '卷状态那步必须被记为失败')
         assert((failed!.error_msg ?? '').includes('项目已切换'),
             `失败原因必须是项目已切换，实为：${failed!.error_msg}`)
+    })
+
+    /**
+     * 最小可提交的续卷载荷：已有第一卷（1–10 章），续第二卷（11–20 章）。
+     * 只用来触发「主进程事务里改 project_core」这一副作用，
+     * 卷内容本身不是本组用例的被测对象。
+     */
+    function makeCommitPayload() {
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        return {
+            closingReport: { volumeNumber: 1, closingState: '主角拿下北境', openThreads: [] },
+            newVolume: vol(2, 11, 20, { title: '第二卷', status: 'planned', synopsis: '卷二大纲' }),
+            newVolumeSection: '## 第二卷 · 南征\n\n卷二大纲',
+        }
+    }
+
+    await testCase('P1 旧 project:save 晚于续卷到达 → 必须被拒绝，不得覆盖新大纲', async () => {
+        freshEnv()
+        seedArchitecture()
+        const store = useProjectStore.getState()
+        // 用户打开小说配置编辑器时读到的版本（此刻库里还没续卷）
+        const staleRevision = ProjectCoreRepository.getRevision()!
+        const staleOutline = ProjectCoreRepository.get()!.synopsis
+
+        // 续卷在主进程事务里改了 synopsis 与 total_chapters，revision +1
+        const commitRes = commitNextVolume(makeCommitPayload())
+        assert(commitRes.success, `续卷应成功：${commitRes.error}`)
+        const afterCommit = ProjectCoreRepository.get()!
+        assert(afterCommit.synopsis !== staleOutline, '前置条件：续卷应当改动了 synopsis')
+        assert(afterCommit.revision > staleRevision, '前置条件：续卷应当让 revision 自增')
+
+        // 编辑器里那份「读于续卷之前」的大纲，现在带着旧 revision 提交保存
+        useProjectStore.setState({ coreRevision: staleRevision } as never)
+        const ok = await store.saveProject({ novelConfig: { coreOutline: staleOutline } }, currentToken)
+
+        assertEq(ok.kind, 'conflict',
+            `过期 revision 应判 conflict（而非 error/project-switched），实为：${JSON.stringify(ok)}`)
+        assertEq(ProjectCoreRepository.get()!.synopsis, afterCommit.synopsis,
+            '续卷写入的大纲不得被旧快照覆盖回去')
+        assertEq(useProjectStore.getState().coreRevision, afterCommit.revision,
+            '冲突后应重载并对齐到库里的真实版本号，否则用户再点一次保存还是失败')
+    })
+
+    await testCase('P2 版本相符时保存正常写入，并把新 revision 交回渲染层', async () => {
+        freshEnv()
+        seedArchitecture()
+        const store = useProjectStore.getState()
+        const rev0 = ProjectCoreRepository.getRevision()!
+        useProjectStore.setState({ coreRevision: rev0 } as never)
+
+        const ok = await store.saveProject({ novelConfig: { goldenFinger: '系统流金手指' } }, currentToken)
+        assertEq(ok.kind, 'success', `版本相符时应成功，实为：${JSON.stringify(ok)}`)
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, '系统流金手指', '值应真的落库')
+        const rev1 = ProjectCoreRepository.getRevision()!
+        assert(rev1 > rev0, 'revision 必须自增')
+        assertEq(useProjectStore.getState().coreRevision, rev1,
+            '新版本号必须回到 store —— 不回带的话连存两次，第二次必然误判冲突')
+
+        // 连存两次：这是「回带 revision」这条最容易被漏掉的证据
+        const ok2 = await useProjectStore.getState().saveProject({ novelConfig: { goldenFinger: '改一次' } }, currentToken)
+        assertEq(ok2.kind, 'success', `连续第二次保存不该被判成冲突，实为：${JSON.stringify(ok2)}`)
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, '改一次', '第二次的值也应落库')
+    })
+
+    await testCase('P3 保存只写补丁里的字段，不碰其它列', async () => {
+        freshEnv()
+        seedArchitecture()
+        const before = ProjectCoreRepository.get()!
+        useProjectStore.setState({ coreRevision: before.revision } as never)
+
+        // 故意让 store 内存里的 coreOutline 是**过期**的（模拟别处刚改过库），
+        // 然后只保存 writingStyle。旧实现发整份快照会把过期的大纲一起写回去
+        getProjectDb()!.prepare(`UPDATE project_core SET synopsis='库里的新大纲' WHERE id='main'`).run()
+        useProjectStore.setState({
+            currentProject: {
+                ...useProjectStore.getState().currentProject!,
+                novelConfig: {
+                    ...useProjectStore.getState().currentProject!.novelConfig,
+                    coreOutline: '内存里的旧大纲',
+                },
+            },
+        } as never)
+
+        const ok = await useProjectStore.getState().saveProject({ novelConfig: { writingStyle: '冷硬派' } }, currentToken)
+        assertEq(ok.kind, 'success', `应成功（直接改库那步没走 revision，CAS 仍相符），实为：${JSON.stringify(ok)}`)
+        assertEq(ProjectCoreRepository.get()!.writingStyle, '冷硬派', '补丁字段应写入')
+        assertEq(ProjectCoreRepository.get()!.synopsis, '库里的新大纲',
+            '不在补丁里的字段一列都不能碰——发整份快照就会把它覆盖成「内存里的旧大纲」')
+    })
+
+    await testCase('P4 点击后切项目 → 渲染层就拦下，请求不发出', async () => {
+        freshEnv()
+        seedArchitecture()
+        const before = ProjectCoreRepository.get()!
+        useProjectStore.setState({ coreRevision: before.revision } as never)
+        // 用户点「保存」那一刻的 token
+        const clickToken = currentToken
+        // 随后切项目：主进程与渲染层的 token 都推进（真实 project:open 会同时更新两侧）
+        currentToken += 1
+        useProjectStore.setState({ currentToken } as never)
+
+        ipcLog.length = 0
+        const ok = await useProjectStore.getState().saveProject(
+            { novelConfig: { goldenFinger: '不该写进来' } }, clickToken)
+        // ⚠️ 本例只手工推进 token，**没有**走真实的 closeProject 生命周期。
+        // 所以这里只断言「判定结果是 project-switched（而不是 conflict——什么都没重载）」，
+        // 不对脏集合的去向下结论：那由 P15 用真实 closeProject 覆盖，结论是「已被清空」
+        assertEq(ok.kind, 'project-switched',
+            `必须判 project-switched 而非 conflict（什么都没重载），实为：${JSON.stringify(ok)}`)
+        assert(!ipcLog.some(l => l.channel === 'project:save'),
+            '渲染层自查就该拦下，不必白跑一趟必然被拒的 IPC')
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, before.goldenFinger, '一列都不该写')
+    })
+
+    await testCase('P4b 渲染层尚未察觉切换时，主进程那道守卫必须独立拦住', async () => {
+        freshEnv()
+        seedArchitecture()
+        const before = ProjectCoreRepository.get()!
+        const clickToken = currentToken
+        useProjectStore.setState({ coreRevision: before.revision } as never)
+
+        // 只推进**主进程**的 token，渲染层 store 仍停在旧值——
+        // 对应「主进程已切库、渲染层的状态更新还没跑到」那一瞬。
+        // 此时渲染层自查看不出问题，请求会真的发出去，
+        // 全靠主进程那道守卫兜底。少了它，A 的配置就写进 B 了
+        currentToken += 1
+
+        ipcLog.length = 0
+        const ok = await useProjectStore.getState().saveProject(
+            { novelConfig: { goldenFinger: '不该写进来' } }, clickToken)
+        assert(ipcLog.some(l => l.channel === 'project:save'),
+            '前置条件：本例中请求应当真的发出去，否则测不到主进程那道')
+        // 主进程用 stale 表达「跨项目」，而渲染层那道 token 复核先一步返回 project-switched；
+        // 本例中渲染层看不出问题，走到的是回包后的复核 → 同样是 project-switched
+        assertEq(ok.kind, 'project-switched', `主进程守卫必须拒绝，实为：${JSON.stringify(ok)}`)
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, before.goldenFinger, '一列都不该写')
+    })
+
+    await testCase('P4c 漏传 expectedRevision 时主进程拒绝，不得退化成"无 CAS"', async () => {
+        freshEnv()
+        seedArchitecture()
+        const before = ProjectCoreRepository.get()!
+        // 直接打 IPC，绕过 store 的封装——模拟将来某个新调用点漏传版本号。
+        // 仓储把 undefined 解读为「不做 CAS」（那是留给主进程内部初始化的口子），
+        // 若 handler 不挡，这条路径就等于把守卫静默关掉
+        const res = await invokeHandler(
+            'project:save', 'main',
+            { novelConfig: { goldenFinger: '不该写进来' } },
+            undefined, currentToken) as { success: boolean }
+        assert(!res.success, `漏传版本号必须被拒，实为：${JSON.stringify(res)}`)
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, before.goldenFinger, '一列都不该写')
+    })
+
+    await testCase('P4d 空补丁 + 过期版本号：不得被当成"保存成功"', async () => {
+        freshEnv()
+        seedArchitecture()
+        const staleRevision = ProjectCoreRepository.getRevision()!
+        // 让库前进一格
+        ProjectCoreRepository.update({ goldenFinger: '别处改的' })
+        const cur = ProjectCoreRepository.getRevision()!
+        assert(cur > staleRevision, '前置条件：版本号应已前进')
+
+        // 空补丁走的是仓储里的早返回分支。早先那条无条件返回 ok:true，
+        // 于是调用方会把过期的 revision 当成"已对齐"继续用——
+        // 一次静默的成功比一次明确的失败危险得多
+        const res = ProjectCoreRepository.update({}, staleRevision)
+        assert(!res.ok, `空补丁 + 过期版本号必须判 stale，实为：${JSON.stringify(res)}`)
+        assertEq(res.revision, cur, 'stale 时应回真实当前版本，供调用方直接对齐')
+    })
+
+    await testCase('P5 coreRevision 未知时，保存请求根本不发出（fail-closed）', async () => {
+        freshEnv()
+        seedArchitecture()
+        const before = ProjectCoreRepository.get()!
+        // 项目刚切换、状态还没对齐的那一刻正是这种情形——最该拦的时候
+        useProjectStore.setState({ coreRevision: null } as never)
+        ipcLog.length = 0
+        const ok = await useProjectStore.getState().saveProject({ novelConfig: { goldenFinger: '不该写进来' } }, currentToken)
+        assertEq(ok.kind, 'error',
+            `版本未知应判 error（什么都没重载，脏标记必须留着），实为：${JSON.stringify(ok)}`)
+        // ⚠️ 只断言「没写进去」是不够的：去掉守卫后 expectedRevision 会是 null，
+        // SQL 的 `revision = NULL` 恒不匹配，CAS 照样拒绝——用例会因为一个
+        // 与守卫无关的原因而通过。真正的证据是**请求压根没发出去**
+        assert(!ipcLog.some(l => l.channel === 'project:save'),
+            '版本未知时不该发出 project:save，应在渲染层就拦掉')
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, before.goldenFinger, '一列都不该写')
+    })
+
+    await testCase('P6 老库（无 revision 列）打开时自动补列，且保存守卫立即生效', async () => {
+        freshEnv()
+        seedArchitecture()
+        const dir = path.join(tmpRoot, `p-${dbSeq}`)
+
+        // 构造「分卷之前建的库」：把 revision 列摘掉。
+        // 所有存量项目升级时走的都是这条路，不测等于把最大的一批用户放在没验过的路径上
+        getProjectDb()!.exec(`ALTER TABLE project_core DROP COLUMN revision`)
+        const colsBefore = (getProjectDb()!.pragma('table_info(project_core)') as Array<{ name: string }>)
+        assert(!colsBefore.some(c => c.name === 'revision'), '前置条件：此刻应当没有 revision 列')
+        closeProjectDatabase()
+
+        // 重新打开 = 真实的「用户打开老项目」路径
+        initProjectDatabase(dir)
+        const colsAfter = (getProjectDb()!.pragma('table_info(project_core)') as Array<{ name: string }>)
+        assert(colsAfter.some(c => c.name === 'revision'), '打开老库时必须自动补上 revision 列')
+        assertEq(ProjectCoreRepository.getRevision(), 0, '补列后应为 0（默认值）')
+
+        // 补完列，CAS 必须马上能用——只补列不生效等于迁移做了一半
+        useProjectStore.setState({ coreRevision: 0 } as never)
+        const ok = await useProjectStore.getState().saveProject({ novelConfig: { goldenFinger: '老库也能存' } }, currentToken)
+        assertEq(ok.kind, 'success', `补列后的第一次保存应成功，实为：${JSON.stringify(ok)}`)
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, '老库也能存', '值应真的落库')
+        assertEq(ProjectCoreRepository.getRevision(), 1, '写入后版本号应自增')
+
+        // 再用「补列前那个 0」提交一次，必须被拒
+        useProjectStore.setState({ coreRevision: 0 } as never)
+        const ok2 = await useProjectStore.getState().saveProject({ novelConfig: { goldenFinger: '不该写进来' } }, currentToken)
+        assertEq(ok2.kind, 'conflict', `过期版本号在老库上同样必须被拒，实为：${JSON.stringify(ok2)}`)
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, '老库也能存', '不得被旧快照覆盖')
+    })
+
+    await testCase('P7 updateProjectCore：渲染层自查拦下过期 token，请求不发出', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { updateProjectCore } = await import('../../src/services/vela-protocol')
+        const before = ProjectCoreRepository.get()!
+
+        const staleToken = currentToken - 1   // 用户点「保存架构」时还在上一个项目
+        ipcLog.length = 0
+        const ok = await updateProjectCore({ premise: '不该写进来' }, staleToken)
+
+        assertEq(ok, false,
+            '必须返回 false —— 返回 true 会让 ArchFileViewer 把另一个项目的 tab 标成已保存、' +
+            '让架构工作流发「已生成」事件')
+        // ⚠️ 只断言「没写进去」测不出是哪道守卫在起作用：渲染层自查和主进程守卫
+        // 两道重叠，去掉任一道结果都还是 false。要咬住这一道，得看请求有没有发出去
+        assert(!ipcLog.some(l => l.channel === 'db:project-core-update'),
+            '渲染层自查就该拦下，不必白跑一趟必然被拒的 IPC')
+        assertEq(ProjectCoreRepository.get()!.premise, before.premise, '一列都不该写')
+        assertEq(ProjectCoreRepository.getRevision(), before.revision, 'revision 也不该动')
+    })
+
+    await testCase('P7c 渲染层尚未察觉切换时，主进程 core-update 守卫必须独立拦住', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { updateProjectCore } = await import('../../src/services/vela-protocol')
+        const before = ProjectCoreRepository.get()!
+        const actionToken = currentToken
+
+        // 只推进**主进程**的 token，渲染层 store 仍停在旧值：
+        // 渲染层自查看不出问题，请求会真的发出去，全靠主进程那道兜底
+        currentToken += 1
+        ipcLog.length = 0
+        const ok = await updateProjectCore({ premise: '不该写进来' }, actionToken)
+
+        assert(ipcLog.some(l => l.channel === 'db:project-core-update'),
+            '前置条件：本例中请求应当真的发出去，否则测不到主进程那道')
+        assertEq(ok, false, '主进程守卫必须拒绝')
+        assertEq(ProjectCoreRepository.get()!.premise, before.premise, '一列都不该写')
+    })
+
+    await testCase('P7b updateProjectCore：回包晚于项目切换 → 不污染新项目的 store', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { updateProjectCore } = await import('../../src/services/vela-protocol')
+        const actionToken = currentToken
+        useProjectStore.setState({ coreRevision: ProjectCoreRepository.getRevision() } as never)
+        const revisionBefore = useProjectStore.getState().coreRevision
+
+        // 主进程写入成功（token 相符），但回包到达之前渲染层已经切走
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            if (channel === 'db:project-core-update') {
+                // 写入已完成，此刻用户切了项目
+                useProjectStore.setState({ currentToken: (currentToken + 100) } as never)
+            }
+            return r
+        }
+        try {
+            const ok = await updateProjectCore({ premise: '写给旧项目的' }, actionToken)
+            assertEq(ok, false, '回包晚于切换时必须返回 false —— 那次写入属于上一个项目')
+            assertEq(useProjectStore.getState().coreRevision, revisionBefore,
+                '不得把旧项目的 revision 写进切换后的 store')
+        } finally {
+            invokeHandler = realHandler
+            useProjectStore.setState({ currentToken } as never)
+        }
+    })
+
+    await testCase('P8 保存成功只清「本次提交的字段」，不误清等待期间的新编辑', async () => {
+        freshEnv()
+        seedArchitecture()
+        const store = useProjectStore.getState()
+        useProjectStore.setState({ coreRevision: ProjectCoreRepository.getRevision() } as never)
+
+        // 用户改了两个字段
+        store.updateNovelConfig({ goldenFinger: '金手指 v1' })
+        store.updateNovelConfig({ globalGuidance: '指导 v1' })
+        assertEq(selectPendingConfigFields(useProjectStore.getState()).size, 2, '前置条件：应有两个脏字段')
+
+        // 只提交其中一个，且在 IPC 等待期间用户又改了第三个字段
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'project:save') {
+                useProjectStore.getState().updateNovelConfig({ referenceWorks: '等待期间改的' })
+            }
+            return realHandler(channel, ...args)
+        }
+        try {
+            const res = await useProjectStore.getState().saveProject(
+                { novelConfig: { goldenFinger: '金手指 v1' } }, currentToken)
+            assertEq(res.kind, 'success', `应成功，实为：${JSON.stringify(res)}`)
+        } finally {
+            invokeHandler = realHandler
+        }
+
+        const left = selectPendingConfigFields(useProjectStore.getState())
+        assert(!left.has('goldenFinger'), '本次提交的字段应被清掉')
+        assert(left.has('globalGuidance'), '没提交的字段必须留着，否则它永远不会被保存')
+        assert(left.has('referenceWorks'),
+            '等待期间新改的字段必须留着 —— 整体清空会让它悄无声息地丢失')
+    })
+
+    await testCase('P9 脏字段由 store 统一登记：AI 路径改内存也算数', async () => {
+        freshEnv()
+        seedArchitecture()
+        useProjectStore.setState({ coreRevision: ProjectCoreRepository.getRevision() } as never)
+        assertEq(selectPendingConfigFields(useProjectStore.getState()).size, 0, '前置条件：初始应无脏字段')
+
+        // 模拟 AI / Agent 直接改内存（不经编辑器）
+        useProjectStore.getState().updateNovelConfig({ writingStyle: 'AI 分析出来的文风' })
+        assert(selectPendingConfigFields(useProjectStore.getState()).has('writingStyle'),
+            '非编辑器路径的改动同样要登记 —— 挂在组件 ref 上时这些改动完全不可见，' +
+            '用户点保存会看到「没有改动」而那份内容其实还没落库')
+
+        // 「值来自数据库」的同步不该登记为脏
+        useProjectStore.getState().updateNovelConfig({ coreOutline: '库里读来的' }, { persisted: true })
+        assert(!selectPendingConfigFields(useProjectStore.getState()).has('coreOutline'),
+            '来自库的值不是未保存改动，登记成脏会让下次保存把它再发一遍')
+    })
+
+    await testCase('P10 切项目时脏字段清空：不得把 A 的字段名带进 B', async () => {
+        freshEnv()
+        seedArchitecture()
+        useProjectStore.getState().updateNovelConfig({ goldenFinger: 'A 的金手指' })
+        assert(selectPendingConfigFields(useProjectStore.getState()).size > 0, '前置条件：应有脏字段')
+
+        // freshEnv 会重建项目与 store（等价于打开另一个项目）
+        freshEnv()
+        assertEq(selectPendingConfigFields(useProjectStore.getState()).size, 0,
+            '切项目后脏字段必须清空 —— 带过去会把 A 的字段名当成 B 的未保存改动发出去')
+    })
+
+    await testCase('P11 重载失败时不得报 conflict（conflict 的语义是「已重载」）', async () => {
+        freshEnv()
+        seedArchitecture()
+        const staleRevision = ProjectCoreRepository.getRevision()!
+        commitNextVolume(makeCommitPayload())   // 让库前进一格，制造版本冲突
+        useProjectStore.setState({ coreRevision: staleRevision } as never)
+
+        // 让重载那次读取失败
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:project-core-get') return null as never
+            return realHandler(channel, ...args)
+        }
+        try {
+            const res = await useProjectStore.getState().saveProject(
+                { novelConfig: { goldenFinger: 'x' } }, currentToken)
+            // conflict 的语义是「已重载、你的改动已作废」，调用方据此清脏标记。
+            // 重载没成功还回 conflict，用户的改动会被清掉而内存根本没换成新值
+            assertEq(res.kind, 'error',
+                `重载失败时必须回 error 而不是 conflict，实为：${JSON.stringify(res)}`)
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('P12 同一字段在保存途中被改成新值 → 不得从脏集合里清掉', async () => {
+        freshEnv()
+        seedArchitecture()
+        useProjectStore.setState({ coreRevision: ProjectCoreRepository.getRevision() } as never)
+        useProjectStore.getState().updateNovelConfig({ goldenFinger: 'v1' })
+
+        // IPC 在途期间，用户把**同一个字段**改成 v2
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'project:save') {
+                useProjectStore.getState().updateNovelConfig({ goldenFinger: 'v2' })
+            }
+            return realHandler(channel, ...args)
+        }
+        try {
+            const res = await useProjectStore.getState().saveProject(
+                { novelConfig: { goldenFinger: 'v1' } }, currentToken)
+            assertEq(res.kind, 'success', `提交 v1 应成功：${JSON.stringify(res)}`)
+        } finally {
+            invokeHandler = realHandler
+        }
+
+        assertEq(ProjectCoreRepository.get()!.goldenFinger, 'v1', '库里应是提交的 v1')
+        assertEq(useProjectStore.getState().currentProject!.novelConfig.goldenFinger, 'v2', '内存里是 v2')
+        // 只按字段名清理的话，v2 会被判成「已保存」——库里却是 v1，
+        // 而界面显示「没有改动」，用户的 v2 永远回不去库里
+        assert(selectPendingConfigFields(useProjectStore.getState()).has('goldenFinger'),
+            '值已变成 v2，该字段必须继续留在脏集合里')
+    })
+
+    await testCase('P13 updateProjectCore 在途期间用户编辑同字段 → 不得用库值盖回', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { updateProjectCore } = await import('../../src/services/vela-protocol')
+        useProjectStore.setState({ coreRevision: ProjectCoreRepository.getRevision() } as never)
+
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            if (channel === 'db:project-core-update') {
+                // 写库已成功，此刻用户在编辑器里改了同一个字段
+                useProjectStore.getState().updateNovelConfig({ coreOutline: '用户正在敲的新大纲' })
+            }
+            return r
+        }
+        try {
+            const ok = await updateProjectCore({ synopsis: 'AI 写的大纲' }, currentToken)
+            assertEq(ok, true, '库写入本身应成功')
+        } finally {
+            invokeHandler = realHandler
+        }
+
+        assertEq(ProjectCoreRepository.get()!.synopsis, 'AI 写的大纲', '库里是 AI 那份')
+        assertEq(useProjectStore.getState().currentProject!.novelConfig.coreOutline, '用户正在敲的新大纲',
+            'token 只能识别跨项目；同项目内在途编辑必须靠值比对保住，' +
+            '无条件同步会把用户正在敲的内容原地抹掉')
+        assert(selectPendingConfigFields(useProjectStore.getState()).has('coreOutline'),
+            '用户那份还没落库，必须留在脏集合里')
+    })
+
+    await testCase('P14 多字段别名同步**途中**切项目 → 剩余字段不同步且返回 false', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { updateProjectCore } = await import('../../src/services/vela-protocol')
+        const actionToken = currentToken
+        const before = useProjectStore.getState().currentProject!.novelConfig
+
+        // 切换点必须落在**同步循环内部**：落在回包之前的话，
+        // `updateProjectCore` 回包后那道复核会先返回 false，
+        // 循环里这道就永远测不到（第一版正是这么写的，变异不转红）
+        let flipped = false
+        const unsub = useProjectStore.subscribe((st) => {
+            // 第一个别名刚写进内存 → 立刻切走
+            if (!flipped && st.currentProject?.novelConfig.worldSetting === '新世界观') {
+                flipped = true
+                useProjectStore.setState({ currentToken: currentToken + 50 } as never)
+            }
+        })
+        try {
+            const ok = await updateProjectCore(
+                { worldbuilding: '新世界观', synopsis: '新大纲' }, actionToken)
+            assert(flipped, '前置条件：第一个别名应当已同步并触发切换')
+            // 静默跳过剩余字段却返回 true，会让调用方发「已生成」事件、把 tab 标成已保存
+            assertEq(ok, false, '同步途中切项目必须返回 false')
+            assert(useProjectStore.getState().currentProject!.novelConfig.coreOutline === before.coreOutline,
+                '切换之后的字段不该再被同步进来')
+        } finally {
+            unsub()
+            useProjectStore.setState({ currentToken } as never)
+        }
+    })
+
+    await testCase('P15 closeProject 清空脏集合：这是「切项目后改动已丢失」文案的依据', async () => {
+        freshEnv()
+        seedArchitecture()
+        useProjectStore.getState().updateNovelConfig({ goldenFinger: '未保存的改动' })
+        assert(selectPendingConfigFields(useProjectStore.getState()).has('goldenFinger'),
+            '前置条件：应有未保存的脏字段')
+
+        // 真实切项目一律先 close 再 open。这里直接调 closeProject，
+        // 覆盖 P4/P4b 没碰的那段生命周期（它们只改 token、没走 close）
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            // close 会调这两条；harness 不需要它们的真实副作用
+            if (channel === 'project:set-current' || channel === 'db:close') return { success: true } as never
+            return realHandler(channel, ...args)
+        }
+        try {
+            await useProjectStore.getState().closeProject()
+        } finally {
+            invokeHandler = realHandler
+        }
+
+        assertEq(useProjectStore.getState().currentProject, null, '项目应已关闭')
+        assertEq(selectPendingConfigFields(useProjectStore.getState()).size, 0,
+            '脏集合必须随项目一起清空——留着会在下一个项目里被当成它的未保存改动发出去')
+        // 这条断言的意义不止于「清干净了」：它同时钉住了
+        // `saveProject` 返回 project-switched 时的文案边界——
+        // 那份改动此刻确实已经不在内存里，所以不能对用户说「改动仍保留在编辑器里」
     })
 
     // ===== 汇总 =====

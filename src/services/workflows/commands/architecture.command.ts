@@ -1,5 +1,6 @@
-import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
+import { BaseWorkflowCommand, CommandExecuteParams, WORKFLOW_TOKEN_KEY } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
+import { getProjectToken } from '../../../stores/volume-store'
 import { getPromptTemplate } from '../../prompt-templates'
 import { ArchitecturePromptBuilder } from '../../prompts/prompt-builder'
 import { ipc } from '../../ipc-client'
@@ -36,17 +37,32 @@ function stripThinkingTags(text: string): string {
   return text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
 }
 
-async function writeArchToDb(key: 'premise' | 'charactersArch' | 'worldbuilding' | 'synopsis', content: string): Promise<void> {
+async function writeArchToDb(
+  key: 'premise' | 'charactersArch' | 'worldbuilding' | 'synopsis',
+  content: string,
+  /**
+   * 调用方在 `execute` 入口、任何 await 之前捕获的项目 token。必填。
+   * 架构四步走每一步都在一次分钟级 LLM 之后才写库——现取会拿到用户
+   * 切换后那个项目的合法 token，A 的架构就写进了 B。
+   */
+  expectedToken: number | undefined,
+): Promise<void> {
   const cleanContent = stripThinkingTags(content)
   // 经统一入口写库 + 同步 store 别名（synopsis→coreOutline 等），保持 store ⟷ DB 一致，
   // 否则小说配置编辑器仍显示旧种子，保存时会用陈旧值覆盖架构生成的扩展内容
   const { updateProjectCore } = await import('../../vela-protocol')
-  const ok = await updateProjectCore({ [key]: cleanContent })
+  const ok = await updateProjectCore({ [key]: cleanContent }, expectedToken)
   // DB 写入失败：不发"已生成"事件、抛错让工作流标记本步失败，避免误报
-  if (!ok) throw new Error(`架构字段「${key}」写入数据库失败`)
+  if (!ok) throw new Error(`架构字段「${key}」写入数据库失败（可能是项目已切换）`)
 
-  // 通知 UI 层实时刷新架构完成状态
+  // 通知 UI 层实时刷新架构完成状态。
+  // ⚠️ 这行 `await import` 本身也是一个可切走的窗口——事件是发给**当前**项目的 UI 的，
+  // 切换后再发会让 B 的界面亮起「A 的架构已生成」
   const { globalEventBus } = await import('../../../shared/event-bus')
+  if (getProjectToken() !== expectedToken) {
+    console.warn('[writeArchToDb] 项目已切换，不再向新项目发送架构更新事件')
+    return
+  }
   globalEventBus.emit('ARCH_FILE_UPDATED', { fileName: `${key}.md` })
 }
 
@@ -57,7 +73,13 @@ export class GenerateConfigCommand extends BaseWorkflowCommand<string> {
     super()
   }
 
-  async execute({ callbacks }: CommandExecuteParams): Promise<string> {
+  async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    // ⚠️ 优先取工作流构造时钉住的 token（`WORKFLOW_TOKEN_KEY`），**不现取**。
+    // 工作流是排队执行的，各步之间又各隔一次分钟级 LLM——在 execute 入口现取
+    // 拿到的已经是用户切换后那个项目的**合法** token，守卫看不出异常。
+    // 回落 getProjectToken() 只是给「不经工作流、直接 new Command().execute()」
+    // 的调用兜底（当前无此类调用点）。
+    const actionToken = (context.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
     callbacks.log('正在调度配置专家 AI，准备解析您的脑洞...')
 
     const template = getPromptTemplate('generate_global_config')
@@ -76,13 +98,25 @@ export class GenerateConfigCommand extends BaseWorkflowCommand<string> {
     const resultRaw = await this.callLLMWithBuilder(
       promptBuilder,
       callbacks,
-      { responseFormat: { type: 'json_object' }, thinking: true }
+      { responseFormat: { type: 'json_object' }, thinking: true },
+      // 传 context：`callLLM` 的跨批次 token 守卫只认 context 里的 WORKFLOW_TOKEN_KEY，
+      // 不传等于那道守卫没装（模型请求照发、结果照写、统计照记到切换后的项目）
+      context,
     )
 
     callbacks.log('解析完成，正在应用到项目配置...')
+    // ⚠️ try/catch **只包 JSON 解析那一步**。
+    // 早先它一直包到保存结束，于是「项目已切换」「版本冲突」都会被改写成
+    // 「AI 返回的内容无法解析为 JSON，请重试」——用户按提示重试一次，
+    // 而问题根本不在模型返回上；反过来，真正的解析失败也会被这段掩盖。
+    let parsed: Partial<NovelConfig>
     try {
-      const parsed = this.parseJSON<Partial<NovelConfig>>(resultRaw)
+      parsed = this.parseJSON<Partial<NovelConfig>>(resultRaw)
+    } catch (e) {
+      throw new Error('AI 返回的内容无法解析为 JSON，请重试或缩短输入。详细信息: ' + String(e))
+    }
 
+    {
       // 防御：LLM 常常将长文本字段错误地生成为对象或数组
       const stringifyField = (val: unknown) => {
         if (!val) return ''
@@ -105,16 +139,32 @@ export class GenerateConfigCommand extends BaseWorkflowCommand<string> {
       parsed.wordsPerChapter = this.wordsPerChapter
       if (this.genreHint?.trim()) parsed.genre = this.genreHint.trim()
 
-      this.onGenerated(parsed)
-      const saved = await useProjectStore.getState().saveProject()
-
-      if (saved) {
-        callbacks.log('✅ AI 配置生成并保存成功，请检查各字段后点击「生成架构」')
-      } else {
-        callbacks.log('✅ AI 配置生成成功，请检查各字段后点击「立即保存」')
+      // ⚠️ 改内存**之前**核对。`onGenerated` 会把生成结果写进当前项目的 store，
+      // 而 saveProject 只能拒绝 IPC——它撤不回已经写进 B 内存的 A 的配置。
+      // 这一步排在一次分钟级 LLM 之后，是最容易切走的窗口
+      if (getProjectToken() !== actionToken) {
+        callbacks.log('⚠️ 项目已切换，本次配置生成结果未应用')
+        throw new Error('项目已切换，本次配置生成已中止')
       }
-    } catch (e) {
-      throw new Error('AI 返回的内容无法解析为 JSON，请重试或缩短输入。详细信息: ' + String(e))
+
+      this.onGenerated(parsed)
+      // parsed 就是本步生成的字段集合，原样作为补丁——
+      // 不要退回整份快照，那会把内存里其它未改动字段的旧值一起写回去
+      const saved = await useProjectStore.getState().saveProject({ novelConfig: parsed }, actionToken)
+
+      if (saved.kind === 'success') {
+        callbacks.log('✅ AI 配置生成并保存成功，请检查各字段后点击「生成架构」')
+      } else if (saved.kind === 'error') {
+        // 内存里已有生成结果，但**是否落库无法确定**（超时不取消已发出的 IPC）。
+        // 项目还开着、改动还在，提示用户核对后手动保存一次即可，不算整步失败
+        callbacks.log(`⚠️ AI 配置已生成，但持久化未能确认：${saved.message}。请检查各字段后点击「立即保存」`)
+      } else {
+        // conflict / project-switched：内存里那份已经作废或不属于当前项目，
+        // 让本步明确失败，不能装成「已生成，你去手动保存一下」
+        throw new Error(saved.kind === 'conflict'
+          ? '项目配置已被其它操作更新，本次生成结果已作废，请重新生成'
+          : '项目已切换，本次配置生成已中止')
+      }
     }
     callbacks.setProgress(100)
     return '生成的配置已成功应用！'
@@ -123,6 +173,12 @@ export class GenerateConfigCommand extends BaseWorkflowCommand<string> {
 
 export class GenerateCoreSeedCommand extends BaseWorkflowCommand<string> {
   async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    // ⚠️ 优先取工作流构造时钉住的 token（`WORKFLOW_TOKEN_KEY`），**不现取**。
+    // 工作流是排队执行的，各步之间又各隔一次分钟级 LLM——在 execute 入口现取
+    // 拿到的已经是用户切换后那个项目的**合法** token，守卫看不出异常。
+    // 回落 getProjectToken() 只是给「不经工作流、直接 new Command().execute()」
+    // 的调用兜底（当前无此类调用点）。
+    const actionToken = (context.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
     const { project, config } = getNovelConfig()
     callbacks.log('生成故事前提...')
 
@@ -148,7 +204,7 @@ export class GenerateCoreSeedCommand extends BaseWorkflowCommand<string> {
     if (context.cancelled) throw new Error('工作流已取消')
 
     const content = `# 故事前提\n\n${result}\n`
-    await writeArchToDb('premise', content)
+    await writeArchToDb('premise', content, actionToken)
 
     const partial = (context.data.partial as PartialArchData) || await loadPartialData(project.path)
     partial.premise_result = result
@@ -162,6 +218,12 @@ export class GenerateCoreSeedCommand extends BaseWorkflowCommand<string> {
 
 export class GenerateCharactersCommand extends BaseWorkflowCommand<string> {
   async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    // ⚠️ 优先取工作流构造时钉住的 token（`WORKFLOW_TOKEN_KEY`），**不现取**。
+    // 工作流是排队执行的，各步之间又各隔一次分钟级 LLM——在 execute 入口现取
+    // 拿到的已经是用户切换后那个项目的**合法** token，守卫看不出异常。
+    // 回落 getProjectToken() 只是给「不经工作流、直接 new Command().execute()」
+    // 的调用兜底（当前无此类调用点）。
+    const actionToken = (context.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
     const { project, config } = getNovelConfig()
 
     const core = await ipc.invoke('db:project-core-get')
@@ -190,7 +252,7 @@ export class GenerateCharactersCommand extends BaseWorkflowCommand<string> {
     if (!result.trim()) throw new Error('角色图谱生成失败')
     if (context.cancelled) throw new Error('工作流已取消')
 
-    await writeArchToDb('charactersArch', `# 角色图谱\n\n${result}\n`)
+    await writeArchToDb('charactersArch', `# 角色图谱\n\n${result}\n`, actionToken)
 
     callbacks.log('📇 正在启动角色卡自动提取流水线...')
     const { runArchCharacterExtract } = await import('../architecture-workflow')
@@ -208,6 +270,12 @@ export class GenerateCharactersCommand extends BaseWorkflowCommand<string> {
 
 export class GenerateWorldBuildingCommand extends BaseWorkflowCommand<string> {
   async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    // ⚠️ 优先取工作流构造时钉住的 token（`WORKFLOW_TOKEN_KEY`），**不现取**。
+    // 工作流是排队执行的，各步之间又各隔一次分钟级 LLM——在 execute 入口现取
+    // 拿到的已经是用户切换后那个项目的**合法** token，守卫看不出异常。
+    // 回落 getProjectToken() 只是给「不经工作流、直接 new Command().execute()」
+    // 的调用兜底（当前无此类调用点）。
+    const actionToken = (context.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
     const { project, config } = getNovelConfig()
 
     const core = await ipc.invoke('db:project-core-get')
@@ -233,7 +301,7 @@ export class GenerateWorldBuildingCommand extends BaseWorkflowCommand<string> {
     const result = await this.callLLMWithBuilder(promptBuilder, callbacks, undefined, context)
     if (context.cancelled) throw new Error('工作流已取消')
 
-    await writeArchToDb('worldbuilding', `# 世界观\n\n${result}\n`)
+    await writeArchToDb('worldbuilding', `# 世界观\n\n${result}\n`, actionToken)
 
     const partial = (context.data.partial as PartialArchData) || await loadPartialData(project.path)
     partial.world_building_result = result
@@ -251,6 +319,12 @@ export class GeneratePlotArchitectureCommand extends BaseWorkflowCommand<string>
   }
 
   async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    // ⚠️ 优先取工作流构造时钉住的 token（`WORKFLOW_TOKEN_KEY`），**不现取**。
+    // 工作流是排队执行的，各步之间又各隔一次分钟级 LLM——在 execute 入口现取
+    // 拿到的已经是用户切换后那个项目的**合法** token，守卫看不出异常。
+    // 回落 getProjectToken() 只是给「不经工作流、直接 new Command().execute()」
+    // 的调用兜底（当前无此类调用点）。
+    const actionToken = (context.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
     const { project, config } = getNovelConfig()
 
     const core = await ipc.invoke('db:project-core-get')
@@ -285,7 +359,7 @@ export class GeneratePlotArchitectureCommand extends BaseWorkflowCommand<string>
     const result = await this.callLLMWithBuilder(promptBuilder, callbacks, undefined, context)
     if (context.cancelled) throw new Error('工作流已取消')
 
-    await writeArchToDb('synopsis', `# 情节大纲\n\n${result}\n`)
+    await writeArchToDb('synopsis', `# 情节大纲\n\n${result}\n`, actionToken)
 
     const partial = (context.data.partial as PartialArchData) || await loadPartialData(project.path)
     partial.synopsis_result = result

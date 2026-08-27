@@ -4,6 +4,7 @@ import { useLLMStore } from '../../stores/llm-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 
 import { useProjectStore } from '../../stores/project-store'
+import { getProjectToken } from '../../stores/volume-store'
 import { createConfigGenerationWorkflow } from '../../services/workflows/architecture-workflow'
 import { confirm } from '../ui/Confirm'
 import { toast } from '../ui/Toast'
@@ -73,6 +74,10 @@ export default function GenerateConfigDialog({ isOpen, onClose, onGenerated }: P
     const chapters = targetLength || 200
     const words = currentProject?.novelConfig.wordsPerChapter || 3000
 
+    // ⚠️ 任何 await 之前捕获。下面有一个确认对话框（`await confirm`），
+    // 用户可能在那儿停留很久；之后还要 `updateNovelConfig` 改内存、再构造工作流。
+    // 到那时现取会拿到切换后那个项目的合法 token
+    const actionToken = getProjectToken()
     isSubmittingRef.current = true
     setIsSubmitting(true)
     try {
@@ -97,6 +102,13 @@ export default function GenerateConfigDialog({ isOpen, onClose, onGenerated }: P
         if (!ok) return
       }
 
+      // 确认对话框返回后复核：改内存之前必须确认还是同一个项目，
+      // 否则 A 的篇幅档位会被写进 B 的配置（IPC 拒得掉，内存拒不掉）
+      if (getProjectToken() !== actionToken) {
+        toast.error('项目已切换，本次生成已取消')
+        return
+      }
+
       // 同步篇幅档位到项目配置（单一数据源，配置编辑器一并更新）
       updateNovelConfig({ totalChapters: chapters })
 
@@ -113,7 +125,7 @@ export default function GenerateConfigDialog({ isOpen, onClose, onGenerated }: P
           wordsPerChapter: words,
           onGenerated,
           genreHint: genre || undefined,
-        })
+        }, actionToken)
       )
     } finally {
       isSubmittingRef.current = false

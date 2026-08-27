@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Sparkles, CheckCircle2, Circle, RefreshCw, FileText, BookOpen, AlertTriangle, FolderTree } from 'lucide-react'
 import { useProjectStore } from '../../stores/project-store'
+import { getProjectToken } from '../../stores/volume-store'
 import { useCharacterStore } from '../../stores/character-store'
 import { renderIcon } from '../panels/sidebar/SidebarShared'
 
@@ -145,8 +146,13 @@ export default function WorldBuildingEditor() {
 
   /** 确认后启动架构工作流 */
   const handleConfirm = async (selectedSteps: ArchStepKey[], stepGuidance: Record<string, string>) => {
+    // 任何 await 之前捕获——工作流是排队执行的，构造完到真正跑起来
+    // 可能隔很久，让工厂自己现取等于把捕获点推迟到那之后
+    // 这里的 await（动态 import）本身就是一个可切走的窗口
+    const actionToken = getProjectToken()
     const { useWorkflowStore } = await import('../../stores/workflow-store')
-    useWorkflowStore.getState().startWorkflow(createArchitectureWorkflow({ selectedSteps, stepGuidance }))
+    useWorkflowStore.getState().startWorkflow(
+      createArchitectureWorkflow({ selectedSteps, stepGuidance }, actionToken))
   }
 
   if (!currentProject) {

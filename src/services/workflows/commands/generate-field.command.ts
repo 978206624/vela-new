@@ -1,5 +1,6 @@
-import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
+import { BaseWorkflowCommand, CommandExecuteParams, WORKFLOW_TOKEN_KEY } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
+import { getProjectToken } from '../../../stores/volume-store'
 import type { NovelConfig } from '../../../shared/ipc-channels'
 
 /**
@@ -33,7 +34,12 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
     super()
   }
 
-  async execute({ callbacks }: CommandExecuteParams): Promise<string> {
+  async execute({ context: ctx, callbacks }: CommandExecuteParams): Promise<string> {
+    // ⚠️ 优先取派发方（NovelConfigEditor 的点击处）钉住的 token，不在这里现取。
+    // 解构改名为 ctx：本方法下面有个同名局部变量 `context`（提示词上下文摘要），
+    // 两者含义完全不同，重名会让人误以为在读同一个东西
+    const actionToken = (ctx.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
+
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error('未打开项目')
 
@@ -48,7 +54,8 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
     const prompt = this.buildPrompt(config, context)
     const systemPrompt = '你是一位入行十年的顶尖网文主编与白金大神作家，擅长精准设计小说的各项核心配置。'
 
-    const result = await this.callLLM(prompt, systemPrompt, callbacks)
+    // 传 ctx：不传就没有跨项目守卫（见 actionToken 处的说明）
+    const result = await this.callLLM(prompt, systemPrompt, callbacks, undefined, ctx)
     const cleanResult = this.stripThinkingTags(result).trim()
 
     if (!cleanResult) {
@@ -56,10 +63,23 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
       return ''
     }
 
-    // 写入 NovelConfig
+    if (getProjectToken() !== actionToken) {
+      callbacks.log(`⚠️ 项目已切换，「${label}」的生成结果未写入`)
+      return ''
+    }
+
+    // 只发本步生成的那一个字段
     const { updateNovelConfig, saveProject } = useProjectStore.getState()
     updateNovelConfig({ [this.fieldKey]: cleanResult })
-    await saveProject()
+    const saved = await saveProject({ novelConfig: { [this.fieldKey]: cleanResult } }, actionToken)
+    // 只认 success，理由同 analyze-style。三种失败分开说：
+    // conflict 是确认未写入，另两种是状态未知
+    if (saved.kind !== 'success') {
+      callbacks.log(saved.kind === 'conflict'
+        ? `⚠️ 「${label}」未写入：配置已被其它操作更新`
+        : `⚠️ 「${label}」的持久化未能确认（${saved.kind}）`)
+      return cleanResult
+    }
     callbacks.log(`✅ 「${label}」已生成并保存`)
 
     return cleanResult

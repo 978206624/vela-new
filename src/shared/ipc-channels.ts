@@ -49,15 +49,44 @@ export interface ProjectChannels {
   }
   'project:open': {
     args: [projectPath: string]
-    return: { success: boolean; project: ProjectData | null; error?: string; currentToken?: number }
+    return: {
+      success: boolean; project: ProjectData | null; error?: string; currentToken?: number
+      /** project_core 的当前版本号，渲染层保存时须原样带回做 CAS */
+      coreRevision?: number
+    }
   }
   'project:save': {
-    args: [projectId: string, data: Partial<ProjectData>]
-    return: { success: boolean; error?: string }
-  }
-  'project:update-config': {
-    args: [projectId: string, data: Partial<ProjectData>]
-    return: { success: boolean; error?: string }
+    args: [
+      projectId: string,
+      /**
+       * **只带本次真正改动的字段**，不要发整份快照。
+       * 发整份意味着任何一个字段的旧值都可能覆盖掉别处刚写入的新值
+       * （续卷改 synopsis/total_chapters 是最典型的一例）。
+       */
+      patch: ProjectSavePatch,
+      /** 调用方持有的 project_core 版本号；与库里不一致即整单拒绝 */
+      expectedRevision: number,
+      /** 跨项目守卫：与主进程当前项目 token 不一致即拒绝 */
+      expectedToken: number | undefined,
+    ]
+    return: {
+      success: boolean; error?: string
+      /** 拒绝写入。**成因见 `staleReason`**，两者善后完全不同 */
+      stale?: boolean
+      /**
+       * `stale` 的成因，调用方据此决定善后：
+       * - `'revision'`：版本冲突，库里有更新的内容 → 应重载，用户的改动作废
+       * - `'token'`：项目已切换，这次写入属于**上一个项目** → 什么都不该重载。
+       *   注意**不是**「保留脏标记」：切项目一律先走 `closeProject()`，
+       *   原项目的内存配置与脏集合此刻已被清空，无从保留
+       *
+       * 早先只有一个 `stale` 布尔，渲染层无从分辨，只能一律当成版本冲突去重载——
+       * 于是「项目切换」会把当前项目的配置无谓地重读一遍，还清掉用户的脏标记
+       */
+      staleReason?: 'revision' | 'token'
+      /** 写入后的新版本号（stale 时是库里的真实当前值，供调用方直接对齐） */
+      revision?: number
+    }
   }
   'project:recent-list': {
     args: []
@@ -190,6 +219,19 @@ export interface ProjectData {
   characterStates: string
   createdAt: string
   updatedAt: string
+}
+
+/**
+ * `project:save` 的补丁。**只放本次真正改动的字段。**
+ *
+ * 之前这里是 `Partial<ProjectData>` 且调用方一律发整份快照，于是
+ * 「读于某次主进程写入之前的旧值」会随保存一起落地，把新值覆盖回去。
+ * 收窄成补丁后，冲突面从「任意字段」缩到「同字段真冲突」。
+ */
+export interface ProjectSavePatch {
+  name?: string
+  novelConfig?: Partial<NovelConfig>
+  characterStates?: string
 }
 
 export interface NovelConfig {
@@ -330,7 +372,7 @@ export interface ModelProfile {
 }
 
 // ===== 引入 DB 类型 =====
-import type { ProjectCoreData } from '../../electron/repositories/project-core-repository'
+import type { ProjectCoreData, ProjectCorePatch } from '../../electron/repositories/project-core-repository'
 import type { BlueprintData } from '../../electron/repositories/blueprint-repository'
 import type { VolumeData, VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
 import type { CommitNextVolumePayload, CommitNextVolumeResult, FirstVolumeInspection } from '../../electron/repositories/volume-commit'
@@ -349,7 +391,11 @@ export interface DatabaseChannels {
 
   // 1. project_core
   'db:project-core-get': { args: []; return: ProjectCoreData | null }
-  'db:project-core-update': { args: [data: Partial<ProjectCoreData>]; return: { success: boolean; error?: string } }
+  // 回带 revision：本通道也写 project_core，调用方不同步版本号的话，
+  // 下一次 project:save 会带着过期的 revision 撞 CAS
+  // expectedToken 必传（undefined 视为拒绝）：本通道被架构生成四步走使用，
+  // 每一步都排在一次分钟级 LLM 调用之后，是最容易写进"另一个项目"的路径之一
+  'db:project-core-update': { args: [data: ProjectCorePatch, expectedToken: number | undefined]; return: { success: boolean; error?: string; stale?: boolean; revision?: number } }
 
   // 2. blueprints
   'db:blueprint-get-all': { args: []; return: BlueprintData[] }

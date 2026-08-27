@@ -8,9 +8,14 @@
  * 会审否决——四连写非原子，中途失败会留下「卷已建但总章数未改」「大纲追加了但卷没建」
  * 这类半提交状态，且用户无回滚入口。
  *
- * 另一层原因：`updateProjectCore` 走的 `db:project-core-update` **没有 token 守卫**，
- * 而续卷跨越两次 LLM 调用（分钟级），用户中途切项目就会把这一步写进另一个库。
- * 复合 IPC 只在入口校验一次 token，事务内不再有跨项目窗口。
+ * 另一层原因是跨项目窗口：续卷跨越两次 LLM 调用（分钟级），若拆成四个独立 IPC，
+ * 每一个都得各自捕获并校验 token，漏一个就把那一步写进了另一个库。
+ * 复合 IPC 只在入口校验一次，事务内不再有窗口。
+ *
+ * > 早先这里写的是「`db:project-core-update` **没有 token 守卫**」——
+ * > 那已经不成立：Task 19.5 给它加了 fail-closed 校验
+ * > （`electron/services/project-save.ts` 的 `applyProjectCoreUpdate`）。
+ * > 但上面那条「四连写各自校验、漏一个就出事」的理由与守卫是否存在无关，仍然成立。
  *
  * ## 与仓储层的关系
  *
@@ -25,6 +30,7 @@ import { getProjectDb } from '../database'
 import { VolumeRepository, type VolumeData } from './volume-repository'
 import type { OpenThread } from './volume-threads'
 import { BlueprintRepository } from './blueprint-repository'
+import { ProjectCoreRepository } from './project-core-repository'
 
 /** 孤儿蓝图处置策略。定义在主进程侧，渲染层 type-only 引用（跨边界只允许 import type） */
 export type OrphanPolicy = 'clear' | 'keep' | 'extend'
@@ -126,6 +132,14 @@ export interface CommitNextVolumeResult {
     previousSynopsis?: string
     /** 本次追加的新卷段落，供渲染层在 store 已偏离时自行追加 */
     appendedSection?: string
+    /**
+     * 事务后的 `project_core.revision`。
+     *
+     * 渲染层必须用它刷新本地版本号：续卷在主进程里直接写了 project_core，
+     * 而渲染层持有的整份配置快照仍是续卷之前的。不同步，下一次 `project:save`
+     * 会带着旧 revision 撞 CAS，用户看到「保存失败」而不是「续卷成功」。
+     */
+    coreRevision?: number
     error?: string
 }
 
@@ -443,9 +457,11 @@ export function commitNextVolume(payload: CommitNextVolumePayload): CommitNextVo
             newSynopsis = prevSynopsis
                 ? `${prevSynopsis}\n\n---\n\n${payload.newVolumeSection}`.trim()
                 : payload.newVolumeSection.trim()
+            // revision 必须与数据同语句自增：渲染层拿它做保存 CAS，
+            // 少涨一次就等于给「读于续卷之前的旧快照」开了一道后门
             const info = db.prepare(`
         UPDATE project_core
-        SET total_chapters = ?, synopsis = ?, updated_at = datetime('now')
+        SET total_chapters = ?, synopsis = ?, revision = revision + 1, updated_at = datetime('now')
         WHERE id = 'main'
       `).run(newTotalChapters, newSynopsis)
             if (info.changes === 0) {
@@ -460,6 +476,9 @@ export function commitNextVolume(payload: CommitNextVolumePayload): CommitNextVo
             synopsis: newSynopsis,
             previousSynopsis,
             appendedSection: payload.newVolumeSection,
+            // 回带新版本号：渲染层不同步它，下一次 saveProject 会拿着续卷前的
+            // revision 撞 CAS，用户看到的是「保存失败」而不是「续卷成功」
+            coreRevision: ProjectCoreRepository.getRevision() ?? 0,
         }
     } catch (err) {
         console.error('[volume-commit] 续卷提交失败，事务已回滚:', err)

@@ -184,7 +184,7 @@ async function buildDefinition(
         return { error: '故事架构已生成。为避免误覆盖，重新生成请在「故事架构」向导中操作（可选择生成哪些步骤）。' }
       }
       const { createArchitectureWorkflow } = await import('../../workflows/architecture-workflow')
-      return { def: createArchitectureWorkflow({}) }
+      return { def: createArchitectureWorkflow({}, actionToken) }
     }
 
     default:

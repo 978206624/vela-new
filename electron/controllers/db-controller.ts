@@ -1,9 +1,10 @@
 import { ipcMain } from 'electron'
 import { closeProjectDatabase } from '../database'
 import { getCurrentProjectToken } from '../utils/current-project'
+import { applyProjectCoreUpdate } from '../services/project-save'
 
 // 导入所有 Repository
-import { ProjectCoreRepository, ProjectCoreData } from '../repositories/project-core-repository'
+import { ProjectCoreRepository, type ProjectCorePatch } from '../repositories/project-core-repository'
 import { BlueprintRepository, BlueprintData } from '../repositories/blueprint-repository'
 import { CharacterRepository, CharacterData, CharacterStateData } from '../repositories/character-repository'
 import { DraftRepository } from '../repositories/draft-repository'
@@ -31,10 +32,12 @@ export function registerDatabaseController() {
     return ProjectCoreRepository.get()
   })
 
-  ipcMain.handle('db:project-core-update', async (_event, data: Partial<ProjectCoreData>) => {
+  ipcMain.handle('db:project-core-update', async (_event, data: ProjectCorePatch, expectedToken: number | undefined) => {
     try {
-      ProjectCoreRepository.update(data)
-      return { success: true }
+      // 同 project:save —— 判定与写入走共用实现，harness 调的是同一份
+      return applyProjectCoreUpdate({
+        patch: data, expectedToken, currentToken: getCurrentProjectToken(),
+      })
     } catch (err) {
       console.error('[db:project-core-update] 失败:', err)
       return { success: false, error: String(err) }

@@ -3,6 +3,8 @@ import { useLLMStore } from '../../stores/llm-store'
 import { useProjectStore } from '../../stores/project-store'
 import { coerceRole } from '../../stores/character-store'
 import { getPromptTemplate } from '../prompt-templates'
+import { WORKFLOW_TOKEN_KEY } from './commands/base-command'
+import { getProjectToken } from '../../stores/volume-store'
 import { ipc } from '../ipc-client'
 import type { NovelConfig } from '../../shared/ipc-channels'
 import type { CharacterData } from '../../../electron/repositories/character-repository'
@@ -40,11 +42,23 @@ export interface ConfigGenerationWorkflowParams {
 // 2. 工作流定义
 // ==========================================
 
-export function createArchitectureWorkflow(params: ArchitectureWorkflowParams = {}): WorkflowDefinition {
+export function createArchitectureWorkflow(
+  params: ArchitectureWorkflowParams = {},
+  /** 调用方在**点击入口**捕获的 token；缺省则退化为构造时捕获 */
+  capturedTokenOverride?: number,
+): WorkflowDefinition {
   const sel = params.selectedSteps ?? ['premise', 'characters', 'worldbuilding', 'synopsis']
   const stepDesc = (key: string, defaultDesc: string) => sel.includes(key as never) ? defaultDesc : `（跳过，保留已有内容）`
   // 闭包捕获逐步指导，executor 中注入到 context.data
   const guidance = params.stepGuidance || {}
+
+  // ⚠️ token 在**工作流构造时**捕获，不能让各 Command 在自己的 execute 入口现取。
+  // 工作流是排队执行的：构造完到第一步真正跑起来之间可能隔着另一个工作流的
+  // 全程等待，各步之间又各隔一次分钟级 LLM。任何一处现取都会拿到用户切换后
+  // 那个项目的**合法** token——守卫看不出异常，A 的架构就写进了 B。
+  // 写进 context.data[WORKFLOW_TOKEN_KEY]：BaseWorkflowCommand.callLLM 的
+  // 跨批次检查只认这个键，各 Command 也从这里取（而不是各自 getProjectToken()）。
+  const capturedToken = capturedTokenOverride ?? getProjectToken()
 
   const allSteps = [
     {
@@ -52,6 +66,8 @@ export function createArchitectureWorkflow(params: ArchitectureWorkflowParams = 
       key: 'premise',
       description: stepDesc('premise', '提炼故事前提与核心卖点'),
       executor: async (step: unknown, context: WorkflowContext, callbacks: StepCallbacks) => {
+        // 各步统一从工作流构造时钉住的 token 出发，不各自现取（见工厂里的说明）
+        context.data[WORKFLOW_TOKEN_KEY] = capturedToken
         context.data.stepGuidance = guidance
         const { GenerateCoreSeedCommand } = await import('./commands/architecture.command')
         return new GenerateCoreSeedCommand().execute({ step, context, callbacks })
@@ -62,6 +78,8 @@ export function createArchitectureWorkflow(params: ArchitectureWorkflowParams = 
       key: 'characters',
       description: stepDesc('characters', '构建核心角色关系网与角色弧光'),
       executor: async (step: unknown, context: WorkflowContext, callbacks: StepCallbacks) => {
+        // 各步统一从工作流构造时钉住的 token 出发，不各自现取（见工厂里的说明）
+        context.data[WORKFLOW_TOKEN_KEY] = capturedToken
         context.data.stepGuidance = guidance
         const { GenerateCharactersCommand } = await import('./commands/architecture.command')
         return new GenerateCharactersCommand().execute({ step, context, callbacks })
@@ -72,6 +90,8 @@ export function createArchitectureWorkflow(params: ArchitectureWorkflowParams = 
       key: 'worldbuilding',
       description: stepDesc('worldbuilding', '构建自带冲突引擎的世界观矩阵'),
       executor: async (step: unknown, context: WorkflowContext, callbacks: StepCallbacks) => {
+        // 各步统一从工作流构造时钉住的 token 出发，不各自现取（见工厂里的说明）
+        context.data[WORKFLOW_TOKEN_KEY] = capturedToken
         context.data.stepGuidance = guidance
         const { GenerateWorldBuildingCommand } = await import('./commands/architecture.command')
         return new GenerateWorldBuildingCommand().execute({ step, context, callbacks })
@@ -82,6 +102,8 @@ export function createArchitectureWorkflow(params: ArchitectureWorkflowParams = 
       key: 'synopsis',
       description: stepDesc('synopsis', '整合所有碎片，按选定结构模式生成情节大纲'),
       executor: async (step: unknown, context: WorkflowContext, callbacks: StepCallbacks) => {
+        // 各步统一从工作流构造时钉住的 token 出发，不各自现取（见工厂里的说明）
+        context.data[WORKFLOW_TOKEN_KEY] = capturedToken
         context.data.stepGuidance = guidance
         const { GeneratePlotArchitectureCommand } = await import('./commands/architecture.command')
         return new GeneratePlotArchitectureCommand(sel).execute({ step, context, callbacks })
@@ -99,7 +121,15 @@ export function createArchitectureWorkflow(params: ArchitectureWorkflowParams = 
   }
 }
 
-export function createConfigGenerationWorkflow(params: ConfigGenerationWorkflowParams): WorkflowDefinition {
+export function createConfigGenerationWorkflow(
+  params: ConfigGenerationWorkflowParams,
+  capturedTokenOverride?: number,
+): WorkflowDefinition {
+  // ⚠️ token 在工作流**构造时**捕获，理由同 createArchitectureWorkflow：
+  // 工作流排队执行，各步之间又各隔一次分钟级 LLM，任何一处现取都会拿到
+  // 用户切换后那个项目的合法 token
+  const capturedToken = capturedTokenOverride ?? getProjectToken()
+
   return {
     type: 'config_generation',
     title: '🧠 AI 生成小说配置',
@@ -108,6 +138,8 @@ export function createConfigGenerationWorkflow(params: ConfigGenerationWorkflowP
         name: '智能分析并填充配置',
         description: `根据创作脑洞生成小说配置（全书规划约 ${params.totalChapters} 章）`,
         executor: async (step, context, callbacks) => {
+          // 从工作流构造时钉住的 token 出发，不现取
+          context.data[WORKFLOW_TOKEN_KEY] = capturedToken
           const { GenerateConfigCommand } = await import('./commands/architecture.command')
           const cmd = new GenerateConfigCommand(params.idea, params.totalChapters, params.wordsPerChapter, params.onGenerated, params.genreHint)
           return cmd.execute({ step, context, callbacks })

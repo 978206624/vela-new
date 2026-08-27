@@ -1,4 +1,4 @@
-import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
+import { BaseWorkflowCommand, CommandExecuteParams, WORKFLOW_TOKEN_KEY } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
 import { useLLMStore } from '../../../stores/llm-store'
 import { getPromptTemplate } from '../../prompt-templates'
@@ -245,10 +245,16 @@ export function buildFinalizePostProcessSteps(
         const { AnalyzeWritingStyleCommand } = await import('./analyze-style.command')
         await new AnalyzeWritingStyleCommand().execute({
           step: {} as unknown,
-          context: { data: {}, cancelled: false },
+          // 把本次定稿流水线钉住的 token 传下去：文风分析自己再跑一次 LLM，
+          // 让它在自己入口现取等于把捕获点推迟到那次调用之后
+          context: { data: { [WORKFLOW_TOKEN_KEY]: capturedToken }, cancelled: false },
           callbacks,
         })
-        callbacks.log('✅ 文风分析完成，已更新配置')
+        // ⚠️ 这里**不打成功日志**。命令有两条合法的 no-op 分支
+        // （无已定稿章节 / 采样正文全空），它们记 ℹ️ 后返回空串；
+        // 在这儿无条件打「✅ 已更新配置」会把这两种情况谎报成功。
+        // 真正保存成功时，命令自己已经记过「✅ 文风特征已保存到小说配置」。
+        // 失败则由命令抛错、流水线记为失败（critical:false，不阻断定稿）
       },
     })
   }

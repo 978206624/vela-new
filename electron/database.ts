@@ -58,6 +58,13 @@ function runMigrations(db: BetterSqlite3.Database) {
     db.exec(`ALTER TABLE blueprints ADD COLUMN target_words INTEGER NOT NULL DEFAULT 0`)
     console.log('[Vela DB] migration: blueprints.target_words 已添加')
   }
+
+  // project_core.revision（Phase 19：保存并发守卫，0 = 从未写过）
+  const coreCols = db.pragma('table_info(project_core)') as Array<{ name: string }>
+  if (!coreCols.some((c) => c.name === 'revision')) {
+    db.exec(`ALTER TABLE project_core ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`)
+    console.log('[Vela DB] migration: project_core.revision 已添加')
+  }
 }
 
 /** 创建完整表结构（10 张核心表 + 3 张沿用表） */
@@ -89,6 +96,12 @@ function createTables(db: BetterSqlite3.Database) {
       synopsis TEXT DEFAULT '',                   -- 情节总大纲
       -- [系统缓存]
       character_states TEXT DEFAULT '',           -- 全书角色动态快照
+      -- [并发控制]
+      -- 单调递增版本号。每次 project_core 写入 +1，渲染层保存时带上它做 CAS。
+      -- 没有它时，一份「读于 T0 的整份快照」可以在 T1 的写入之后落地，
+      -- 把刚写进去的 synopsis / total_chapters 覆盖回旧值（续卷正是这种场景）。
+      -- updated_at 只精确到秒，同秒内的两次写入区分不了，当不了版本号。
+      revision INTEGER NOT NULL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );

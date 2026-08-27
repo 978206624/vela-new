@@ -1,6 +1,8 @@
 import { useState, useRef } from 'react'
 import { Save, Sparkles, Info, Loader2, ChevronRight, Link2 } from 'lucide-react'
-import { useProjectStore } from '../../stores/project-store'
+import { useProjectStore, selectPendingConfigFields } from '../../stores/project-store'
+import { getProjectToken } from '../../stores/volume-store'
+import { WORKFLOW_TOKEN_KEY } from '../../services/workflows/commands/base-command'
 import { useLLMStore } from '../../stores/llm-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 import type { NovelConfig } from '../../shared/ipc-channels'
@@ -38,6 +40,16 @@ export default function NovelConfigEditor() {
     return next
   })
 
+  // 本次会话里用户实际改动过的字段。
+  // 保存只发这些字段：发整份配置会把「读于某次主进程写入之前」的旧值
+  // （典型：续卷刚改过的 coreOutline / totalChapters）一并写回去，覆盖掉新值。
+  //
+  // 脏集合来自 **store**，不是组件本地 ref：改内存的路径不止编辑器一条，
+  // AI 生成、Agent 工具、导入推演都直接调 `updateNovelConfig`。挂在组件上时
+  // 那些改动完全不可见 —— 用户点保存会看到「没有改动，无需保存」，
+  // 而那些内容确实还没落库。
+  const pendingFields = useProjectStore(selectPendingConfigFields)
+
   // 直接从 Store 读取配置 — 单一数据源，无需 local state 镜像
   const config = currentProject?.novelConfig ?? null
 
@@ -49,15 +61,48 @@ export default function NovelConfigEditor() {
 
   // 直接写 Store — 消除双向同步风险
   const update = <K extends keyof NovelConfig>(key: K, value: NovelConfig[K]) => {
+    // 脏字段由 store 在 updateNovelConfig 里统一登记
     updateNovelConfig({ [key]: value })
   }
 
   /** 保存配置 — Store 已是最新数据，仅需持久化到磁盘 */
   const handleSave = async () => {
     if (!config || saving) return
+    // 任何 await 之前捕获（本函数里的 saveProject 是异步的）
+    const actionToken = getProjectToken()
     setSaving(true)
     try {
-      await saveProject()
+      // 快照：本次提交哪些字段，此刻定死。保存期间用户还能继续编辑，
+      // 那些新字段会进 store 的脏集合但**不在**本次 patch 里；
+      // 保存成功后 store 只减掉本次提交的这几个，新编辑仍然留着
+      const dirty = [...pendingFields]
+      if (dirty.length === 0) {
+        addLog('info', '📝 没有改动，无需保存')
+        return
+      }
+      const patch: Partial<NovelConfig> = {}
+      for (const k of dirty) {
+        (patch as Record<string, unknown>)[k] = config[k]
+      }
+      const res = await saveProject({ novelConfig: patch }, actionToken)
+      // ⚠️ 四种结果的善后互不相同。早先把所有失败一律当成「已重载」清脏标记，
+      // 于是一次 IPC 超时就会让用户的编辑消失在界面上——他会以为已经保存了。
+      // 脏集合的增删现在全部由 store 负责（success 按本次快照精确减、
+      // conflict 随重载整体清空），组件只负责把结果讲给用户听
+      if (res.kind === 'conflict') {
+        addLog('error', '保存未生效：项目配置已被其它操作更新，已重新加载')
+        return
+      }
+      if (res.kind !== 'success') {
+        // 两种结果都**不确定**是否落库（切项目可能发生在主进程写完之后；
+        // 超时也不取消已发出的 IPC），但「改动还在不在」不同：
+        // 切项目时 closeProject 已经把原项目的配置与脏集合清空了，
+        // 说「改动仍保留在编辑器里」是谎话；error 时项目还开着，改动确实还在
+        addLog('error', res.kind === 'project-switched'
+          ? '项目已切换，本次保存未能确认；原项目未保存的改动已随项目关闭丢失'
+          : `保存未能确认：${res.message}（改动仍在编辑器里，可重试）`)
+        return
+      }
       addLog('info', '📝 小说配置已保存')
     } catch (error) {
       console.error('[NovelConfigEditor] 保存失败:', error)
@@ -87,12 +132,15 @@ export default function NovelConfigEditor() {
     // 生成前自动展开对应区块，让用户看到结果
     setOpenSections(prev => new Set(prev).add(fieldKey))
     setGeneratingField(fieldKey)
+    // 任何 await 之前捕获——下面是一次分钟级的 LLM 生成
+    const genToken = getProjectToken()
     try {
       const { GenerateFieldCommand } = await import('../../services/workflows/commands/generate-field.command')
       const cmd = new GenerateFieldCommand(fieldKey)
       await cmd.execute({
         step: { id: '', commandId: '', name: '', params: {} },
-        context: { data: {}, cancelled: false },
+        // 点击处捕获的 token 随 context 传下去，命令内部不再现取
+        context: { data: { [WORKFLOW_TOKEN_KEY]: genToken }, cancelled: false },
         callbacks: {
           log: (msg: string) => useWorkflowStore.getState().addLog('info', msg),
           setProgress: () => { },

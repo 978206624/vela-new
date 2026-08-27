@@ -7,6 +7,7 @@ import ArchitectureConfirmDialog from '../dialogs/ArchitectureConfirmDialog'
 import { Button } from '../ui/Button'
 import { ipc } from '../../services/ipc-client'
 import { readCoreContent, writeCoreContent } from '../../services/vela-protocol'
+import { getProjectToken } from '../../stores/volume-store'
 import CodeMirrorEditor from './CodeMirrorEditor'
 import { useProjectStore } from '../../stores/project-store'
 import { useCharacterStore } from '../../stores/character-store'
@@ -106,11 +107,13 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
 
   /** 保存（统一走 vela://core/ DB 路径） */
   const handleSave = useCallback(async (md: string) => {
+    // 任何 await 之前捕获：写库是异步的，期间用户可能切走
+    const actionToken = getProjectToken()
     setSaving(true)
     try {
       let success = true
       if (filePath.startsWith('vela://core/')) {
-        success = await writeCoreContent(filePath, md)
+        success = await writeCoreContent(filePath, md, actionToken)
       } else {
         // DB 化后架构文件不应有物理路径；如果意外触发，尝试 FS 写入兜底
         console.warn('[ArchFileViewer] 非预期的物理路径保存:', filePath)
@@ -159,7 +162,11 @@ export default function ArchFileViewer({ filePath, content: initialContent }: Pr
 
   /** 确认后启动架构生成工作流 */
   const handleConfirm = async (selectedSteps: ArchStepKey[], stepGuidance: Record<string, string>) => {
-    useWorkflowStore.getState().startWorkflow(createArchitectureWorkflow({ selectedSteps, stepGuidance }))
+    // 任何 await 之前捕获——工作流是排队执行的，构造完到真正跑起来
+    // 可能隔很久，让工厂自己现取等于把捕获点推迟到那之后
+    const actionToken = getProjectToken()
+    useWorkflowStore.getState().startWorkflow(
+      createArchitectureWorkflow({ selectedSteps, stepGuidance }, actionToken))
   }
 
   const handleOpenDialog = async () => {

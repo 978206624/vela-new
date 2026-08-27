@@ -281,6 +281,14 @@ export async function commitNextVolume(
             return { success: false, error: res.stale ? '项目已切换，本次续卷未写入' : res.error }
         }
 
+        // 续卷在主进程事务里直接改了 project_core，revision 已 +1。
+        // 必须同步回来：否则用户随后在小说配置里点保存，会带着续卷之前的版本号
+        // 撞 CAS，看到的是"保存失败"而不是"续卷成功"。
+        // 与下面的别名同步一样，先核对 token——这段跑在 await 之后，项目可能已切换。
+        if (getProjectToken() === capturedToken && res.coreRevision !== undefined) {
+            useProjectStore.setState({ coreRevision: res.coreRevision })
+        }
+
         // 主进程已在事务内落库 project_core。渲染层这里只同步内存别名、不再发持久化 IPC——
         // 否则用户随后在小说配置编辑器点保存，saveProject 会用陈旧的 coreOutline
         // 把刚提交的卷大纲覆盖掉（vela-protocol.ts 注释所述的坑）。
@@ -299,7 +307,11 @@ export async function commitNextVolume(
             // 用户在生成期间做的编辑对两次读都可见、结果相等，会被判成「没改过」而整串覆盖，
             // 恰好漏掉唯一真正危险的那个窗口。
             if (storeNow === (res.previousSynopsis ?? '')) {
-                store.updateNovelConfig({ totalChapters: res.totalChapters, coreOutline: res.synopsis })
+                // persisted:true —— 这两个值就是主进程事务刚写进库的，内存与库一致。
+                // 登记成脏会让用户下一次保存把它们再发一遍，还把「有没有未保存改动」搅浑
+                store.updateNovelConfig(
+                    { totalChapters: res.totalChapters, coreOutline: res.synopsis },
+                    { persisted: true })
             } else {
                 // store 已偏离 → 用户有未保存的编辑。
                 // 把新卷段落追加到**用户当前的文本**上，而不是丢弃任何一边：
@@ -310,7 +322,11 @@ export async function commitNextVolume(
                 const merged = storeNow.trim()
                     ? `${storeNow.trim()}\n\n---\n\n${section}`.trim()
                     : section.trim()
-                store.updateNovelConfig({ totalChapters: res.totalChapters, coreOutline: merged })
+                // 分开登记：`totalChapters` 已由事务持久化（persisted），
+                // 而 merged 的 coreOutline 是内存里独有的合并结果、库里没有 → 必须是脏，
+                // 否则用户不点保存它就永远回不去库里
+                store.updateNovelConfig({ totalChapters: res.totalChapters }, { persisted: true })
+                store.updateNovelConfig({ coreOutline: merged })
                 console.warn('[volume-workflow] 情节大纲在生成期间被编辑过，已将新卷段落合并到你的版本')
                 globalEventBus.emit('SYSTEM_NOTICE', {
                     level: 'warn',

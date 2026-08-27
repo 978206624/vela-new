@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react'
 import { FileUp, FolderOpen, BookOpen, Zap, Clock, AlertTriangle } from 'lucide-react'
 import { useProjectStore } from '../../stores/project-store'
+import { getProjectToken } from '../../stores/volume-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 import { ipc } from '../../services/ipc-client'
 import { createImportWorkflow, estimateImportCost } from '../../services/workflows/import-workflow'
@@ -97,8 +98,11 @@ export default function ImportNovelDialog({ open, onClose }: ImportNovelDialogPr
         return
       }
 
-      // 2. 启动导入工作流
-      const workflow = createImportWorkflow({ chapters })
+      // 2. 启动导入工作流。
+      // token 取「创建/打开项目之后」的值：上面 createProject 会切换当前项目，
+      // 在它之前捕获反而钉的是上一个项目
+      const actionToken = getProjectToken()
+      const workflow = createImportWorkflow({ chapters }, actionToken)
       await startWorkflow(workflow, true) // 步进模式，方便用户观察
 
       onClose()

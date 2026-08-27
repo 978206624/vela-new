@@ -7,8 +7,10 @@
  * 3. InferBlueprintsPerChapterCommand — 按章逐一推演精准蓝图 + 蓝图入向量库 + 拼装轻量全局摘要
  */
 
-import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
+import { BaseWorkflowCommand, CommandExecuteParams, WORKFLOW_TOKEN_KEY } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
+import { getProjectToken } from '../../../stores/volume-store'
+import type { NovelConfig } from '../../../shared/ipc-channels'
 import { getPromptTemplate } from '../../prompt-templates'
 import { ImportPromptBuilder } from '../../prompts/prompt-builder'
 import { ipc } from '../../ipc-client'
@@ -111,6 +113,12 @@ export class ImportInitializeCommand extends BaseWorkflowCommand<void> {
 
 export class InferGlobalSettingsCommand extends BaseWorkflowCommand<void> {
   async execute({ context, callbacks }: CommandExecuteParams): Promise<void> {
+    // ⚠️ 优先取工作流构造时钉住的 token（`WORKFLOW_TOKEN_KEY`），**不现取**。
+    // 工作流是排队执行的，各步之间又各隔一次分钟级 LLM——在 execute 入口现取
+    // 拿到的已经是用户切换后那个项目的**合法** token，守卫看不出异常。
+    // 回落 getProjectToken() 只是给「不经工作流、直接 new Command().execute()」
+    // 的调用兜底（当前无此类调用点）。
+    const actionToken = (context.data[WORKFLOW_TOKEN_KEY] as number | undefined) ?? getProjectToken()
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error('未打开项目')
 
@@ -176,7 +184,9 @@ export class InferGlobalSettingsCommand extends BaseWorkflowCommand<void> {
       prompt,
       template.systemRole || '你是一位顶级网文主编和资深阅读分析师。',
       callbacks,
-      { responseFormat: { type: 'json_object' } }
+      { responseFormat: { type: 'json_object' } },
+      // 传 context：不传就没有跨项目守卫
+      context,
     )
 
     callbacks.setProgress(70)
@@ -191,33 +201,37 @@ export class InferGlobalSettingsCommand extends BaseWorkflowCommand<void> {
 
     // ===== 写入小说配置 =====
     if (inferResult.novelConfig) {
-      const novelConfig = {
-        ...project.novelConfig,
-        ...inferResult.novelConfig,
+      // ⚠️ 补丁**只放本步真正产出的字段**：AI 推断出来的那些 + 由章节数据算出的两个。
+      //
+      // 早先这里是 `{...project.novelConfig, ...inferResult.novelConfig, ...}`——
+      // 而 `project` 是在**分钟级 LLM 调用之前**捕获的。展开它等于把一份陈旧快照
+      // 当成本步的意图值提交：同项目内用户在推演期间改过的字段会被旧值覆盖，
+      // 而且因为 revision 是提交时才读的、CAS 根本不会触发。
+      const derived = {
         totalChapters: chapters.length,
         wordsPerChapter: Math.round(chapters.reduce((s, c) => s + c.wordCount, 0) / chapters.length),
       }
+      const patch = { ...inferResult.novelConfig, ...derived } as Partial<NovelConfig>
+
+      // ⚠️ 改内存之前核对，理由同 architecture：updateNovelConfig 写的是
+      // **当前**项目的 store，IPC 被拒也撤不回来
+      if (getProjectToken() !== actionToken) {
+        throw new Error('项目已切换，本次导入推演结果未应用')
+      }
       // 更新内存
-      useProjectStore.getState().updateNovelConfig(novelConfig)
-      // 持久化到 config 文件
-      const updatedProject = useProjectStore.getState().currentProject
-      if (updatedProject) {
-        // 仅提取 ProjectData 字段，防止 structured clone 序列化异常
-        const plainData = {
-          id: updatedProject.id,
-          name: updatedProject.name,
-          path: updatedProject.path,
-          novelConfig: { ...updatedProject.novelConfig },
-          characterStates: updatedProject.characterStates,
-          createdAt: updatedProject.createdAt,
-          updatedAt: updatedProject.updatedAt,
-        }
-        await ipc.invoke('project:save', plainData.id, plainData)
+      useProjectStore.getState().updateNovelConfig(patch)
+      const ok = await useProjectStore.getState().saveProject({ novelConfig: patch }, actionToken)
+      if (ok.kind !== 'success') {
+        throw new Error(ok.kind === 'conflict'
+          ? '小说配置未写入：已被其它操作更新'
+          : `小说配置的写入未能确认（${ok.kind}）`)
       }
       callbacks.log('✅ 小说配置已更新')
 
-      // 生成配置摘要供后续步骤使用
-      context.data.novelConfigSummary = `类型: ${novelConfig.genre || '未知'} | 子类型: ${novelConfig.subGenre || '未知'} | 受众: ${novelConfig.targetAudience || '未知'}\n大纲: ${novelConfig.coreOutline || '（无）'}\n世界观: ${novelConfig.worldSetting || '（无）'}\n金手指: ${novelConfig.goldenFinger || '（无）'}\n主角: ${novelConfig.protagonistProfile || '（无）'}`
+      // 摘要从**写入后的当前 store** 取，不用那份陈旧快照——
+      // 后续步骤靠它做上下文，喂陈旧值等于让整条推演链跟着错下去
+      const now = useProjectStore.getState().currentProject?.novelConfig
+      context.data.novelConfigSummary = `类型: ${now?.genre || '未知'} | 子类型: ${now?.subGenre || '未知'} | 受众: ${now?.targetAudience || '未知'}\n大纲: ${now?.coreOutline || '（无）'}\n世界观: ${now?.worldSetting || '（无）'}\n金手指: ${now?.goldenFinger || '（无）'}\n主角: ${now?.protagonistProfile || '（无）'}`
     }
 
     // ===== 写入架构信息 =====
@@ -230,7 +244,7 @@ export class InferGlobalSettingsCommand extends BaseWorkflowCommand<void> {
         charactersArch: inferResult.architectureFiles.characters,
         worldbuilding: inferResult.architectureFiles.world,
         synopsis: inferResult.architectureFiles.synopsis,
-      })
+      }, actionToken)
       if (!ok) throw new Error('四段式故事架构写入数据库失败')
       callbacks.log('✅ 四段式故事架构已持久化到数据库')
     }
@@ -322,7 +336,8 @@ export class InferBlueprintsPerChapterCommand extends BaseWorkflowCommand<void> 
           prompt,
           template.systemRole || '你是一位专业的网文结构分析师。',
           callbacks,
-          { responseFormat: { type: 'json_object' } }
+          { responseFormat: { type: 'json_object' } },
+          context,
         )
 
         const blueprint = this.parseJSON<Record<string, unknown>>(rawResult)

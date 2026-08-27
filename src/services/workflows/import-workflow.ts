@@ -10,6 +10,8 @@
 
 import type { WorkflowDefinition } from '../../stores/workflow-store'
 import type { ImportedChapter } from './commands/import-novel.command'
+import { WORKFLOW_TOKEN_KEY } from './commands/base-command'
+import { getProjectToken } from '../../stores/volume-store'
 
 export interface ImportWorkflowParams {
   /** 拆分后的章节数据 */
@@ -19,7 +21,15 @@ export interface ImportWorkflowParams {
 /**
  * 创建导入小说工作流
  */
-export function createImportWorkflow(params: ImportWorkflowParams): WorkflowDefinition {
+export function createImportWorkflow(
+  params: ImportWorkflowParams,
+  /** 调用方在**点击入口**捕获的 token；缺省则退化为构造时捕获 */
+  capturedTokenOverride?: number,
+): WorkflowDefinition {
+  // ⚠️ 构造时捕获，理由同 createArchitectureWorkflow：
+  // 导入是三步长流程（写正文+建库 → AI 推演全局 → 逐章推演蓝图），
+  // 每步都可能跑几分钟，任何一步现取都会拿到切换后那个项目的合法 token
+  const capturedToken = capturedTokenOverride ?? getProjectToken()
   return {
     type: 'novel_import',
     title: `📥 导入小说（${params.chapters.length} 章）`,
@@ -29,6 +39,8 @@ export function createImportWorkflow(params: ImportWorkflowParams): WorkflowDefi
         name: '写入正文与构建知识库',
         description: `将 ${params.chapters.length} 章正文写入 manuscript/ 并灌入向量知识库`,
         executor: async (step, context, callbacks) => {
+          // 从工作流构造时钉住的 token 出发，不现取
+          context.data[WORKFLOW_TOKEN_KEY] = capturedToken
           const { ImportInitializeCommand } = await import('./commands/import-novel.command')
           const cmd = new ImportInitializeCommand(params.chapters)
           return cmd.execute({ step, context, callbacks })
@@ -40,6 +52,8 @@ export function createImportWorkflow(params: ImportWorkflowParams): WorkflowDefi
         name: 'AI 推演全局配置与架构',
         description: '通过向量检索关键片段，AI 推演小说配置、故事架构、角色卡',
         executor: async (step, context, callbacks) => {
+          // 从工作流构造时钉住的 token 出发，不现取
+          context.data[WORKFLOW_TOKEN_KEY] = capturedToken
           const { InferGlobalSettingsCommand } = await import('./commands/import-novel.command')
           const cmd = new InferGlobalSettingsCommand()
           return cmd.execute({ step, context, callbacks })
@@ -51,6 +65,8 @@ export function createImportWorkflow(params: ImportWorkflowParams): WorkflowDefi
         name: 'AI 逐章推演蓝图',
         description: `逐章推演蓝图 + 蓝图要点入向量库 + 拼装全局摘要（共 ${params.chapters.length} 章）`,
         executor: async (step, context, callbacks) => {
+          // 从工作流构造时钉住的 token 出发，不现取
+          context.data[WORKFLOW_TOKEN_KEY] = capturedToken
           const { InferBlueprintsPerChapterCommand } = await import('./commands/import-novel.command')
           const cmd = new InferBlueprintsPerChapterCommand()
           return cmd.execute({ step, context, callbacks })
