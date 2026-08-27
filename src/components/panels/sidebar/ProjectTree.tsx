@@ -21,6 +21,7 @@ import {
   ARCH_FILES, LeafItem, renderIcon, showSidebarMenu,
   openArchFile, openBuiltinEditor,
 } from './SidebarShared'
+import VolumeGroup from './VolumeGroup'
 import DraftBoxGroup from './DraftBoxGroup'
 import ManuscriptGroup from './ManuscriptGroup'
 
@@ -180,6 +181,9 @@ export default function ProjectTree() {
 
       {/* 2. 故事架构 — 点击标题行打开编辑器，子文件仍可单独点开 */}
       <WorldBuildingGroup archStatus={archStatus} archDone={archDone} />
+
+      {/* 2.5 分卷 — 挂在架构四件之下（设计稿 27/28）。零卷项目显示单卷模式说明 */}
+      <VolumeGroup />
 
       {/* 3. 章节蓝图 — 点击打开编辑器页 */}
       <LeafItem

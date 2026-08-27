@@ -76,6 +76,7 @@ import {
 } from '../../src/services/workflows/volume-workflow'
 import { createDirectoryWorkflow } from '../../src/services/workflows/directory-workflow'
 import { useVolumeStore } from '../../src/stores/volume-store'
+import { useVolumeFlowStore, invalidateVolumeFlow } from '../../src/stores/volume-flow-store'
 
 // ===== 迷你断言框架（与 volume-commit-harness 同款口径）=====
 
@@ -166,6 +167,10 @@ function freshEnv(): void {
 
     // workflow-store 每个用例清空，避免上一例的 results 残留
     useWorkflowStore.setState({ activeRuns: [], history: [], globalLogs: [], waitingRuns: {}, results: {} })
+    // 续卷流程同样要作废：它有 single-flight 保护，上一例停在 wizard 的话，
+    // 下一例的发起会被判成「已有流程在进行」——用例间互相污染。
+    // 用 invalidateVolumeFlow 而不是裸 setState：它保证 flowId 不回退
+    invalidateVolumeFlow()
     // 默认「ready 且零卷」= 真单卷模式。需要分卷的用例自行 setState 覆盖；
     // 默认设成 ready 而非 idle，是为了让「未就绪 fail closed」成为需要显式构造的场景，
     // 而不是所有用例都在无意中测它
@@ -2476,6 +2481,734 @@ ${prompt.slice(0, 500)}`)
         // 这条断言的意义不止于「清干净了」：它同时钉住了
         // `saveProject` 返回 project-switched 时的文案边界——
         // 那份改动此刻确实已经不在内存里，所以不能对用户说「改动仍保留在编辑器里」
+    })
+
+    // ===== 续卷流程发起（Task 19.4 卷 UI）=====
+    // 这段分支判定决定「要不要弹孤儿处置对话框」「首卷边界取哪个值」，
+    // 是 UI 层唯一可测的纯逻辑；对话框本身在 React 层，本 harness 不覆盖
+
+    /**
+     * 一份最小可提交的续卷工作流产物。`capturedToken` 取当前 token——
+     * 提交时主进程要拿它核对，不对就整单拒绝
+     */
+    function makeWorkflowResult() {
+        return {
+            prevVolume: VolumeRepository.get(1)!,
+            firstVolume: undefined,
+            closingReport: { volumeNumber: 1, closingState: 'AI 原始收束', openThreads: [] },
+            draftVolume: { title: 'AI 拟的名', premise: '', synopsis: '', suggestedChapterCount: 10 },
+            capturedToken: currentToken,
+            deferredLLMLogs: [],
+        } as never
+    }
+
+    await testCase('F1 已有卷 → 直接进向导，承接末卷边界', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        VolumeRepository.upsert(vol(2, 11, 30, { title: '第二卷', status: 'writing' }))
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const res = await startNextVolumeFlow()
+        assert(res.ok && res.stage === 'wizard', `应直接进向导，实为：${JSON.stringify(res)}`)
+        const f = useVolumeFlowStore.getState()
+        assertEq(f.prevTitle, '第二卷', '承接的应是**末卷**')
+        assertEq(f.prevEndChapter, 30, '新卷从末卷末章的下一章开始')
+        assertEq(f.prevChapterCount, 20, '章数默认取末卷的章数（11–30 共 20 章）')
+        assertEq(f.orphan, null, '已有卷时不该有孤儿处置这一步')
+    })
+
+    await testCase('F2 零卷 + 无孤儿蓝图 → 进向导，首卷止于已定稿最大章号', async () => {
+        freshEnv()
+        seedArchitecture()
+        // freshEnv 播了 1–10 章蓝图且全部定稿 → maxBlueprint === maxFinalized，无孤儿
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const res = await startNextVolumeFlow()
+        assert(res.ok && res.stage === 'wizard', `无孤儿时应跳过处置直接进向导，实为：${JSON.stringify(res)}`)
+        assertEq(useVolumeFlowStore.getState().prevEndChapter, 10, '首卷止于已定稿最大章号')
+        assertEq(useVolumeFlowStore.getState().orphan, null, '不该有孤儿信息')
+    })
+
+    await testCase('F3 零卷 + 有孤儿蓝图 → 进孤儿处置，条数用实际条数而非区间长度', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 第 11–20 章加蓝图但不定稿 → 孤儿。**故意留缺口**（跳过 15、17），
+        // 实际只有 8 条；若 UI 用 end-start+1 会显示 10 条，用户按虚高的数字做决定
+        for (const c of [11, 12, 13, 14, 16, 18, 19, 20]) {
+            getProjectDb()!.prepare(
+                `INSERT INTO blueprints (chapter_number, title, key_events) VALUES (?,?,?)`
+            ).run(c, `第${c}章`, 'e')
+        }
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const res = await startNextVolumeFlow()
+        assert(res.ok && res.stage === 'orphan', `有孤儿时必须先处置，实为：${JSON.stringify(res)}`)
+        const o = useVolumeFlowStore.getState().orphan!
+        assert(!!o, '应带上孤儿信息')
+        assertEq(o.startChapter, 11, '孤儿区间起点 = 已定稿最大章号 + 1')
+        assertEq(o.endChapter, 20, '孤儿区间终点 = 蓝图最大章号')
+        assertEq(o.count, 8, '条数必须是**实际存在的蓝图条数**（区间允许有缺口），不是 end-start+1')
+        assertEq(o.maxFinalized, 10, '对话框文案要用它说明「首卷按已定稿最大章号定为第 1–10 章」')
+    })
+
+    await testCase('F4 零卷 + 无定稿章节 → 拦在发起处，不进流程', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 清掉所有定稿：maxFinalized === 0
+        getProjectDb()!.prepare(`DELETE FROM drafts`).run()
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const res = await startNextVolumeFlow()
+        assert(!res.ok && res.reason === 'no-finalized',
+            `应拦在发起处，实为：${JSON.stringify(res)}`)
+        assertEq(useVolumeFlowStore.getState().stage, 'idle', '流程必须收回 idle，不能停在中间态')
+        // 放进工作流才失败的话，要先烧两次分钟级 LLM 调用
+    })
+
+    await testCase('F5 查卷表回来后切项目 → 作废，不进向导', async () => {
+        freshEnv()
+        seedArchitecture()
+        // ⚠️ 必须**有卷**：零卷会走到第二次探查，那里还有一道复核会接住，
+        // 删掉第一道也测不出来（第一版就是这么写的，变异不转红）。
+        // 有卷时第一道是唯一那道
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            if (channel === 'db:volume-get-all') {
+                // 查卷表回来之前用户切走了
+                currentToken += 1
+                useProjectStore.setState({ currentToken } as never)
+            }
+            return r
+        }
+        try {
+            const res = await startNextVolumeFlow()
+            assert(!res.ok && res.reason === 'project-switched',
+                `切项目应作废整条流程，实为：${JSON.stringify(res)}`)
+            assertEq(useVolumeFlowStore.getState().stage, 'idle',
+                '不能停在 inspecting —— 那会让向导以为还在准备中')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('F5b 首卷探查回来后切项目 → 作废（第二道复核的专属用例）', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 零卷才会走到第二次探查。切换点落在 `db:volume-inspect-first` 的回包上，
+        // 此时第一道复核早已通过——只有第二道能接住
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            if (channel === 'db:volume-inspect-first') {
+                currentToken += 1
+                useProjectStore.setState({ currentToken } as never)
+            }
+            return r
+        }
+        try {
+            const res = await startNextVolumeFlow()
+            assert(!res.ok && res.reason === 'project-switched',
+                `探查回包晚于切项目应作废，实为：${JSON.stringify(res)}`)
+            assertEq(useVolumeFlowStore.getState().stage, 'idle', '不能停在中间态')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('F6 流程已在进行时拒绝重复发起（single-flight）', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        const first = await startNextVolumeFlow()
+        assert(first.ok, `第一次应成功：${JSON.stringify(first)}`)
+        const second = await startNextVolumeFlow()
+        // 不拦的话，第二次会把第一次的向导顶掉；而第一次若已领到工作流产物，
+        // 那份产物就没人 discard，库里留下孤儿统计
+        assert(!second.ok && second.reason === 'busy',
+            `已有流程在跑时必须拒绝，实为：${JSON.stringify(second)}`)
+        assertEq(useVolumeFlowStore.getState().stage, 'wizard', '第一条流程不该被顶掉')
+    })
+
+    await testCase('F7 旧流程的回包不得覆盖新流程（同项目内重复发起）', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+
+        // 让第一次发起卡在查卷表的回包上：在它 await 期间，
+        // 手动把 store 改成「另一条流程正在 preview」的样子
+        const realHandler = invokeHandler
+        let hijacked = false
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            if (channel === 'db:volume-get-all' && !hijacked) {
+                hijacked = true
+                // 模拟：用户取消了这一条，又发起了新的一条（flowId 递增）
+                useVolumeFlowStore.setState({
+                    stage: 'preview',
+                    flowId: useVolumeFlowStore.getState().flowId + 1,
+                    prevTitle: '新流程占位',
+                } as never)
+            }
+            return r
+        }
+        try {
+            const res = await startNextVolumeFlow()
+            assert(hijacked, '前置条件：应当发生过一次劫持')
+            assert(!res.ok, `过期流程不该报成功，实为：${JSON.stringify(res)}`)
+            // 关键：过期任务**只返回、不写 store**。若它 reset 或 setState，
+            // 用户刚发起的那条流程会被无声关掉或改写
+            const f = useVolumeFlowStore.getState()
+            assertEq(f.stage, 'preview', '新流程的阶段不该被旧流程改动')
+            assertEq(f.prevTitle, '新流程占位', '新流程的数据不该被旧流程覆盖')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('F8 项目关闭时作废流程：不得把 A 的向导留给 B', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+        const { invalidateVolumeFlow } = await import('../../src/stores/volume-flow-store')
+
+        await startNextVolumeFlow()
+        assertEq(useVolumeFlowStore.getState().stage, 'wizard', '前置条件：应停在向导')
+
+        // 真实路径是 onProjectClosed 调它。这里直接调被调方，
+        // 避开 onProjectClosed 里那些需要大量垫片的 Layer-2 重置
+        invalidateVolumeFlow()
+        assertEq(useVolumeFlowStore.getState().stage, 'idle', '关项目必须作废流程')
+        assertEq(useVolumeFlowStore.getState().projectToken, null, '归属也要清掉')
+    })
+
+    await testCase('F9 实例号发号器从不回退，旧实例号无法冒充新流程', async () => {
+        freshEnv()
+        const { invalidateVolumeFlow } = await import('../../src/stores/volume-flow-store')
+        const { isCurrentFlow } = await import('../../src/stores/volume-flow-store')
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+
+        await startNextVolumeFlow()
+        const idBefore = useVolumeFlowStore.getState().flowId
+        invalidateVolumeFlow()
+        await startNextVolumeFlow()
+        const idAfter = useVolumeFlowStore.getState().flowId
+
+        // 承重的是**发号器**：它回退的话，第二条流程会领到与第一条相同的号，
+        // 第一条那些还在飞的回包就能冒充第二条写状态。
+        // （store 里的 flowId 归零反而无害——归属校验还要比 projectToken，
+        //   而它此刻是 null。这一点我一开始搞反了，变异不转红才发现）
+        assert(idAfter > idBefore,
+            `实例号必须单调递增（前 ${idBefore} 后 ${idAfter}）`)
+        // 拿旧号去验，必须不认
+        assert(!isCurrentFlow(useVolumeFlowStore.getState().projectToken ?? undefined, idBefore, currentToken),
+            '旧实例号不该再被认作当前流程')
+    })
+
+    await testCase('F10 确认写入：正常路径落库并收干净流程', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { startNextVolumeFlow, confirmNextVolume } = await import('../../src/services/volume-flow')
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        await startNextVolumeFlow()   // 领取归属键（confirmNextVolume 要用）
+
+        const res = await confirmNextVolume({
+            result: makeWorkflowResult(),
+            chapterCount: 10,
+            edited: { title: '第二卷', premise: '主线', synopsis: '大纲', suggestedChapterCount: 10 },
+            editedReport: { volumeNumber: 1, closingState: '收束', openThreads: [] },
+        })
+        assert(res.ok, `应写入成功：${JSON.stringify(res)}`)
+        assertEq(VolumeRepository.get(2)?.title, '第二卷', '新卷应落库')
+        assertEq(useVolumeFlowStore.getState().stage, 'idle', '成功后流程收回 idle')
+    })
+
+    await testCase('F11 确认写入：用户编辑过的伏笔必须结转进新卷台账', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { startNextVolumeFlow, confirmNextVolume } = await import('../../src/services/volume-flow')
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        await startNextVolumeFlow()
+
+        // AI 原本给的是空清单，用户在预览里补录了一条。
+        // 走 AI 那份原始产物的话，这条补录永远进不了台账，
+        // 「伏笔必须回收」在后续几十章里都拿它没办法
+        await confirmNextVolume({
+            result: makeWorkflowResult(),
+            chapterCount: 10,
+            edited: { title: '第二卷', premise: 'p', synopsis: 's', suggestedChapterCount: 10 },
+            editedReport: {
+                volumeNumber: 1,
+                closingState: '用户改过的收束状态',
+                openThreads: [{ chapter: 7, thread: '用户补录的伏笔', urgency: 'high' }],
+            },
+        })
+        const v2 = VolumeRepository.get(2)!
+        assertEq(v2.openingState, '用户改过的收束状态', '新卷开卷状态取自**编辑后**的收卷报告')
+        assertEq(v2.openThreads.length, 1, '用户补录的伏笔必须结转')
+        assertEq(v2.openThreads[0].thread, '用户补录的伏笔', '内容要对得上')
+    })
+
+    await testCase('F12 确认写入：回包晚于流程作废 → 不动任何状态', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { startNextVolumeFlow, confirmNextVolume } = await import('../../src/services/volume-flow')
+        const { invalidateVolumeFlow } = await import('../../src/stores/volume-flow-store')
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        await startNextVolumeFlow()
+
+        // 提交事务返回之后、重拉卷表之前，用户关了项目又发起了新流程
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            // 切换点落在**提交事务的回包**上 —— 第一道归属判定的专属窗口
+            if (channel === 'db:volume-commit-next') {
+                invalidateVolumeFlow()
+                useVolumeFlowStore.setState({ stage: 'wizard', prevTitle: '新流程占位' } as never)
+            }
+            return r
+        }
+        try {
+            ipcLog.length = 0
+            const res = await confirmNextVolume({
+                result: makeWorkflowResult(),
+                chapterCount: 10,
+                edited: { title: '第二卷', premise: 'p', synopsis: 's', suggestedChapterCount: 10 },
+                editedReport: { volumeNumber: 1, closingState: 'c', openThreads: [] },
+            })
+            assert(!res.ok && res.reason === 'stale',
+                `回包晚于作废应判 stale，实为：${JSON.stringify(res)}`)
+            // 库里那条写入确实成功了——但对当前上下文而言这次调用等于没发生。
+            // 关键是**不能 reset**：那会把用户刚发起的新流程无声关掉
+            const f = useVolumeFlowStore.getState()
+            assertEq(f.stage, 'wizard', '新流程的阶段不该被旧提交回包改动')
+            assertEq(f.prevTitle, '新流程占位', '新流程的数据不该被覆盖')
+            // ⚠️ 这里**曾经**断言「stale 后不该再重拉卷表」，那是条**假绿**：
+            // `commitNextVolume` 返回之前就发了 REFRESH_RESOURCE，真实 App 里
+            // ProjectService 的监听会照样 loadAll——本流程的归属判定管不着它。
+            // harness 没初始化 ProjectService，所以那条断言只在测试里成立。
+            // 现在重复的那次显式 loadAll 已从 confirmNextVolume 里删掉，
+            // 卷表刷新统一由事件驱动（它自带 token 守卫，串不到别的项目）。
+            // 本用例保留的是真正承重的部分：**stale 时不动流程状态**。
+
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('F12b 确认写入：提交失败时不动流程状态，且失败原因如实透传', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { startNextVolumeFlow, confirmNextVolume } = await import('../../src/services/volume-flow')
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        await startNextVolumeFlow()
+
+        // 让提交事务失败（主进程拒绝）。流程必须**留在原地**让用户重试，
+        // 不能像成功那样 reset —— 那会把预览界面连同用户的编辑一起关掉
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:volume-commit-next') {
+                return { success: false, error: '模拟的提交失败' } as never
+            }
+            return realHandler(channel, ...args)
+        }
+        try {
+            const res = await confirmNextVolume({
+                result: makeWorkflowResult(),
+                chapterCount: 10,
+                edited: { title: '第二卷', premise: 'p', synopsis: 's', suggestedChapterCount: 10 },
+                editedReport: { volumeNumber: 1, closingState: 'c', openThreads: [] },
+            })
+            assert(!res.ok && res.reason === 'failed', `应判 failed，实为：${JSON.stringify(res)}`)
+            assert(res.ok === false && res.reason === 'failed' && res.message.includes('模拟的提交失败'),
+                `失败原因要如实透传，实为：${JSON.stringify(res)}`)
+            assert(useVolumeFlowStore.getState().stage !== 'idle',
+                '提交失败不该收掉流程 —— 用户的编辑还在预览里，得让他能重试')
+            assertEq(VolumeRepository.get(2), null, '失败时不该有新卷落库')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('F13 伏笔校验：逐条合规不等于整体合规（字节上限）', async () => {
+        const { validateOpenThreads, MAX_OPEN_THREADS, MAX_THREAD_LEN, MAX_OPEN_THREADS_BYTES } =
+            await import('../../src/shared/volume-limits')
+
+        assertEq(validateOpenThreads([]), '', '空清单合法')
+        assertEq(validateOpenThreads([{ chapter: 1, thread: 'ok', urgency: 'mid' }]), '', '正常条目合法')
+
+        // 逐条都在限内，但总量超字节上限 —— 只查条数与单条长度会放行，
+        // 主进程随后拒绝，用户看到的是一条底层报错
+        const fat = Array.from({ length: MAX_OPEN_THREADS }, () => ({
+            chapter: 1, thread: '伏'.repeat(MAX_THREAD_LEN), urgency: 'mid',
+        }))
+        assert(fat.length <= MAX_OPEN_THREADS, '前置：条数在限内')
+        assert(fat.every(t => t.thread.length <= MAX_THREAD_LEN), '前置：单条长度在限内')
+        const err = validateOpenThreads(fat)
+        assert(err.includes('总量'), `应报总量超限，实为：${err || '（通过了）'}`)
+        assert(MAX_OPEN_THREADS_BYTES > 0, 'sanity')
+
+        assert(validateOpenThreads([{ chapter: 0, thread: 'x', urgency: 'mid' }]).includes('章号'),
+            '章号非法要报出来')
+        assert(validateOpenThreads([{ chapter: 1, thread: '   ', urgency: 'mid' }]).includes('为空'),
+            '空内容要报出来')
+    })
+
+    await testCase('F14 续卷工作流：章数必须是安全整数（1e21 这类要拦住）', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        const { createNextVolumeWorkflow } = await import('../../src/services/workflows/volume-workflow')
+
+        // `Number.isInteger(1e21)` 为**真**，但 `1e21 + 1 === 1e21`——
+        // 章号运算静默丢精度，而这一切发生在两次分钟级 LLM 调用**之后**才暴露。
+        // UI 那道只是第一道，Agent 或将来的其它调用方绕不开工作流入口这道
+        for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21, Number.MAX_SAFE_INTEGER + 10]) {
+            let threw = ''
+            try {
+                createNextVolumeWorkflow({ userIntent: '', structure: 'three_act', chapterCount: bad as number })
+            } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+            assert(threw.includes('章数非法'), `chapterCount=${String(bad)} 应被拒，实为：${threw || '（没抛）'}`)
+        }
+        // 合法值不该被误伤
+        let ok = true
+        try {
+            createNextVolumeWorkflow({ userIntent: '', structure: 'three_act', chapterCount: 60 })
+        } catch { ok = false }
+        assert(ok, '合法章数不该被拒')
+    })
+
+    await testCase('F15 探查抛异常 + 归属已失 → 按 project-switched 静默，不报「准备失败」', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { startNextVolumeFlow } = await import('../../src/services/volume-flow')
+        const { invalidateVolumeFlow } = await import('../../src/stores/volume-flow-store')
+
+        // 用户切走导致在途请求失败，是很常见的一种「异常」。
+        // 报 inspect-failed 会让 VolumeGroup 在**新项目的界面**上弹
+        // 「续卷准备失败」——一句用户看不懂、也没法处理的错误
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:volume-get-all') {
+                invalidateVolumeFlow()
+                useVolumeFlowStore.setState({ stage: 'wizard', prevTitle: '新流程占位' } as never)
+                throw new Error('模拟：项目关闭导致在途请求失败')
+            }
+            return realHandler(channel, ...args)
+        }
+        try {
+            const res = await startNextVolumeFlow()
+            assert(!res.ok && res.reason === 'project-switched',
+                `归属已失时的异常应按 project-switched 静默，实为：${JSON.stringify(res)}`)
+            // 且不得动新流程
+            assertEq(useVolumeFlowStore.getState().prevTitle, '新流程占位', '不该改动新流程的数据')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('F16 章数输入的严格解析：parseInt 会把 1e21 / 1.5 静默截成 1', async () => {
+        const { parseChapterCount } = await import('../../src/shared/volume-limits')
+
+        // 这两个是关键：`Number.parseInt('1e21', 10) === 1`、
+        // `Number.parseInt('1.5', 10) === 1`——先转换再校验，
+        // 用户敲 1e21 会按 1 章去生成，而他毫不知情
+        assert(Number.isNaN(parseChapterCount('1e21')), '1e21 必须判非法，不能截成 1')
+        assert(Number.isNaN(parseChapterCount('1.5')), '1.5 必须判非法，不能截成 1')
+        // 对照：证明上面那两条确实在防「静默截断」而不是随手写的
+        assertEq(Number.parseInt('1e21', 10), 1, '前置事实：parseInt 会把 1e21 截成 1')
+        assertEq(Number.parseInt('1.5', 10), 1, '前置事实：parseInt 会把 1.5 截成 1')
+
+        assert(Number.isNaN(parseChapterCount('')), '空串非法')
+        assert(Number.isNaN(parseChapterCount('  ')), '空白非法')
+        assert(Number.isNaN(parseChapterCount('0')), '0 非法')
+        assert(Number.isNaN(parseChapterCount('-3')), '负数非法')
+        assert(Number.isNaN(parseChapterCount('abc')), '非数字非法')
+        assert(Number.isNaN(parseChapterCount(String(Number.MAX_SAFE_INTEGER + 10))), '越界非法')
+        assertEq(parseChapterCount('60'), 60, '合法值原样返回')
+        assertEq(parseChapterCount(' 60 '), 60, '两侧空白可容忍')
+    })
+
+    await testCase('F17 派生末章越界必须在第一次 LLM 之前拦下', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { buildCommitPayload } = await import('../../src/services/workflows/volume-workflow')
+
+        // 上一卷末章接近 MAX_SAFE_INTEGER 时，**合法的 chapterCount: 1**
+        // 照样算出不安全的章号。工作流入口那道只验 chapterCount 本身，兜不住；
+        // 仓储层虽然也验（Task 19.4 收紧过），但那是落库时——
+        // 本函数的返回值会先被拿去拼 prompt 发给模型
+        const prev = vol(1, 1, Number.MAX_SAFE_INTEGER, { title: '第一卷' })
+        let threw = ''
+        try {
+            buildCommitPayload(
+                { prevVolume: prev, closingReport: { volumeNumber: 1, closingState: '', openThreads: [] } },
+                { title: 'x', premise: '', synopsis: '', suggestedChapterCount: 1 },
+                1,
+            )
+        } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+        assert(threw.includes('章号非法'), `派生末章越界应被拒，实为：${threw || '（没抛）'}`)
+
+        // 正常区间不该被误伤
+        const okPrev = vol(1, 1, 10, { title: '第一卷' })
+        const payload = buildCommitPayload(
+            { prevVolume: okPrev, closingReport: { volumeNumber: 1, closingState: '', openThreads: [] } },
+            { title: '第二卷', premise: '', synopsis: '', suggestedChapterCount: 10 },
+            10,
+        )
+        assertEq(payload.newVolume.startChapter, 11, '正常区间起点')
+        assertEq(payload.newVolume.endChapter, 20, '正常区间终点')
+    })
+
+    await testCase('F17b 老库里的超长卷：工作流第一步就拦下（不烧掉两次 LLM）', async () => {
+        freshEnv()
+        seedArchitecture()
+        // ⚠️ **绕过仓储直接写库**：仓储层现在会拒绝这种超长卷（F18b 验的就是那道），
+        // 所以正常路径已经建不出来。这里模拟的是**老库脏数据**——
+        // 加区间上限之前建的卷，或从外部导入的库。
+        // 工作流那道守卫的意义正在于此：它不能假设库里的数据都合规
+        getProjectDb()!.prepare(
+            `INSERT INTO volumes (volume_number, title, start_chapter, end_chapter, status) VALUES (?,?,?,?,?)`
+        ).run(1, '第一卷', 1, Number.MAX_SAFE_INTEGER, 'done')
+        const { createNextVolumeWorkflow } = await import('../../src/services/workflows/volume-workflow')
+        const llm = stubLLM(['{}', '{}'])
+
+        const def = createNextVolumeWorkflow({ userIntent: '', structure: 'three_act', chapterCount: 1 })
+        let threw = ''
+        try {
+            await def.steps[0].executor(
+                {} as never,
+                { data: {}, cancelled: false } as never,
+                { log: () => {}, setProgress: () => {}, appendText: () => {} } as never)
+        } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+
+        assert(threw.includes('章号越界'), `第一步就该拦下，实为：${threw || '（没抛）'}`)
+        // 关键：拦在**第一次 LLM 之前**。事后才发现的话，两次分钟级调用的成本已经烧掉了
+        assertEq(llm.calls, 0, '拦下时不该发起任何模型调用')
+
+        // ⚠️ 这道守卫拦的是**章号越界**那一类。
+        // （`readVolumeChapterNotes` 本身已改成按实际记录遍历，不再逐章循环，
+        //   所以它不会再因为区间大而挂死；但越界章号仍会让后续所有加减静默出错。）
+        // 「上一卷区间超长」是**另一类**，由紧随其后的 span 检查拦，见 F17c。
+    })
+
+    await testCase('F18 端点安全但区间巨大 —— 安全整数 ≠ 可遍历', async () => {
+        freshEnv()
+        const { MAX_VOLUME_CHAPTERS, parseChapterCount } = await import('../../src/shared/volume-limits')
+
+        // ⚠️ 这是上一轮我漏掉的那类反例：`prevEnd=10 + count=MAX_SAFE_INTEGER-10`
+        // 两端相加**仍是**安全整数，只验端点的守卫会放行，
+        // 而按区间逐章处理的代码要跑 9 千万亿次。
+        const huge = Number.MAX_SAFE_INTEGER - 10
+        assert(Number.isSafeInteger(huge), '前置事实：它本身是安全整数')
+        assert(Number.isSafeInteger(10 + huge), '前置事实：与上一卷末章相加**也是**安全整数')
+        assert(Number.isNaN(parseChapterCount(String(huge))),
+            '正是这种「端点安全」的值必须被拒 —— 只查安全整数是不够的')
+
+        assertEq(parseChapterCount(String(MAX_VOLUME_CHAPTERS)), MAX_VOLUME_CHAPTERS, '恰好等于上限应放行')
+        assert(Number.isNaN(parseChapterCount(String(MAX_VOLUME_CHAPTERS + 1))), '超过一格即拒')
+    })
+
+    await testCase('F18b 仓储层是最后一道：直接建超长卷必须被拒', async () => {
+        freshEnv()
+        const { MAX_VOLUME_CHAPTERS } = await import('../../src/shared/volume-limits')
+
+        // 渲染层的解析、工作流入口都只护住各自那条链；
+        // `db:volume-upsert` 是公开通道，Agent 或将来的调用方可以直接打进来
+        let threw = ''
+        try {
+            VolumeRepository.upsert(vol(1, 1, MAX_VOLUME_CHAPTERS + 1, { title: '超长卷' }))
+        } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+        assert(threw.includes('超过上限'), `超长区间应被拒，实为：${threw || '（没抛）'}`)
+
+        // 不安全整数同样拒。⚠️ 这里的**区间必须是小的**：
+        // 用 `1..1e21` 的话 span 检查会抢先拦下，`isSafeInteger` 这道就测不到
+        // （第一版正是这么写的，把 isInteger 换回去也不转红）。
+        // `start = end = 1e21` 时 span 恰好是 1，只有安全整数这道能拦
+        let threw2 = ''
+        try {
+            VolumeRepository.upsert(vol(1, 1e21, 1e21, { title: '越界卷' }))
+        } catch (e) { threw2 = e instanceof Error ? e.message : String(e) }
+        assert(threw2.includes('安全整数'),
+            `1e21 章号应被「安全整数」那道拦下，实为：${threw2 || '（没抛）'}`)
+        // ⚠️ 本断言证明的是「**这一对**安全整数检查里至少有一道生效」，
+        // 不是「每一道各自生效」：`end >= start` 使得起始章不安全时结束章必然也不安全，
+        // 两道互为掩护，单独去掉任一道另一道都会接住（实测两条变异都不转红，
+        // 同时去掉两道才转红）。这是有意的纵深防御，不是冗余代码——
+        // 但用例只能证明到这个粒度，不该声称更多。
+
+        // 正常卷不该被误伤
+        VolumeRepository.upsert(vol(1, 1, 100, { title: '正常卷' }))
+        assertEq(VolumeRepository.get(1)?.title, '正常卷', '合法卷应正常落库')
+    })
+
+    await testCase('F19 盘点上一卷要点：耗时只与真实数据量相关，与区间大小无关', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { readVolumeChapterNotes } = await import('../../src/services/prompts/volume-context')
+
+        // freshEnv 播了 1–10 章蓝图。用一个**巨大的区间**去读——
+        // 逐章循环的旧实现会在这里跑到天荒地老；按记录遍历则只看库里那 10 条
+        ipcLog.length = 0
+        const text = await readVolumeChapterNotes(1, Number.MAX_SAFE_INTEGER)
+
+        assert(text.includes('第1章'), '应读到实际存在的章')
+        assert(text.includes('第10章'), '应读到区间内最后一条实际记录')
+        // 关键断言：IPC 次数与**区间大小**无关。逐章实现会发 9 千万亿次
+        const calls = ipcLog.filter(l => l.channel.startsWith('db:blueprint')).length
+        assert(calls <= 2, `蓝图相关 IPC 应为常数次（一次取全量），实为 ${calls} 次`)
+    })
+
+    await testCase('F17c 上一卷区间超长（端点全安全）→ 工作流前置拒绝', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { MAX_VOLUME_CHAPTERS } = await import('../../src/shared/volume-limits')
+        const { createNextVolumeWorkflow } = await import('../../src/services/workflows/volume-workflow')
+
+        // ⚠️ 这正是 F17b 漏掉的那一类：`start=1, end=MAX_SAFE_INTEGER-10001, count=1`
+        // —— 末章是安全整数、派生末章也是安全整数，只验端点的守卫会**放行**，
+        // 然后跑完两次分钟级 LLM，最后才在「把上一卷 upsert 回去」那步被仓储层拒绝。
+        // 绕过仓储直接写库：这种卷正是老库/外部导入才有的
+        const hugeEnd = Number.MAX_SAFE_INTEGER - 10001
+        assert(Number.isSafeInteger(hugeEnd), '前置事实：末章是安全整数')
+        assert(Number.isSafeInteger(hugeEnd + 1), '前置事实：派生末章也是安全整数')
+        assert(hugeEnd - 1 + 1 > MAX_VOLUME_CHAPTERS, '前置事实：但区间远超单卷上限')
+
+        getProjectDb()!.prepare(
+            `INSERT INTO volumes (volume_number, title, start_chapter, end_chapter, status) VALUES (?,?,?,?,?)`
+        ).run(1, '老库超长卷', 1, hugeEnd, 'done')
+
+        const llm = stubLLM(['{}', '{}'])
+        const def = createNextVolumeWorkflow({ userIntent: '', structure: 'three_act', chapterCount: 1 })
+        let threw = ''
+        try {
+            await def.steps[0].executor(
+                {} as never, { data: {}, cancelled: false } as never,
+                { log: () => {}, setProgress: () => {}, appendText: () => {} } as never)
+        } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+
+        assert(threw.includes('区间异常'), `超长的上一卷应被前置拒绝，实为：${threw || '（没抛）'}`)
+        assert(threw.includes('卷详情'), '错误里要告诉用户去哪儿修')
+        assertEq(llm.calls, 0, '拦下时不该发起任何模型调用')
+    })
+
+    await testCase('F20 伏笔章号的严格解析与优先级校验', async () => {
+        const { parseChapterNumber, validateOpenThreads } = await import('../../src/shared/volume-limits')
+
+        // 与「本卷章数」同一个坑：`parseInt('1.5')===1`、`parseInt('1e21')===1`。
+        // 用户粘一个 1.5 进去，系统当成第 1 章存下来，而他毫不知情
+        assert(Number.isNaN(parseChapterNumber('1.5')), '1.5 必须判非法')
+        assert(Number.isNaN(parseChapterNumber('1e21')), '1e21 必须判非法')
+        assertEq(Number.parseInt('1.5', 10), 1, '前置事实：parseInt 会把 1.5 截成 1')
+        assertEq(parseChapterNumber('12'), 12, '合法值原样返回')
+        assert(Number.isNaN(parseChapterNumber('0')), '0 非法')
+
+        // urgency 也得验：仓储层 assertThreadForWrite 会拒绝列表外的值，
+        // 预检漏了它，「与仓储层同一套判据」就是空话
+        const bad = validateOpenThreads([{ chapter: 1, thread: 'x', urgency: 'urgent' }])
+        assert(bad.includes('优先级'), `列表外的 urgency 应被拒，实为：${bad || '（通过了）'}`)
+        for (const u of ['high', 'mid', 'low']) {
+            assertEq(validateOpenThreads([{ chapter: 1, thread: 'x', urgency: u }]), '', `${u} 应合法`)
+        }
+        // 不安全整数章号同样拒（isInteger 放行 1e21，isSafeInteger 才拦得住）
+        assert(validateOpenThreads([{ chapter: 1e21, thread: 'x', urgency: 'mid' }]).includes('章号'),
+            '1e21 章号应被拒')
+    })
+
+    await testCase('F17d 上一卷零长度/反向区间同样前置拒绝', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { createNextVolumeWorkflow } = await import('../../src/services/workflows/volume-workflow')
+
+        // `start=2, end=1` → span 为 0，**端点全是安全整数**、也没超上限。
+        // 只拦「太长」会放行它，跑完两次 LLM 才在回写上一卷时被仓储层拒绝
+        getProjectDb()!.prepare(
+            `INSERT INTO volumes (volume_number, title, start_chapter, end_chapter, status) VALUES (?,?,?,?,?)`
+        ).run(1, '反向区间卷', 2, 1, 'done')
+
+        const llm = stubLLM(['{}', '{}'])
+        const def = createNextVolumeWorkflow({ userIntent: '', structure: 'three_act', chapterCount: 1 })
+        let threw = ''
+        try {
+            await def.steps[0].executor(
+                {} as never, { data: {}, cancelled: false } as never,
+                { log: () => {}, setProgress: () => {}, appendText: () => {} } as never)
+        } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+        assert(threw.includes('区间异常'), `零长度区间应被前置拒绝，实为：${threw || '（没抛）'}`)
+        assertEq(llm.calls, 0, '拦下时不该发起任何模型调用')
+    })
+
+    await testCase('F21 主进程伏笔校验与渲染层预检同判据', async () => {
+        freshEnv()
+        const { assertThreadForWrite } = await import('../../electron/repositories/volume-threads')
+        const { validateOpenThreads, THREAD_URGENCIES } = await import('../../src/shared/volume-limits')
+
+        // 渲染层已经拒 1e21，主进程若还用 isInteger，
+        // 直接打 `db:volume-upsert` / `db:volume-update-threads` 就能把它存进去
+        const bad = { chapter: 1e21, thread: 'x', urgency: 'mid' }
+        assert(validateOpenThreads([bad]).includes('章号'), '前置：渲染层拒绝它')
+        let threw = ''
+        try { assertThreadForWrite(bad, 1, 0) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+        assert(threw.includes('章号'), `主进程也必须拒绝，实为：${threw || '（放行了）'}`)
+
+        // urgency 清单两侧共用同一份，不各写一套
+        for (const u of THREAD_URGENCIES) {
+            const t = assertThreadForWrite({ chapter: 1, thread: 'x', urgency: u }, 1, 0)
+            assertEq(t.urgency, u, `${u} 两侧都该合法`)
+        }
+
+        // trim 口径：仓储层存的是 trim 后的内容，预检也按 trim 后量长度。
+        // 不一致的话，带首尾空白的边界输入会被 UI 拒绝、而仓储层本来会接受
+        const padded = { chapter: 1, thread: `  ${'伏'.repeat(500)}  `, urgency: 'mid' }
+        assertEq(validateOpenThreads([padded]), '', '预检按 trim 后量，恰好 500 字应放行')
+        const kept = assertThreadForWrite(padded, 1, 0)
+        assertEq(kept.thread.length, 500, '仓储层存的是 trim 后的内容')
+    })
+
+    await testCase('F22 字节预检只算落库字段：UI 专用字段不得计入限额', async () => {
+        const { validateOpenThreads, MAX_OPEN_THREADS, MAX_OPEN_THREADS_BYTES, utf8Bytes } =
+            await import('../../src/shared/volume-limits')
+        const { serializeOpenThreads } = await import('../../electron/repositories/volume-threads')
+
+        // 预览对话框给每行挂了个稳定 `_id`（删除后原始输入文本不串行所必需）。
+        // 字节校验若用 `{...t}` 展开，这个纯 UI 字段会被算进 256KB 限额——
+        // 近上限时 UI 拒绝、而仓储层本来接受，用户被一个不存在的规则挡住。
+        // 419 字 × 200 条：这个尺寸卡在两者之间——**落库形态在限内、
+        // 带 `_id` 的 UI 形态超限**，正好能区分「按落库字段量」与「按 UI 对象量」。
+        //
+        // ⚠️ 刻意**不在注释里写死字节数**：那个值随 `_id` 的位数、章号位数、
+        // 甚至 JSON 键序而变，写死了迟早与构造对不上（上一版就抄错过一组，
+        // 注释里的数字对应的是另一种构造）。
+        // 两条前置断言是**动态计算**的，它们负责证明这个尺寸确实卡在两者之间；
+        // 尺寸本身若哪天不再满足，断言会直接失败，而不是悄悄退化成空转。
+        const rows = Array.from({ length: MAX_OPEN_THREADS }, (_, i) => ({
+            chapter: i + 1, thread: '伏'.repeat(419), urgency: 'mid', _id: `t${i}`,
+        }))
+
+        // 前置事实：**落库形态**确实在限内
+        const persistedBytes = utf8Bytes(serializeOpenThreads(
+            rows.map(r => ({ chapter: r.chapter, thread: r.thread, urgency: r.urgency as never })), 1))
+        assert(persistedBytes <= MAX_OPEN_THREADS_BYTES,
+            `前置事实：落库形态 ${persistedBytes} 字节应在 ${MAX_OPEN_THREADS_BYTES} 限内`)
+        // 前置事实：带 _id 的形态确实超限——证明这条用例测的是真差异，不是空转
+        const uiBytes = utf8Bytes(JSON.stringify(rows))
+        assert(uiBytes > MAX_OPEN_THREADS_BYTES,
+            `前置事实：带 _id 的形态 ${uiBytes} 字节应超限，否则本用例证明不了什么`)
+
+        assertEq(validateOpenThreads(rows), '',
+            '预检必须按落库字段量：UI 专用字段计入限额会误拒仓储层本来接受的数据')
     })
 
     // ===== 汇总 =====

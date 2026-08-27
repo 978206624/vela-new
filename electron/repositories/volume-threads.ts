@@ -27,13 +27,15 @@ export interface OpenThread {
     urgency: ThreadUrgency
 }
 
-const VALID_URGENCY: readonly string[] = ['high', 'mid', 'low']
+// 取自 shared，与渲染层预检**同一份**清单。各写一份迟早分叉，
+// 而分叉的那份会让 UI 放行主进程要拒绝的值
+const VALID_URGENCY: readonly string[] = THREAD_URGENCIES
 
 // 限额常量已移到 src/shared/volume-limits.ts 供渲染层共用后再 re-export。
 // 渲染层若直接**值导入**本文件，会把用到 Node `Buffer` 的代码打进渲染进程 bundle
 // （主窗口 nodeIntegration: false，调用即 ReferenceError，且 tsc/eslint 都不报）。
 // `electron/ → src/shared/` 是本项目的正向依赖，多个 controller 已如此引用 ipc-channels。
-import { MAX_OPEN_THREADS, MAX_THREAD_LEN, MAX_OPEN_THREADS_BYTES, utf8Bytes } from '../../src/shared/volume-limits'
+import { MAX_OPEN_THREADS, MAX_THREAD_LEN, MAX_OPEN_THREADS_BYTES, THREAD_URGENCIES, utf8Bytes } from '../../src/shared/volume-limits'
 export { MAX_OPEN_THREADS, MAX_THREAD_LEN, MAX_OPEN_THREADS_BYTES }
 
 /**
@@ -69,8 +71,13 @@ export function assertThreadForWrite(item: unknown, volumeNumber: number, index:
     if (!item || typeof item !== 'object') throw new Error(`${where}格式非法：应为对象`)
     const obj = item as Record<string, unknown>
 
-    if (typeof obj.chapter !== 'number' || !Number.isInteger(obj.chapter) || obj.chapter < 1) {
-        throw new Error(`${where}章号非法：${String(obj.chapter)}（须为 ≥1 的整数）`)
+    // ⚠️ `isSafeInteger` 而非 `isInteger`：`Number.isInteger(1e21)` 为真，
+    // 而这种章号一旦落库，所有做章号加减的地方都会静默出错。
+    // 渲染层的 `validateOpenThreads` 已按此判据预检，主进程这道是最后一关——
+    // `db:volume-upsert` / `db:volume-update-threads` 都是公开通道，
+    // 渲染层护不住它们
+    if (typeof obj.chapter !== 'number' || !Number.isSafeInteger(obj.chapter) || obj.chapter < 1) {
+        throw new Error(`${where}章号非法：${String(obj.chapter)}（须为 ≥1 的安全整数）`)
     }
     if (typeof obj.thread !== 'string' || !obj.thread.trim()) {
         throw new Error(`${where}内容为空`)

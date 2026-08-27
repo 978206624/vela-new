@@ -21,6 +21,7 @@
  * 通过校验，把整套结构数据写进另一个项目库。
  */
 import { useWorkflowStore, type WorkflowDefinition } from '../../stores/workflow-store'
+import { MAX_VOLUME_CHAPTERS } from '../../shared/volume-limits'
 import { useProjectStore } from '../../stores/project-store'
 import { getProjectToken } from '../../stores/volume-store'
 import { ipc } from '../ipc-client'
@@ -127,9 +128,17 @@ export function createNextVolumeWorkflow(params: NextVolumeParams): WorkflowDefi
     // 无 token 说明根本没打开项目。若放行，主进程会走 expectedToken===undefined 分支
     // 返回 stale:true，UI 显示「项目已切换」——与真实原因不符，用户照提示重试也没用
     if (capturedToken === undefined) throw new Error('未打开项目，无法续卷')
-    // 章数校验前置：非法值会先烧掉两次 LLM 调用，最后才在仓储层失败
-    if (!Number.isInteger(params.chapterCount) || params.chapterCount < 1) {
-        throw new Error(`本卷章数非法：${params.chapterCount}（须为 ≥1 的整数）`)
+    // 章数校验前置：非法值会先烧掉两次 LLM 调用，最后才在仓储层失败。
+    // ⚠️ `isSafeInteger` 而非 `isInteger`——`Number.isInteger(1e21)` 为真，
+    // 而 `1e21 + 1 === 1e21`，章号运算会静默丢精度。UI 那道只是第一道，
+    // Agent 或将来的其它调用方绕不开这里
+    if (!Number.isSafeInteger(params.chapterCount) || params.chapterCount < 1) {
+        throw new Error(`本卷章数非法：${params.chapterCount}（须为 ≥1 的安全整数）`)
+    }
+    // 上限同样前置。仓储层那道是最后防线，但它在两次分钟级 LLM **之后**才执行——
+    // 用户输 20000 会白等几分钟才被告知超限
+    if (params.chapterCount > MAX_VOLUME_CHAPTERS) {
+        throw new Error(`本卷章数 ${params.chapterCount} 超过上限 ${MAX_VOLUME_CHAPTERS}`)
     }
 
     return {
@@ -206,6 +215,41 @@ export function createNextVolumeWorkflow(params: NextVolumeParams): WorkflowDefi
                         callbacks.log(
                             `首卷候选：第 1–${draft.endChapter} 章` +
                             (insp.orphan ? `（孤儿蓝图 ${insp.orphan.count} 条，策略：${params.orphanPolicy ?? '未选'}）` : '')
+                        )
+                    }
+
+                    // ⚠️ 这里要拦**两类**都在两次 LLM 调用之前，且它们是不同的问题：
+                    //
+                    // ① **章号越界**：末章不是安全整数 → 后续所有章号加减都会静默出错。
+                    // ② **上一卷区间超长**：端点全都安全、派生末章也安全，但上一卷本身
+                    //    跨了几千万亿章。老库里可能存在这种卷（区间上限是本 Task 才加的，
+                    //    也可能来自外部导入）。工作流会拿它的区间去盘点要点、
+                    //    最后还会把它 upsert 回去——upsert 那一步会被仓储层拒绝，
+                    //    但那已经是两次分钟级 LLM 之后了。
+                    //
+                    // 反例（②，只验 ① 时会漏）：`start=1, end=MAX_SAFE_INTEGER-10001,
+                    // chapterCount=1` —— 末章与派生末章都是安全整数，照样放行。
+                    const derivedEnd = prevVolume.endChapter + params.chapterCount
+                    if (!Number.isSafeInteger(prevVolume.endChapter) || !Number.isSafeInteger(derivedEnd)) {
+                        throw new Error(
+                            `新卷章号越界：上一卷止于第 ${prevVolume.endChapter} 章，` +
+                            `再加 ${params.chapterCount} 章超出可精确表示的范围`
+                        )
+                    }
+                    const prevSpan = prevVolume.endChapter - prevVolume.startChapter + 1
+                    // 上下界**都要验**。只拦「太长」会漏掉零长度与反向区间
+                    // （`start=2, end=1` → span 为 0，端点全是安全整数），
+                    // 那种卷同样会跑完两次 LLM、最后在回写上一卷时才被仓储层拒绝
+                    if (
+                        !Number.isSafeInteger(prevVolume.startChapter)
+                        || prevVolume.startChapter < 1
+                        || prevSpan < 1
+                        || prevSpan > MAX_VOLUME_CHAPTERS
+                    ) {
+                        throw new Error(
+                            `「${prevVolume.title}」的章号区间异常：第 ${prevVolume.startChapter}–${prevVolume.endChapter} 章` +
+                            `（共 ${prevSpan} 章，合法范围 1–${MAX_VOLUME_CHAPTERS}）。` +
+                            `请先在卷详情里修正它的边界，再续下一卷`
                         )
                     }
 
@@ -376,6 +420,13 @@ export function buildCommitPayload(
 ): CommitNextVolumePayload {
     const startChapter = ctx.prevVolume.endChapter + 1
     const endChapter = startChapter + chapterCount - 1
+    // 防御性复核：本函数是**导出**的，除续卷预览外将来可能有别的调用方。
+    // 仓储层现在也验安全整数与区间上限（Task 19.4 收紧过），但那是**落库时**——
+    // 而本函数的返回值会先被拿去拼 prompt、发给模型。让非法章号走到那一步，
+    // 用户白等两次分钟级调用才在提交时被拒
+    if (!Number.isSafeInteger(startChapter) || !Number.isSafeInteger(endChapter) || endChapter < startChapter) {
+        throw new Error(`新卷章号非法：第 ${startChapter}–${endChapter} 章（越界或区间为空）`)
+    }
     const newVolume: VolumeData = {
         volumeNumber: ctx.prevVolume.volumeNumber + 1,
         title: edited.title,

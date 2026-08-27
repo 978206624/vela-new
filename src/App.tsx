@@ -20,6 +20,7 @@ import NewProjectDialog from './components/dialogs/NewProjectDialog'
 import ImportNovelDialog from './components/dialogs/ImportNovelDialog'
 import ChapterCreationDialog from './components/dialogs/ChapterCreationDialog'
 import ExportDialog from './components/dialogs/ExportDialog'
+import NextVolumeFlow from './components/dialogs/NextVolumeFlow'
 import UpdateDialog from './components/dialogs/UpdateDialog'
 import SettingsModal from './components/settings/SettingsModal'
 import { useUpdateStore } from './stores/update-store'
@@ -218,6 +219,11 @@ export default function App() {
         isOpen={exportOpen}
         onClose={closeExport}
       />
+      {/* 续卷向导全流程（孤儿处置 → 参数 → 生成 → 预览确认）。
+          全局挂载一次，任何入口调 `startNextVolumeFlow()` 即可发起。
+          同样绑 token 重挂：换项目时把进行中的向导状态整个丢掉，
+          避免拿 A 的上一卷信息去给 B 续卷 */}
+      <NextVolumeFlow key={`volume-flow-${projectToken ?? 'none'}`} />
       {/* 全屏设置弹窗 */}
       <SettingsModal
         open={settingsOpen}

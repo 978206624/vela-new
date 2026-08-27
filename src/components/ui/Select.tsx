@@ -17,6 +17,13 @@ interface SelectProps {
   disabled?: boolean
   /** 原生 title 提示 */
   title?: string
+  /**
+   * 触发器的 DOM id。本组件不是原生 `<select>`，外部 `<label htmlFor>`
+   * 只有配上它才真的关联得上（否则读屏器看到的是个无名控件）。
+   */
+  id?: string
+  /** 无可见 label 时给读屏器的可访问名 */
+  'aria-label'?: string
 }
 
 /**
@@ -24,7 +31,7 @@ interface SelectProps {
  * 替代原生 <select>：完全可主题化，弹层跟随熔炉/象牙等主题，不再出现系统白底菜单。
  * 与原生 select 行高/字号一致（h-7 / text-xs）。
  */
-export function Select({ value, onValueChange, options, placeholder, className, disabled, title }: SelectProps) {
+export function Select({ value, onValueChange, options, placeholder, className, disabled, title, id, 'aria-label': ariaLabel }: SelectProps) {
   // 受控 value 不在 options 中时（如 AI 返回了列表外的枚举值），补一项以原值兜底展示，
   // 避免 Radix Select 触发器显示空白。空字符串/哨兵已由调用方保证在 options 内，无需补。
   const allOptions = value && !options.some((o) => o.value === value)
@@ -33,6 +40,8 @@ export function Select({ value, onValueChange, options, placeholder, className, 
   return (
     <RadixSelect.Root value={value} onValueChange={onValueChange} disabled={disabled}>
       <RadixSelect.Trigger
+        id={id}
+        aria-label={ariaLabel}
         title={title}
         className={cn(
           'flex h-7 w-full items-center justify-between gap-1 rounded-md px-2 py-1 text-xs',

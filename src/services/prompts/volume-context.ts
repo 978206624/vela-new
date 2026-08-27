@@ -42,16 +42,30 @@ export async function readCharacterStates(): Promise<string> {
  * 拿计划去推演下一卷等于「接着一份过期的计划续」。无 notes 的章只留标题行。
  */
 export async function readVolumeChapterNotes(startChapter: number, endChapter: number): Promise<string> {
-    const lines: string[] = []
-    for (let i = startChapter; i <= endChapter; i++) {
-        try {
-            const bp = await ipc.invoke('db:blueprint-get', i)
-            if (!bp) continue
-            lines.push(bp.notes?.trim()
-                ? `【第${i}章 ${bp.title || ''}】\n${bp.notes.trim()}`
-                : `【第${i}章 ${bp.title || ''}】（无要点）`)
-        } catch { /* 单章读取失败不阻断整卷盘点 */ }
+    // ⚠️ **按实际存在的蓝图记录遍历，不按章号区间逐个探**。
+    //
+    // 早先是 `for (i = start; i <= end; i++) ipc('db:blueprint-get', i)`：
+    // 区间有多长就发多少次 IPC，与库里实际有几条无关。
+    // 而卷边界曾经可以合法地非常大——「两端都是安全整数」并不意味着
+    // 「区间可遍历」。Task 19.4 已给单卷加了 `MAX_VOLUME_CHAPTERS` 上限，
+    // 新建的卷不会再这样；但**老库与外部导入的库仍可能有**，
+    // 而本函数不该假设数据都合规。
+    // 改成一次取全量再过滤，耗时只与**真实数据量**相关，
+    // 与区间大小彻底解耦——这比给区间加上限更根本，上限只是第二道。
+    let blueprints: Array<{ chapterNumber: number; title?: string; notes?: string }>
+    try {
+        blueprints = (await ipc.invoke('db:blueprint-get-all')) as never
+    } catch {
+        return '（该卷暂无章节要点）'
     }
+
+    const lines = (blueprints ?? [])
+        .filter(bp => bp.chapterNumber >= startChapter && bp.chapterNumber <= endChapter)
+        .sort((a, b) => a.chapterNumber - b.chapterNumber)
+        .map(bp => (bp.notes?.trim()
+            ? `【第${bp.chapterNumber}章 ${bp.title || ''}】\n${bp.notes.trim()}`
+            : `【第${bp.chapterNumber}章 ${bp.title || ''}】（无要点）`))
+
     return lines.join('\n\n') || '（该卷暂无章节要点）'
 }
 

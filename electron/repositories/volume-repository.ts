@@ -26,6 +26,7 @@ import {
     serializeOpenThreads,
     type OpenThread,
 } from './volume-threads'
+import { MAX_VOLUME_CHAPTERS } from '../../src/shared/volume-limits'
 
 /** 卷状态：planned=未开始 / writing=写作中 / done=已完成 */
 export type VolumeStatus = 'planned' | 'writing' | 'done'
@@ -94,17 +95,38 @@ function assertValidStatus(status: unknown, volumeNumber: number): VolumeStatus 
     return status as VolumeStatus
 }
 
-/** 卷序号与章号区间的基础校验（不依赖 db，故放在取库之前） */
+/**
+ * 卷序号与章号区间的基础校验（不依赖 db，故放在取库之前）。
+ *
+ * 这是**最后一道**：渲染层的输入解析、续卷工作流的入口校验都只护住各自那条链，
+ * 而 `db:volume-upsert` 是公开通道，Agent 或将来的调用方可以直接打进来。
+ *
+ * ⚠️ 两处刻意的收紧（Task 19.4 会审）：
+ * ① `isSafeInteger` 而非 `isInteger`——`Number.isInteger(1e21)` 为真，
+ *    但 `1e21 + 1 === 1e21`，这种章号一旦落库，所有做章号加减的地方都会静默出错。
+ * ② **区间长度**也要卡。「两端都是安全整数」不代表「区间可遍历」：
+ *    `start=11, end=MAX_SAFE_INTEGER` 两端都合法，而任何按区间逐章处理的代码
+ *    都会跑 9 千万亿次、把应用冻死。主要防线是让那些地方改成按实际记录遍历，
+ *    但那要求每一处都记得这么写；这道上限是不依赖记性的兜底。
+ */
 function assertValidRange(data: VolumeData): void {
-    if (!Number.isInteger(data.volumeNumber) || data.volumeNumber < 1) {
-        throw new Error(`卷序号非法：${data.volumeNumber}（须为 ≥1 的整数）`)
+    if (!Number.isSafeInteger(data.volumeNumber) || data.volumeNumber < 1) {
+        throw new Error(`卷序号非法：${data.volumeNumber}（须为 ≥1 的安全整数）`)
     }
-    if (!Number.isInteger(data.startChapter) || data.startChapter < 1) {
-        throw new Error(`第 ${data.volumeNumber} 卷起始章号非法：${data.startChapter}（须为 ≥1 的整数）`)
+    if (!Number.isSafeInteger(data.startChapter) || data.startChapter < 1) {
+        throw new Error(`第 ${data.volumeNumber} 卷起始章号非法：${data.startChapter}（须为 ≥1 的安全整数）`)
     }
-    if (!Number.isInteger(data.endChapter) || data.endChapter < data.startChapter) {
+    if (!Number.isSafeInteger(data.endChapter) || data.endChapter < data.startChapter) {
         throw new Error(
-            `第 ${data.volumeNumber} 卷章号区间非法：${data.startChapter}–${data.endChapter}（结束章须 ≥ 起始章）`
+            `第 ${data.volumeNumber} 卷章号区间非法：${data.startChapter}–${data.endChapter}（结束章须 ≥ 起始章，且为安全整数）`
+        )
+    }
+    const span = data.endChapter - data.startChapter + 1
+    if (span > MAX_VOLUME_CHAPTERS) {
+        throw new Error(
+            `第 ${data.volumeNumber} 卷章数 ${span} 超过上限 ${MAX_VOLUME_CHAPTERS}` +
+            `（第 ${data.startChapter}–${data.endChapter} 章）。` +
+            `这个量级的区间会让按章遍历的逻辑卡死，通常是误输入`
         )
     }
 }
