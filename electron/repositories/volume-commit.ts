@@ -410,8 +410,21 @@ export function commitNextVolume(payload: CommitNextVolumePayload): CommitNextVo
                 openThreads: payload.closingReport.openThreads,
             })
 
-            // ⑦ 新卷
-            VolumeRepository.upsert(payload.newVolume)
+            // ⑦ 新卷。
+            //
+            // `openingState` 与 `openThreads` **在事务内从 closingReport 派生**，
+            // 不采纳载荷里的值。这两个字段是「上一卷收束结果结转到新卷」这条不变量的
+            // 两个面，让它们各自独立地跨 IPC 传过来，就等于允许出现
+            // 「上一卷登记了伏笔、新卷台账却是空的」这种载荷——提交会成功，
+            // 而下一卷的罗盘从此丢掉那些伏笔，链条在无声中断掉。
+            //
+            // 渲染层的 buildCommitPayload 也做了同样的赋值，但那只是个 helper，
+            // 约束不了 IPC 边界；持久化不变量必须在写入这一层强制。
+            VolumeRepository.upsert({
+                ...payload.newVolume,
+                openingState: payload.closingReport.closingState,
+                openThreads: payload.closingReport.openThreads,
+            })
 
             // ⑧ project_core：库内读改写，避免用渲染层的陈旧快照整串覆盖。
             //    这是本模块唯一直接写的表——渲染层的 updateProjectCore 无法参与本事务，

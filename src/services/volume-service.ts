@@ -20,7 +20,7 @@
  */
 import { ipc } from './ipc-client'
 import type { NovelConfig } from '../shared/ipc-channels'
-import type { VolumeData, VolumeStatus } from '../../electron/repositories/volume-repository'
+import type { VolumeData, VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
 import type { ProjectCoreData } from '../../electron/repositories/project-core-repository'
 
 /** 卷状态的中文展示文案。
@@ -128,8 +128,129 @@ export function getVolumeOutline(
     }
 }
 
-// ===== 展示用 helper：收数组即可，失败模式是安全默认值 =====
+/**
+ * 「本卷罗盘」的取数——目录生成（19.3a）与正文写作（19.3b）共用同一份口径。
+ *
+ * 与 `getVolumeOutline` 同属生成关键路径，故同样只吃 `VolumeSnapshot`：
+ * 未就绪时 fail closed，绝不把「加载中」当成单卷模式。
+ *
+ * `value === null` 表示**真单卷模式**（零卷），调用方应整段跳过卷相关注入。
+ */
+export interface VolumeCompassData {
+    volumeNumber: number
+    title: string
+    startChapter: number
+    endChapter: number
+    /** 本卷主线目标 + 核心冲突 */
+    premise: string
+    /** 开卷状态 = 上一卷收卷状态（续卷事务落库时写入本卷） */
+    openingState: string
+    /**
+     * 需要在本卷回收的伏笔——**只读本卷台账**。
+     *
+     * 建卷时由续卷事务把上一卷的未回收清单结转进来（见 `buildCommitPayload`），
+     * 此后本卷台账就是唯一权威：用户在卷详情里改它、下一次收卷提炼也读它。
+     *
+     * ⚠️ 不要改成「上一卷 + 本卷」合并。那样会同时制造两个错误：
+     * 已在本卷回收、台账已清空的条目会被上一卷"复活"；而三卷之后，
+     * 由于结转从未真正发生，链条会在 V2 处断掉。
+     */
+    openThreads: OpenThread[]
+}
 
+export function getVolumeCompass(
+    snap: VolumeSnapshot,
+    chapterNumber: number,
+): VolumeQuery<VolumeCompassData | null> {
+    const nr = notReady<VolumeCompassData | null>(snap)
+    if (nr) return nr
+    const vols = (snap as { volumes: VolumeData[] }).volumes
+    if (vols.length === 0) return { ready: true, value: null }
+
+    // 越界回落最后一卷，与 getVolumeOutline 保持同一口径：
+    // 正文写作时，首卷末章之后、尚未续卷的那几章仍应看到最后一卷的罗盘，而不是什么都没有。
+    //
+    // ⚠️ 但**目录生成不能接受这个回落**——它会让 prompt 同时出现
+    // 「共 60 章」与「推演第 61–63 章」，正是本 Task 要消除的矛盾指令。
+    // 故调用方须自行校验 chapterNumber 是否真的落在返回卷的闭区间内
+    // （`directory.command.ts` 就是这么做的，不命中即 fail closed）。
+    const vol = getCurrentVolume(vols, chapterNumber) ?? getLastVolume(vols)
+    if (!vol) return { ready: true, value: null }
+
+    return {
+        ready: true,
+        value: {
+            volumeNumber: vol.volumeNumber,
+            title: vol.title,
+            startChapter: vol.startChapter,
+            endChapter: vol.endChapter,
+            premise: vol.premise ?? '',
+            openingState: vol.openingState ?? '',
+            openThreads: vol.openThreads,
+        },
+    }
+}
+
+/**
+ * 校验一个章号闭区间是否被现有卷**连续覆盖**。
+ *
+ * `value === null` 表示单卷模式——此时不存在卷边界，任何区间都合法。
+ *
+ * 为什么必须**前置**校验整个区间、而不是逐批到了才发现：
+ * 目录生成是「跑一批、写一批」的。卷二止于 60 时请求 58–63，
+ * 逐批检查会让 58–60 那一批先跑完 LLM 并把蓝图写进库，
+ * 游标推到 61 才报错——工作流失败了，模型调用和落库的副作用却已经发生。
+ */
+export type RangeCoverage =
+    | { covered: true }
+    | { covered: false; message: string }
+
+export function checkRangeCoverage(
+    snap: VolumeSnapshot,
+    startChapter: number,
+    endChapter: number,
+): VolumeQuery<RangeCoverage | null> {
+    const nr = notReady<RangeCoverage | null>(snap)
+    if (nr) return nr
+    const vols = (snap as { volumes: VolumeData[] }).volumes
+    if (vols.length === 0) return { ready: true, value: null }
+
+    const sorted = [...vols].sort((a, b) => a.startChapter - b.startChapter)
+    const first = sorted[0]
+    const last = sorted[sorted.length - 1]
+
+    if (startChapter < first.startChapter) {
+        return {
+            ready: true,
+            value: { covered: false, message: `第 ${startChapter} 章在首卷起点（第 ${first.startChapter} 章）之前，不属于任何卷` },
+        }
+    }
+    if (endChapter > last.endChapter) {
+        return {
+            ready: true,
+            value: {
+                covered: false,
+                message:
+                    `生成范围到第 ${endChapter} 章，已超出最后一卷「${last.title}」的末章（第 ${last.endChapter} 章）。` +
+                    `请先「续写下一卷」建立卷区间，或把范围收回到第 ${last.endChapter} 章以内`,
+            },
+        }
+    }
+    // 卷间缺口：相邻两卷不首尾相接时，落在缺口里的章号同样无卷归属
+    for (let i = 1; i < sorted.length; i++) {
+        const gapStart = sorted[i - 1].endChapter + 1
+        const gapEnd = sorted[i].startChapter - 1
+        if (gapStart <= gapEnd && startChapter <= gapEnd && endChapter >= gapStart) {
+            return {
+                ready: true,
+                value: { covered: false, message: `第 ${gapStart}–${gapEnd} 章不属于任何卷（卷区间存在缺口），请先修正分卷边界` },
+            }
+        }
+    }
+    return { ready: true, value: { covered: true } }
+}
+
+// ===== 展示用 helper：收数组即可，失败模式是安全默认值 =====
 /** 取某章所属的卷；未分卷或章号落在所有卷区间之外返回 null */
 export function getCurrentVolume(vols: VolumeData[], chapterNumber: number): VolumeData | null {
     return vols.find(v => v.startChapter <= chapterNumber && v.endChapter >= chapterNumber) ?? null

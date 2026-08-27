@@ -853,6 +853,26 @@ function main(): void {
             'previousSynopsis 必须原样返回，不得 trim')
     })
 
+    testCase('F5 结转不变量由**事务**强制：载荷台账为空也要从收卷报告派生', () => {
+        freshDb()
+        seedFinalized(1, 10)
+        VolumeRepository.upsert(vol(1, 1, 10))
+        // payloadFor 造出的正是「收卷报告含伏笔、新卷台账为空」这种不一致载荷
+        //（vol() 默认 openThreads: []）。渲染层的 buildCommitPayload 会补上，
+        // 但那只是个 helper，约束不了 IPC 边界——持久化不变量必须在写入层强制
+        const p = payloadFor(vol(1, 1, 10), 5)
+        assertEq(p.newVolume.openThreads, [], '前置：载荷里的新卷台账确实是空的')
+        assert(p.closingReport.openThreads.length > 0, '前置：收卷报告确实带着伏笔')
+
+        assert(commitNextVolume(p).success, '应成功')
+        assertEq(VolumeRepository.get(2)!.openThreads, p.closingReport.openThreads,
+            '新卷台账必须由事务从 closingReport 派生——否则下一卷罗盘会丢掉这些伏笔，链条无声断掉')
+        assertEq(VolumeRepository.get(2)!.openingState, p.closingReport.closingState,
+            '开卷状态同理，两者是同一条不变量的两个面')
+        assertEq(VolumeRepository.get(1)!.openThreads, p.closingReport.openThreads,
+            '上一卷保留自己那份历史快照')
+    })
+
     console.log('\n▶ G 组：open_threads 读宽容 / 写严格')
 
     testCase('G1 写侧对非法值一律抛错，不静默改写', () => {

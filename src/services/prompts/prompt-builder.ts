@@ -335,6 +335,18 @@ export class DirectoryPromptBuilder extends BasePromptBuilder {
     this.variables.pacing_guidance = guidance;
     return this;
   }
+
+  /** 本卷罗盘：本卷主线目标 + 上一卷收卷状态（零卷时传空串，模板段落会被裁掉） */
+  withVolumeContext(context: string) {
+    this.variables.volume_context = context;
+    return this;
+  }
+
+  /** 待回收的未回收伏笔清单，让「伏笔强制回收」那条约束有据可依 */
+  withOpenThreads(threads: string) {
+    this.variables.open_threads = threads;
+    return this;
+  }
 }
 
 /**

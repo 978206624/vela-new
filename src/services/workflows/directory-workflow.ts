@@ -138,15 +138,29 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
           const core = await ipc.invoke('db:project-core-get')
           if (!core) throw new Error('项目核心数据未初始化')
 
-          const parts: string[] = []
-          if (core.premise && core.premise.length > 50) parts.push(core.premise)
-          if (core.charactersArch && core.charactersArch.length > 50) parts.push(core.charactersArch)
-          if (core.worldbuilding && core.worldbuilding.length > 50) parts.push(core.worldbuilding)
-          if (core.synopsis && core.synopsis.length > 50) parts.push(core.synopsis)
+          // 「短于 50 字视为未生成」是既有闸门，逐项沿用
+          const gated = (s: string | undefined) => (s && s.length > 50) ? s : ''
+          const premise = gated(core.premise)
+          const charactersArch = gated(core.charactersArch)
+          const worldbuilding = gated(core.worldbuilding)
+          const synopsis = gated(core.synopsis)
 
-          if (parts.length === 0) throw new Error('项目主要架构均未生成')
+          if (!premise && !charactersArch && !worldbuilding && !synopsis) {
+            throw new Error('项目主要架构均未生成')
+          }
 
-          context.data.architecture = parts.join('\n\n---\n\n')
+          // 三大件（故事前提 / 角色图谱 / 世界观）是**全书唯一**的，任何卷都照原样喂。
+          // 情节大纲则不同：分卷模式下必须换成「当前卷」的主线与卷内大纲，
+          // 全书 synopsis 描述的是一个已闭环的完整故事，喂进去会诱导 AI 收尾
+          // （Spec §4.11 的原始缺陷）。但「当前卷」取决于本批次生成到第几章，
+          // 只有 Command 里的 cursor 知道，故这里只把两半分开存，由 Command 逐批合成。
+          //
+          // ⚠️ 必须逐项判空后再拼，不能对过滤后的数组做 slice(0,3)——
+          // 三大件里任意一项没过闸门时，slice 会把 synopsis 一起带进「三大件」。
+          context.data.architectureBase = [premise, charactersArch, worldbuilding]
+            .filter(Boolean).join('\n\n---\n\n')
+          // 零卷回落时 Command 直接用它，保证单卷模式拼出的 architecture 与分卷前逐字节一致
+          context.data.coreSynopsis = synopsis
           // 注入节奏指导到 context，供 Command 读取
           if (params.pacingGuidance) context.data.pacingGuidance = params.pacingGuidance
           if (params.mode === 'append') {
@@ -154,7 +168,7 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
             context.data.existingBlueprints = existing
             callbacks.log(`已加载 ${existing.length} 章已有蓝图`)
           }
-          return `架构加载完成（${parts.length} 段）`
+          return `架构加载完成（${[premise, charactersArch, worldbuilding, synopsis].filter(Boolean).length} 段）`
         },
       },
       {

@@ -369,7 +369,16 @@ export function buildCommitPayload(
         synopsis: edited.synopsis,
         openingState: ctx.closingReport.closingState,
         closingState: '',
-        openThreads: [],
+        // 把上一卷的未回收伏笔**结转进新卷**，新卷台账自此成为唯一权威。
+        //
+        // 早先这里是 `[]`，靠读取时临时合并上一卷来兜——那是错的，且错两次：
+        // ① **断链**：续 V3 时收卷提炼只读 V2 的台账，V2 若是空的，
+        //    V1 留下、V2 未处理的伏笔就永久丢失（模板明令「要点没提到的一律视为不存在」）；
+        // ② **复活**：V2 已确认回收并写成空清单后，重新生成 V2 目录时
+        //    合并又会把 V1 的旧条目捞回来，AI 被要求回收一条已经回收过的伏笔。
+        // 结转之后，「尚未继承」与「已全部回收」才在数据上可区分。
+        // 上一卷保留自己那份历史快照不动，供回溯。
+        openThreads: ctx.closingReport.openThreads,
         status: 'planned',
     }
     return {

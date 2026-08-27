@@ -1,10 +1,16 @@
 import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
+import { useVolumeStore } from '../../../stores/volume-store'
 import { getPromptTemplate } from '../../prompt-templates'
 import { DirectoryPromptBuilder } from '../../prompts/prompt-builder'
 import { DirectoryWorkflowParams, ChapterBlueprint, parseTextBlueprints, saveAllBlueprints } from '../directory-workflow'
 import { globalEventBus } from '../../../shared/event-bus'
 import { coerceChapterRole } from '../../../shared/chapter-roles'
+import {
+  getEffectiveTotalChapters, getVolumeCompass, getVolumeOutline, checkRangeCoverage, describeNotReady,
+  type VolumeCompassData,
+} from '../../volume-service'
+import { formatOpenThreads } from '../../prompts/volume-context'
 
 /**
  * 从流式 JSON（裸数组 [...] 或 {"blueprints":[...]}）中抽取「已闭合的顶层对象」字符串。
@@ -59,6 +65,16 @@ function normalizeBlueprint(p: Record<string, unknown>): ChapterBlueprint {
   }
 }
 
+/** 把卷罗盘拼成 prompt 用的「本卷定位」文本。零卷（compass 为 null）返回空串 */
+function formatVolumeContext(compass: VolumeCompassData | null): string {
+  if (!compass) return ''
+  return [
+    `当前为「${compass.title}」（第 ${compass.startChapter}–${compass.endChapter} 章）`,
+    compass.premise.trim() && `【本卷主线】\n${compass.premise.trim()}`,
+    compass.openingState.trim() && `【上一卷收卷状态】\n${compass.openingState.trim()}`,
+  ].filter(Boolean).join('\n\n')
+}
+
 export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBlueprint[]> {
   constructor(private params: DirectoryWorkflowParams) {
     super()
@@ -68,12 +84,23 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error('未打开项目')
 
-    const architecture = context.data.architecture as string
+    const architectureBase = (context.data.architectureBase as string) || ''
+    const coreSynopsis = (context.data.coreSynopsis as string) || ''
     const existingBlueprints = (context.data.existingBlueprints || []) as ChapterBlueprint[]
 
-    const totalChapters = project.novelConfig.totalChapters
     const globalGuidance = project.novelConfig.globalGuidance || ''
     const genre = project.novelConfig.genre || ''
+
+    // ⚠️ 分卷快照只取一次并贯穿全程：目录生成跨多批次、可达数分钟，
+    // 每批现取会让「生成中途用户续了一卷」导致前后两批按不同的卷边界推演。
+    const snap = useVolumeStore.getState().getSnapshot()
+
+    // 全书有效总章数以**卷表**为准（续卷会把 novelConfig.totalChapters 同步过去，
+    // 但用户手改小说配置可能让二者偏离）。未就绪必须终止——
+    // 把「加载中」当零卷会退回用全书 totalChapters + 已闭环 synopsis 的老路
+    const totalQ = getEffectiveTotalChapters(snap, project.novelConfig)
+    if (!totalQ.ready) throw new Error(`无法确定全书总章数：${describeNotReady(totalQ.reason)}`)
+    const totalChapters = totalQ.value
 
     let startChapter = 1
     let endChapter = totalChapters
@@ -85,6 +112,25 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       }
     } else if (this.params.count && this.params.count > 0) {
       endChapter = Math.min(this.params.count, totalChapters)
+    }
+
+    // 空区间必须显式报错，不能让 while 直接不进入。
+    // 典型触发：末卷止于 60 时从第 61 章续写且不传 count —— endChapter 仍是 60，
+    // 循环一次都不跑，工作流却以「已生成 0 章」**静默成功**，用户以为生成过了
+    if (startChapter > endChapter) {
+      throw new Error(
+        `生成范围为空：起始第 ${startChapter} 章已超过结束第 ${endChapter} 章。` +
+        `若要续写新章节，请先「续写下一卷」扩展卷区间，或显式指定生成章数`
+      )
+    }
+
+    // 整个请求区间必须被现有卷连续覆盖——**在任何 LLM 调用与落库之前**校验。
+    // 逐批到了才发现是不够的：请求 58–63 时，58–60 那批会先跑完模型并把蓝图写进库，
+    // 游标推到 61 才报错，工作流虽然失败，副作用却已经产生
+    const coverageQ = checkRangeCoverage(snap, startChapter, endChapter)
+    if (!coverageQ.ready) throw new Error(`无法校验生成范围：${describeNotReady(coverageQ.reason)}`)
+    if (coverageQ.value && !coverageQ.value.covered) {
+      throw new Error(coverageQ.value.message)
     }
 
     callbacks.log(`生成第 ${startChapter}–${endChapter} 章蓝图...`)
@@ -108,11 +154,53 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
     while (cursor <= endChapter) {
       if (context.cancelled) { callbacks.log('已取消'); break }
 
-      const batchEnd = Math.min(cursor + batchSize - 1, endChapter)
+      // 逐批按 cursor 重算所属卷：一次生成可能横跨两卷，卷边界一变，
+      // 「全书规模」「本卷定位」「情节大纲」三样都得跟着换
+      const compassQ = getVolumeCompass(snap, cursor)
+      if (!compassQ.ready) throw new Error(`无法确定第 ${cursor} 章所属卷：${describeNotReady(compassQ.reason)}`)
+      const compass = compassQ.value
+
+      // ⚠️ getVolumeCompass 对「不属于任何卷」的章号会回落最后一卷——
+      // 那对正文写作是合理默认，对目录生成却会重新制造矛盾指令：
+      // 最后一卷止于 60 时生成 61–63，prompt 会同时出现「共 60 章」与「推演 61–63 章」，
+      // 还会写入无卷归属的蓝图。故此处必须校验 cursor 真的落在该卷闭区间内。
+      if (compass && (cursor < compass.startChapter || cursor > compass.endChapter)) {
+        throw new Error(
+          `第 ${cursor} 章不属于任何卷（当前最后一卷「${compass.title}」止于第 ${compass.endChapter} 章）。` +
+          `请先「续写下一卷」建立卷区间，或把生成范围收回到已有卷内`
+        )
+      }
+
+      // 单批**不得横跨卷界**：卷一 1–10 时从第 8 章生成 6 章，
+      // 若不夹住就会得到 8–12 这一批——用卷一的大纲、声明「共 10 章」，
+      // 却要求生成属于卷二的第 11–12 章，与本 Task 要消除的矛盾指令同源
+      const volumeScopeEnd = compass ? Math.min(endChapter, compass.endChapter) : endChapter
+      const batchEnd = Math.min(cursor + batchSize - 1, volumeScopeEnd)
       callbacks.log(`  正在生成第 ${cursor}–${batchEnd} 章...`)
 
+      const outlineQ = getVolumeOutline(snap, cursor, { synopsis: coreSynopsis })
+      if (!outlineQ.ready) throw new Error(`无法确定情节大纲：${describeNotReady(outlineQ.reason)}`)
+      // 零卷时 outlineQ.value 就是（已过 50 字闸门的）全书 synopsis，
+      // 拼出来与分卷前逐字节一致；有卷时它是本卷主线 + 卷内大纲，不含全书 synopsis
+      const architecture = [architectureBase, outlineQ.value].filter(s => s.trim()).join('\n\n---\n\n')
+
+      // 「全书规模」在分卷模式下报**本卷末章**：报全书总章数会与
+      // 「请推演第 N–M 章」形成矛盾指令——AI 一边被告知全书 500 章、
+      // 一边只写到第 60 章，收尾节奏必然错乱（Spec §4.11 要消除的正是这个）
+      const scopeTotal = compass ? compass.endChapter : totalChapters
+      const volumeContext = formatVolumeContext(compass)
+      // 零卷必须传空串而非 formatOpenThreads 的「（无未回收伏笔）」占位文案——
+      // 模板标题用的是「（如有）」形态，finalizePrompt 只在值为空时才裁掉整段，
+      // 传占位文案会给单卷模式留一个无意义的空台账小节
+      const openThreads = compass && compass.openThreads.length > 0
+        ? formatOpenThreads(compass.openThreads)
+        : ''
+
       let prompt: string
-      if (cursor === 1 && this.params.mode === 'full') {
+      // legacy 全量模板一次性要求生成 1..endChapter，且没有 volume_context / open_threads
+      // 两个占位符。分卷项目走这条会拿着第一卷的 architecture 生成整本书，
+      // 后续批次再也切不回第二卷——故它只对**真零卷**开放
+      if (compass === null && cursor === 1 && this.params.mode === 'full') {
         const template = getPromptTemplate('chapter_blueprint')
         if (!template) throw new Error('模板丢失')
         prompt = new DirectoryPromptBuilder(template)
@@ -127,17 +215,24 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
         if (!template) throw new Error('模板丢失')
 
         const prevAll = [...existingBlueprints, ...newBlueprints]
-        const chapterList = prevAll.slice(-100).map(c => `第${c.chapterNumber}章 ${c.title}：${c.keyEvents}`).join('\n')
+        // 优先取 notes（定稿后处理由 AI 从**正文**提炼的实际要点），
+        // 回落 keyEvents（当初的计划）。接着事实续，不接着计划续——
+        // 计划与写成的正文往往已经分叉，喂计划会让新章节接到一条不存在的剧情线上
+        const chapterList = prevAll.slice(-100)
+          .map(c => `第${c.chapterNumber}章 ${c.title}：${c.notes?.trim() || c.keyEvents}`)
+          .join('\n')
 
         prompt = new DirectoryPromptBuilder(template)
           .withNovelArchitecture(architecture)
           .withChapterList(chapterList || '（首批生成）')
-          .withNumberOfChapters(totalChapters)
+          .withNumberOfChapters(scopeTotal)
           .withN(cursor)
           .withM(batchEnd)
           .withGlobalGuidance(globalGuidance)
           .withGenre(genre)
           .withPacingGuidance((context.data.pacingGuidance as string) || '')
+          .withVolumeContext(volumeContext)
+          .withOpenThreads(openThreads)
           .build()
       }
 
@@ -157,7 +252,10 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
           let p: Record<string, unknown>
           try { p = JSON.parse(objStr) } catch { continue }
           const n = Number(p.chapterNumber ?? p.chapter_number)
-          if (!Number.isInteger(n) || n < cursor || n > endChapter || savedChapters.has(n)) continue
+          // 接受上界是 volumeScopeEnd 而非 endChapter：模型常一次超额返回，
+          // 若放行跨卷章节，它们会带着**上一卷的上下文**直接落库，
+          // 而 cursor 随后跳过这些章号，下一卷的大纲与伏笔台账永远参与不进来
+          if (!Number.isInteger(n) || n < cursor || n > volumeScopeEnd || savedChapters.has(n)) continue
           savedChapters.add(n)
           fresh.push(normalizeBlueprint(p))
         }
@@ -185,7 +283,9 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
 
       // ★ 关键修复：接受 AI 返回的从 cursor 到 endChapter 范围内的所有有效章节
       // AI 可能一次性返回超出本批次（batchEnd）的章节，全部保留，避免浪费和重复 LLM 请求
-      const parsed = parseTextBlueprints(resultText, cursor, endChapter)
+      // 同上：权威解析的接受上界同样夹到卷末章，否则超额返回的跨卷章节
+      // 会绕过流式预存那道过滤、从这里落库
+      const parsed = parseTextBlueprints(resultText, cursor, volumeScopeEnd)
       newBlueprints.push(...parsed)
 
       // ==== 权威整批入库（确保最后落地）====

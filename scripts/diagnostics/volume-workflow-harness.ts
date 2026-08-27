@@ -54,7 +54,7 @@ let invokeHandler: (channel: string, ...args: unknown[]) => Promise<unknown> = a
 // ===== 2. 主进程侧（真实仓储，非 mock）=====
 
 import { initProjectDatabase, closeProjectDatabase, getProjectDb } from '../../electron/database'
-import { VolumeRepository } from '../../electron/repositories/volume-repository'
+import { VolumeRepository, type VolumeData } from '../../electron/repositories/volume-repository'
 import { commitNextVolume, inspectFirstVolume } from '../../electron/repositories/volume-commit'
 import { BlueprintRepository } from '../../electron/repositories/blueprint-repository'
 
@@ -71,6 +71,8 @@ import {
     buildCommitPayload,
     type NextVolumeWorkflowResult,
 } from '../../src/services/workflows/volume-workflow'
+import { createDirectoryWorkflow } from '../../src/services/workflows/directory-workflow'
+import { useVolumeStore } from '../../src/stores/volume-store'
 
 // ===== 迷你断言框架（与 volume-commit-harness 同款口径）=====
 
@@ -161,6 +163,39 @@ function freshEnv(): void {
 
     // workflow-store 每个用例清空，避免上一例的 results 残留
     useWorkflowStore.setState({ activeRuns: [], history: [], globalLogs: [], waitingRuns: {}, results: {} })
+    // 默认「ready 且零卷」= 真单卷模式。需要分卷的用例自行 setState 覆盖；
+    // 默认设成 ready 而非 idle，是为了让「未就绪 fail closed」成为需要显式构造的场景，
+    // 而不是所有用例都在无意中测它
+    useVolumeStore.setState({ volumes: [], status: 'ready' })
+}
+
+/** 架构三大件 + 全书大纲，都得**超过** 50 字才过 directory-workflow 的既有闸门（`> 50`，不是 `>=`） */
+const ARCH = {
+    premise: '故事前提：主角沈砚出身北境边镇，因一枚来历不明的玉佩意外卷入王朝更替的暗流，被迫在旧秩序与新兴势力之间反复选边，每一次抉择都在缩小他的退路。',
+    charactersArch: '角色图谱：主角沈砚是少年武者，师父柳无咎为前朝暗卫，宿敌赵北望执掌北境都督府，三方围绕玉佩与气脉枢纽构成核心张力网络，彼此既互相牵制又不得不短暂结盟。',
+    worldbuilding: '世界观：王朝末年中央权威崩解，北境十三镇半独立自治，武道体系以气脉为根基，而玉佩正是前朝用来控制气脉枢纽的信物之一，得之可号令一方却也招致围杀。',
+    synopsis: '全书情节大纲：主角从边镇少年一路成长为北境之主，先后经历夺镇、结盟、背叛与反攻，最终揭开玉佩背后的真相、终结王朝更替带来的长期动荡，故事在此彻底闭环收束。',
+}
+
+/** 把架构四大件写进 project_core（默认 freshEnv 只写了短文本，过不了 50 字闸门） */
+function seedArchitecture(): void {
+    getProjectDb()!.prepare(
+        `UPDATE project_core SET premise=?, characters_arch=?, worldbuilding=?, synopsis=? WHERE id='main'`
+    ).run(ARCH.premise, ARCH.charactersArch, ARCH.worldbuilding, ARCH.synopsis)
+}
+
+/** 构造一条 VolumeData（与 volume-commit-harness 的 vol() 同款） */
+function vol(n: number, start: number, end: number, extra: Partial<VolumeData> = {}): VolumeData {
+    return {
+        volumeNumber: n, title: `第${n}卷`, startChapter: start, endChapter: end,
+        premise: '', synopsis: `卷${n}大纲`, openingState: '', closingState: '',
+        openThreads: [], status: 'done', ...extra,
+    }
+}
+
+/** 把若干卷置入 volume-store（生成关键路径读的是 store 快照，不是库） */
+function setVolumes(vols: VolumeData[]): void {
+    useVolumeStore.setState({ volumes: vols, status: 'ready' })
 }
 
 /**
@@ -230,7 +265,14 @@ invokeHandler = async (channel, ...args) => {
             return BlueprintRepository.getByChapter(args[0] as number)
         case 'db:blueprint-get-all':
             return BlueprintRepository.getAll()
+        case 'db:blueprint-upsert-many':
+            BlueprintRepository.upsertMany(args[0] as never)
+            return { success: true }
         case 'db:character-get-all':
+            return []
+        // 保存蓝图那步会调 refreshFileTree() 刷侧边栏资产树。harness 不关心文件树，
+        // 返回空目录即可——但**必须显式路由**，未知通道会直接抛错炸掉整个 harness
+        case 'fs:list-dir':
             return []
         case 'db:project-core-get': {
             const row = getProjectDb()!.prepare(`SELECT * FROM project_core WHERE id='main'`).get() as Record<string, string>
@@ -320,6 +362,12 @@ async function main(): Promise<void> {
         assertEq(VolumeRepository.getAll().length, 2, '应有首卷 + 新卷两卷')
         assertEq(VolumeRepository.get(1)!.closingState, '主角拿下北境', '收卷状态应写进首卷')
         assertEq(VolumeRepository.get(2)!.title, '第二卷 · 南征', '新卷名')
+        // 结转不变量：新卷台账必须**深等于**收卷报告的未回收清单，开卷状态同理。
+        // 不断言这个的话，把 buildCommitPayload 的结转赋值退回 `[]` 仍会全绿（round-02 #5）
+        assertEq(VolumeRepository.get(2)!.openThreads, r.closingReport.openThreads,
+            '新卷台账必须由上一卷的未回收清单结转而来')
+        assertEq(VolumeRepository.get(2)!.openingState, r.closingReport.closingState,
+            '新卷开卷状态必须等于上一卷收卷状态')
         assertEq(countLLMCalls(), 2, '确认后两条延迟统计应一次性补写')
 
         const core = getProjectDb()!.prepare(`SELECT total_chapters, synopsis FROM project_core WHERE id='main'`)
@@ -493,6 +541,358 @@ async function main(): Promise<void> {
         assertEq(useWorkflowStore.getState().results[runId], undefined, 'discard 后产物必须消失')
         assertEq(takeNextVolumeResult(runId), null, 'discard 之后再 take 应拿不到')
         assertEq(countLLMCalls(), 0, '取消 = 零副作用')
+    })
+
+    console.log('\n▶ 目录生成接卷（Task 19.3a）')
+
+    /**
+     * 跑一次目录生成，返回**全部批次**的 prompt。
+     * 只看首个 prompt 会漏掉「第二批切到下一卷」这类跨卷缺陷（round-01 #8）。
+     */
+    async function runDirectoryAll(opts: {
+        mode?: 'append' | 'full'
+        startChapter?: number
+        count?: number
+        /** 每批模型返回什么。默认空数组；要模拟超额返回就在这里塞跨卷章节 */
+        responses?: string[]
+    } = {}): Promise<string[]> {
+        const { mode = 'append', startChapter = 11, count = 3 } = opts
+        const llm = stubLLM(opts.responses ?? ['{"blueprints":[]}', '{"blueprints":[]}', '{"blueprints":[]}'])
+        await useWorkflowStore.getState().startWorkflow(
+            mode === 'full'
+                ? createDirectoryWorkflow({ mode: 'full', count })
+                : createDirectoryWorkflow({ mode: 'append', startChapter, count })
+        )
+        assert(llm.prompts.length > 0,
+            `目录工作流没发出任何 prompt：${useWorkflowStore.getState().globalLogs.map(l => l.message).join(' | ').slice(-400)}`)
+        return llm.prompts
+    }
+
+    /** 只要首批 prompt 的便捷包装 */
+    async function runDirectory(count = 3, startChapter = 11): Promise<string> {
+        return (await runDirectoryAll({ count, startChapter }))[0]
+    }
+
+    await testCase('V1 零卷（单卷模式）：architecture 与分卷前逐字节一致', async () => {
+        freshEnv()
+        seedArchitecture()
+        const prompt = await runDirectory()
+        // 分卷前的组装就是「四大件按 \n\n---\n\n 依次拼接」。本 Task 把 synopsis
+        // 拆出去单独走 getVolumeOutline，零卷回落必须还原成完全相同的串
+        const expected = [ARCH.premise, ARCH.charactersArch, ARCH.worldbuilding, ARCH.synopsis].join('\n\n---\n\n')
+        assert(prompt.includes(expected),
+            `零卷 architecture 应与分卷前逐字节一致。\n实际 prompt 片段：\n${prompt.slice(0, 900)}`)
+    })
+
+    await testCase('V2 零卷：两个卷段落被 finalizePrompt 裁净，不留孤儿标题', async () => {
+        freshEnv()
+        seedArchitecture()
+        const prompt = await runDirectory()
+        // 断言的是**小节标题**（带「（如有）」的那个形态）被整段裁掉。
+        // 不能只搜「【待回收伏笔台账」——指令正文里有一句「优先处理【待回收伏笔台账】中列出的条目」，
+        // 那是对小节的引用而非孤儿标题，单卷模式下它由后半句「台账为空时，则…」兜住
+        assert(!prompt.includes('【本卷定位（如有）】'),
+            `单卷模式不该残留本卷定位标题：\n${prompt.slice(0, 700)}`)
+        assert(!prompt.includes('【待回收伏笔台账（如有）】'), '单卷模式不该残留伏笔台账标题')
+        assert(!prompt.includes('（无未回收伏笔）'),
+            '零卷必须传空串而非 formatOpenThreads 的占位文案，否则标题裁不掉')
+        // 正向确认裁剪确实发生过：架构池之后应直接接前置进度，中间没有空标题
+        assert(/【全书架构数据池】\n[\s\S]*?\n\n【前置剧情进度与连贯性检查】/.test(prompt),
+            `裁剪后两段应直接相邻：\n${prompt.slice(prompt.indexOf('【全书架构数据池】'), prompt.indexOf('【全书架构数据池】') + 400)}`)
+    })
+
+    await testCase('V3 有卷：architecture 换成本卷主线/大纲，且**不含**全书 synopsis', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷', premise: '边镇少年初露锋芒', synopsis: '第一卷卷内大纲：从边镇到北境' }),
+            vol(2, 11, 60, {
+                title: '第二卷 · 北境风雪', premise: '本卷主线：夺回北境十三镇',
+                synopsis: '第二卷卷内大纲：三段式推进', openingState: '主角已掌握玉佩', status: 'planned',
+            }),
+        ])
+        const prompt = await runDirectory()
+        assert(!prompt.includes(ARCH.synopsis),
+            '有卷时绝不能注入已闭环的全书 synopsis——那正是本 Phase 要根治的缺陷')
+        assert(prompt.includes('本卷主线：夺回北境十三镇'), '应含本卷主线')
+        assert(prompt.includes('第二卷卷内大纲：三段式推进'), '应含本卷卷内大纲')
+        assert(prompt.includes(ARCH.premise) && prompt.includes(ARCH.worldbuilding),
+            '三大件是全书唯一的，任何卷都照原样喂')
+        // 不断言 openingState 的话，把 withVolumeContext() 整个删掉本用例仍会绿
+        assert(prompt.includes('主角已掌握玉佩'), '上一卷收卷状态必须注入（本卷 openingState）')
+        assert(prompt.includes('【上一卷收卷状态】'), '应带小标题，AI 才知道这段是什么')
+    })
+
+    await testCase('V4 有卷：全书规模报**本卷末章**，而非全书有效总章数', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷' }),
+            vol(2, 11, 60, { title: '第二卷', status: 'planned' }),
+        ])
+        // ⚠️ 必须在**第一卷内**生成，让「本卷末章(10)」与「全书有效总章数(60)」分离。
+        // 早先这条测的是第二卷（末章 60 == 有效总章数），两者不可区分——
+        // 把 scopeTotal 改回 totalChapters 的变异下用例照样绿，等于没测
+        const prompt = await runDirectory(3, 5)
+        assert(prompt.includes('共 10 章'),
+            `全书规模应报本卷末章 10。实际：
+${prompt.slice(0, 600)}`)
+        assert(!prompt.includes('共 60 章'),
+            '报全书总章数会与「请推演第 5–7 章」形成矛盾指令：AI 一边被告知全书 60 章、一边只写到第 10 章')
+    })
+
+    await testCase('V5 前置进度优先取 notes（实际写成的），回落 keyEvents（当初计划的）', async () => {
+        freshEnv()
+        seedArchitecture()
+        const db = getProjectDb()!
+        // 第 3 章有 notes（定稿后处理提炼的实际要点），第 4 章只有 keyEvents
+        db.prepare(`UPDATE blueprints SET notes='第3章实际写成：主角改走水路', key_events='第3章原计划：主角走陆路' WHERE chapter_number=3`).run()
+        db.prepare(`UPDATE blueprints SET notes='', key_events='第4章原计划：抵达渡口' WHERE chapter_number=4`).run()
+        const prompt = await runDirectory()
+        assert(prompt.includes('第3章实际写成：主角改走水路'), '有 notes 时必须用 notes')
+        assert(!prompt.includes('第3章原计划：主角走陆路'),
+            '计划与写成的正文已分叉，喂计划会让新章节接到一条不存在的剧情线上')
+        assert(prompt.includes('第4章原计划：抵达渡口'), '无 notes 时回落 keyEvents')
+    })
+
+    await testCase('V6 伏笔台账注入本卷条目，且不重复', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷', openThreads: [{ chapter: 3, thread: '玉佩来历未明', urgency: 'high' }] }),
+            vol(2, 11, 60, {
+                title: '第二卷', status: 'planned',
+                // 建卷时已由 buildCommitPayload 从上一卷结转过来，本卷台账即权威
+                openThreads: [
+                    { chapter: 3, thread: '玉佩来历未明', urgency: 'high' },
+                    { chapter: 9, thread: '用户手工补录的线索', urgency: 'mid' },
+                ],
+            }),
+        ])
+        const prompt = await runDirectory()
+        assert(prompt.includes('玉佩来历未明'), '结转进本卷的伏笔必须注入')
+        assert(prompt.includes('用户手工补录的线索'), '用户手工补录的条目同样要注入')
+        assert(prompt.includes('[第3章 · 高]'), `应带埋设章号与优先级。实际：
+${prompt.slice(0, 500)}`)
+        const occurrences = prompt.split('玉佩来历未明').length - 1
+        assertEq(occurrences, 1, '同一条目不得在 prompt 里出现两遍')
+    })
+
+    await testCase('V7 分卷数据未就绪 → 终止生成，不按零卷继续', async () => {
+        freshEnv()
+        seedArchitecture()
+        useVolumeStore.setState({ volumes: [], status: 'loading' })
+        const llm = stubLLM(['{"blueprints":[]}'])
+        const before = snapshot()
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 3 })
+        )
+        assertEq(llm.calls, 0,
+            '未就绪时必须 fail closed——当零卷继续会退回「全书总章数 + 已闭环 synopsis」的老路')
+        assertUnchanged(before, '终止后')
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
+        assert(logs.includes('正在加载'), `错误应说清原因，实为：\n${logs.slice(-400)}`)
+    })
+
+    await testCase('V8 单批不得横跨卷界：第二批必须切到下一卷的上下文', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷', premise: '卷一主线：夺回边镇' }),
+            vol(2, 11, 60, { title: '第二卷', premise: '卷二主线：南征', status: 'planned' }),
+        ])
+        // 从第 8 章生成 6 章 → 跨越卷界（8–10 属卷一，11–13 属卷二）。
+        // 不夹住的话首批就是 8–13：用卷一大纲、声明「共 10 章」，却要求生成第 11–13 章
+        const prompts = await runDirectoryAll({ startChapter: 8, count: 6 })
+        assertEq(prompts.length, 2, '跨卷应恰好拆成两批——只断言「至少两批」发现不了多余的重复批次')
+        assert(prompts[0].includes('共 10 章') && prompts[0].includes('第8章 到 第10章'),
+            `首批应止于卷一末章。实际：\n${prompts[0].slice(0, 600)}`)
+        assert(prompts[0].includes('卷一主线：夺回边镇'), '首批应用卷一上下文')
+        assert(prompts[1].includes('共 60 章') && prompts[1].includes('第11章 到 第13章'),
+            `第二批应切到卷二。实际：\n${prompts[1].slice(0, 600)}`)
+        assert(prompts[1].includes('卷二主线：南征'), '第二批应用卷二上下文')
+    })
+
+    await testCase('V9 模型超额返回跨卷章节 → 一条都不落库', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷' }),
+            vol(2, 11, 60, { title: '第二卷', premise: '卷二主线：南征', status: 'planned' }),
+        ])
+        // 首批只该覆盖 8–10，但模型一口气返回到第 13 章（真实模型常这么干）。
+        // ⚠️ 污染标题必须**唯一可辨**：早先写成「第11章」，与合法生成的标题撞车，
+        // 断言 `!ch11 || title === '第11章'` 反而放行了污染——把流式过滤退回
+        // endChapter 的变异下用例照样绿，是个假阳性（round-02 #4）
+        const overflow = JSON.stringify({
+            blueprints: [8, 9, 10, 11, 12, 13].map(n => ({
+                chapterNumber: n, title: `OVERFLOW-${n}`, role: '发展', purpose: 'p',
+                characters: [], keyEvents: `事件${n}`, suspenseHook: 'h',
+            })),
+        })
+        // 第二批返回空：这样第 11–13 章若出现在库里，只可能来自首批的跨卷污染
+        const prompts = await runDirectoryAll({
+            startChapter: 8, count: 6,
+            responses: [overflow, '{"blueprints":[]}', '{"blueprints":[]}'],
+        })
+        const db = getProjectDb()!
+        const polluted = db.prepare(
+            `SELECT chapter_number FROM blueprints WHERE title LIKE 'OVERFLOW-%' AND chapter_number > 10`
+        ).all() as Array<{ chapter_number: number }>
+        assertEq(polluted, [],
+            '跨卷章节不得被首批（卷一上下文）落库——它们会带着上一卷的大纲与伏笔台账定型')
+        // 卷一范围内的超额返回是允许的（本来就属于本批的卷）
+        assertEq(
+            (db.prepare(`SELECT COUNT(*) c FROM blueprints WHERE title LIKE 'OVERFLOW-%'`).get() as { c: number }).c,
+            3, '第 8–10 章属于卷一，应正常落库')
+        assertEq(prompts.length, 2, '超额返回不得让 cursor 跳过卷二')
+        assert(prompts[1].includes('卷二主线：南征'), '第二批必须仍带卷二上下文')
+    })
+
+    await testCase('V10 分卷项目跑 full → 不走 legacy 全量模板，仍按卷分批', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷', premise: '卷一主线：夺回边镇' }),
+            vol(2, 11, 60, { title: '第二卷', premise: '卷二主线：南征', status: 'planned' }),
+        ])
+        const prompts = await runDirectoryAll({ mode: 'full', count: 13 })
+        // legacy chapter_blueprint 模板没有卷占位符，且一次要求生成 1..endChapter，
+        // 分卷项目走它会拿第一卷 architecture 生成整本书，后续再也切不回第二卷
+        assert(prompts[0].includes('卷一主线：夺回边镇'),
+            `分卷模式的 full 也必须带卷上下文。实际：\n${prompts[0].slice(0, 600)}`)
+        assert(prompts[0].includes('共 10 章'), '首批仍应按卷一末章报规模')
+        assertEq(prompts.length, 2, '应恰好按卷拆成两批')
+        assert(prompts[1].includes('卷二主线：南征'), '应继续按卷分批切到卷二')
+    })
+
+    await testCase('V11 逐批卷界 guard 现在是纵深防御：正常入口已被前置校验拦在更早', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 10, { title: '第一卷' }), vol(2, 11, 60, { title: '第二卷' })])
+        const llm = stubLLM(['{"blueprints":[]}'])
+        const before = snapshot()
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 61, count: 3 })
+        )
+        // round-02 加了整区间前置校验后，越界在第一次 LLM 之前就被拒，
+        // 报的是「已超出最后一卷」而不是逐批 guard 的「不属于任何卷」。
+        // 逐批 guard 因此成为纯纵深防御——快照只取一次，区间已校验，
+        // 正常入口下 cursor 不可能落到卷外。此处固化该结论：
+        // 若将来有人放宽前置校验导致逐批 guard 重新可达，下面的断言会先红
+        assertEq(llm.calls, 0, '越界必须在任何模型调用前拒绝')
+        assertUnchanged(before, '库不变')
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
+        assert(logs.includes('已超出最后一卷'),
+            `应由前置校验拦下（而非逐批 guard），实为：\n${logs.slice(-400)}`)
+        assert(!logs.includes('不属于任何卷（当前最后一卷'),
+            '不应走到逐批 guard——那意味着已经进过生成循环')
+    })
+
+    await testCase('V12 伏笔台账以**本卷**为权威：已回收不复活', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, {
+                title: '第一卷',
+                openThreads: [
+                    { chapter: 3, thread: '玉佩来历未明', urgency: 'high' },
+                    { chapter: 7, thread: '卷二已回收的旧线索', urgency: 'mid' },
+                ],
+            }),
+            vol(2, 11, 60, {
+                title: '第二卷', status: 'planned',
+                // 结转后用户在卷详情里回收了「旧线索」，本卷台账才是权威
+                openThreads: [{ chapter: 3, thread: '玉佩来历未明', urgency: 'high' }],
+            }),
+        ])
+        const prompt = await runDirectory()
+        assert(prompt.includes('玉佩来历未明'), '本卷台账里的条目必须注入')
+        assert(!prompt.includes('卷二已回收的旧线索'),
+            '本卷已清掉的条目不得被上一卷「复活」——合并方案的核心缺陷')
+    })
+
+    await testCase('V12b 真实结转链：V1→V2 走完整工作流，新卷台账由收卷报告结转而来', async () => {
+        freshEnv()
+        // ⚠️ 不手工塞 store，而是**真的跑一遍续卷工作流并提交**，
+        // 断言库里落下的新卷台账。V12 那种手工构造的夹具证明不了结转真的发生过
+        // ——把 buildCommitPayload 的结转赋值退回 `[]`，V12 照样绿（round-02 #5）
+        stubLLM([CLOSING_JSON, SYNOPSIS_JSON])
+        const runId = await useWorkflowStore.getState().startWorkflow(
+            createNextVolumeWorkflow({ userIntent: '', structure: 'three_act', chapterCount: 5 })
+        )
+        const r = takeNextVolumeResult(runId) as NextVolumeWorkflowResult
+        assert(r !== null, '产物应能取到')
+        assert(r.closingReport.openThreads.length > 0, '前置：收卷报告应含未回收伏笔')
+
+        const payload = buildCommitPayload(
+            { prevVolume: r.prevVolume, firstVolume: r.firstVolume, closingReport: r.closingReport },
+            r.draftVolume, 5,
+        )
+        assert((await commitFromRenderer(payload, r.capturedToken, r.deferredLLMLogs)).success, '提交应成功')
+
+        const v1 = VolumeRepository.get(1)!
+        const v2 = VolumeRepository.get(2)!
+        assertEq(v2.openThreads, r.closingReport.openThreads, '新卷台账 = 上一卷收卷报告的未回收清单')
+        assertEq(v1.openThreads, r.closingReport.openThreads, '上一卷保留自己那份历史快照')
+
+        // 结转之后，第 11 章（属新卷）的罗盘必须能看到这些伏笔——
+        // 这正是「只读本卷台账」在多卷链条上不断链的证据
+        useVolumeStore.setState({ volumes: VolumeRepository.getAll(), status: 'ready' })
+        seedArchitecture()
+        const prompt = await runDirectory(3, 11)
+        assert(prompt.includes('玉佩来历未明'),
+            `结转进新卷的伏笔必须出现在新卷的目录 prompt 里。实际：\n${prompt.slice(0, 600)}`)
+    })
+
+    await testCase('V13 生成范围超出末卷 → 在任何 LLM 调用与落库**之前**拒绝', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 10, { title: '第一卷' }), vol(2, 11, 60, { title: '第二卷' })])
+        const llm = stubLLM(['{"blueprints":[]}', '{"blueprints":[]}'])
+        const before = snapshot()
+        // 58–63 跨出末卷。逐批检查是不够的：58–60 那批会先跑完模型、把蓝图写进库，
+        // 游标推到 61 才报错——工作流失败了，副作用却已经产生（round-02 #1）
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 58, count: 6 })
+        )
+        assertEq(llm.calls, 0, '必须在第一次 LLM 调用之前就拒绝')
+        assertUnchanged(before, '拒绝后库一字不改（尤其不能留下 58–60 的蓝图）')
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
+        assert(logs.includes('已超出最后一卷'), `错误应点明超出末卷，实为：\n${logs.slice(-400)}`)
+    })
+
+    await testCase('V14 末卷之后续写且不传章数 → 显式报错，不得静默生成 0 章', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 10, { title: '第一卷' }), vol(2, 11, 60, { title: '第二卷' })])
+        const llm = stubLLM(['{"blueprints":[]}'])
+        const before = snapshot()
+        // 不传 count 时 endChapter 仍是有效总章数 60，startChapter=61 → 区间为空。
+        // while 一次都不进，工作流会以「已生成 0 章」**静默成功**，用户以为生成过了
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 61 })
+        )
+        assertEq(llm.calls, 0, '空区间不该调用模型')
+        assertUnchanged(before, '库不变')
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
+        assert(logs.includes('生成范围为空'), `必须显式报错而非静默成功，实为：\n${logs.slice(-400)}`)
+    })
+
+    await testCase('V15 卷间缺口落在请求范围内 → 前置拒绝', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 人为制造缺口：卷一 1–10、卷二 15–60，第 11–14 章无卷归属
+        setVolumes([vol(1, 1, 10, { title: '第一卷' }), vol(2, 15, 60, { title: '第二卷' })])
+        const llm = stubLLM(['{"blueprints":[]}'])
+        const before = snapshot()
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 8, count: 10 })
+        )
+        assertEq(llm.calls, 0, '范围内存在无卷归属的章号时不该开始生成')
+        assertUnchanged(before, '库不变')
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
+        assert(logs.includes('第 11–14 章不属于任何卷'), `应点名缺口区间，实为：\n${logs.slice(-400)}`)
     })
 
     // ===== 汇总 =====
