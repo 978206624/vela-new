@@ -19,6 +19,17 @@ export interface FinalizeChapterParams {
   draftContent: string
   chapterNumber: number
   chapterInfo: ChapterInfo
+  /**
+   * 调用方在**点击入口、任何 await 之前**捕获的项目 token。
+   * 必传：本 Command 到写卷状态时已隔了「UI 的 guard/confirm/读正文」+「工作流排队」
+   * +「动态 import」多层延迟，在 execute() 里现取会拿到用户切换后的新项目 token，
+   * 于是 A 项目的章号会被拿去改 B 项目的卷状态。
+   *
+   * 类型是 `number | undefined` 而非可选属性：无项目时确实取不到值，
+   * 但**必须显式传**——可选属性会让新调用点漏传时静默退化，
+   * 而 undefined 在主进程守卫处是 fail-closed（直接拒写），不会误放行。
+   */
+  capturedToken: number | undefined
 }
 
 // ===== 工具函数：流式调用大模型并返回完整文本 =====
@@ -86,6 +97,13 @@ export function buildFinalizePostProcessSteps(
   chapterNumber: number,
   chapterTitle: string,
   draftContent: string,
+  /**
+   * 定稿流程发起时捕获的项目 token。
+   * 后处理流水线含多次 LLM 调用、可达分钟级，且支持失败重试，
+   * 期间用户完全可能切到别的项目——写卷状态时现取 token 会写进另一个库。
+   * `db:volume-update-status` 对缺省 token 直接判 stale，故必须显式传。
+   */
+  capturedToken: number | undefined,
 ): PostProcessStep[] {
   const steps: PostProcessStep[] = []
 
@@ -235,6 +253,50 @@ export function buildFinalizePostProcessSteps(
     })
   }
 
+  // ─── 步骤 5: 卷状态流转（零卷时整步跳过）─────────────────────────
+  // 放在流水线末尾：它依赖的只是「本章已定稿」这个事实，与前面几步无先后耦合；
+  // 而前面几步都含 LLM 调用、更容易失败，让它们先跑完再动卷状态，
+  // 可避免「卷已标记 done、后处理却整体失败重试」这种状态错位。
+  steps.push({
+    key: 'volume_status',
+    label: '📚 卷状态流转',
+    // 非关键：卷状态是可推导的展示态，用户还能在卷详情里手改（Spec §4.11）。
+    // 它失败不该让整章定稿判定为失败。
+    critical: false,
+    executor: async (callbacks) => {
+      // **一次原子 IPC** 完成「按章号定位卷 → 判定目标状态 → 条件更新」。
+      //
+      // 不在这里做「先 getByChapter 再 updateStatus」两步：后处理流水线含多次
+      // LLM 调用，两步之间隔着可观的时间窗口。用户在这期间把末卷从「止于第 10 章」
+      // 延长到第 20 章，旧判断仍会写成 done——一个刚被延长的卷立刻显示「已完成」。
+      // 判定所依据的边界必须与写入处于同一份事务内快照。
+      //
+      // 判定规则见 VolumeRepository.advanceStatusByChapter：先判末章（单章卷两个
+      // 条件同时成立时应落 done），且只认首章触发 writing——Spec §4.11 允许用户
+      // 手动置回 planned 表示「本卷暂时搁置」，任意中间章都触发会推翻用户的显式意图。
+      //
+      // 零卷 / 本章无卷归属 / 已是目标状态 → changed 为 null，整步无副作用。
+      const res = await ipc.invoke('db:volume-advance-status', chapterNumber, capturedToken)
+      if (!res.success) {
+        // **必须抛**，不能只记日志后正常返回：runPostProcessPipeline 靠 executor
+        // 是否抛错判定步骤成败，正常返回会被标记为成功，于是既不重试、
+        // 修复模式也不会重跑——守卫拦住了写入，状态却永远停在旧值且无人知晓。
+        // critical:false 决定它不阻断整章定稿，这与「如实记为失败」不矛盾。
+        throw new Error(
+          res.stale
+            ? '项目已切换，本章的卷状态流转未写入'
+            : `卷状态更新失败：${res.error ?? '未知错误'}`
+        )
+      }
+      if (!res.changed) return
+
+      const label = res.changed.status === 'done' ? '已完成' : '写作中'
+      callbacks.log(`✅ 「${res.changed.title}」状态流转为「${label}」`)
+      const { globalEventBus } = await import('../../../shared/event-bus')
+      globalEventBus.emit('REFRESH_RESOURCE', { resources: ['volumes'] })
+    },
+  })
+
   return steps
 }
 
@@ -248,6 +310,11 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
   async execute({ callbacks }: CommandExecuteParams): Promise<void> {
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error('未打开项目')
+
+    // ⚠️ token 由调用方在**点击入口**捕获并传入，这里**不能**现取：
+    // 到这一行时已经隔了 UI 的 guard/confirm/读正文、工作流排队、动态 import 多层延迟，
+    // 现取拿到的是用户切换后那个项目的合法 token，守卫会原样放行
+    const capturedToken = this.params.capturedToken
 
     const refinedDraftText = this.params.draftContent
     if (!refinedDraftText) throw new Error('没有定稿内容')
@@ -291,6 +358,7 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
       this.params.chapterNumber,
       this.params.chapterInfo.title,
       refinedDraftText,
+      capturedToken,
     )
 
     await runPostProcessPipeline(project.path, scope, sourceLabel, steps, callbacks)

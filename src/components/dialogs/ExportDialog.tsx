@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { Download, FileText, Files, Type } from 'lucide-react'
 import { useProjectStore } from '../../stores/project-store'
-import { exportNovel, type ExportFormat } from '../../services/export-service'
+import { useVolumeStore, getProjectToken } from '../../stores/volume-store'
+import { exportNovel, type ExportFormat, type ExportScope } from '../../services/export-service'
 import { ipc } from '../../services/ipc-client'
 import {
   Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription,
@@ -17,19 +18,42 @@ interface Props {
 /** 导出对话框 — 使用 shadcn/ui */
 export default function ExportDialog({ isOpen, onClose }: Props) {
   const currentProject = useProjectStore(s => s.currentProject)
+  // 只在**已分卷**时才出现范围选择。单卷模式（含全部存量项目）看不到任何卷相关 UI，
+  // 与 Spec §4.11「老项目零感知」一致
+  const volumes = useVolumeStore(s => s.volumes)
   const [format, setFormat] = useState<ExportFormat>('merged-md')
+  const [scope, setScope] = useState<ExportScope>('book')
+  const [volumeNumber, setVolumeNumber] = useState<number | undefined>(undefined)
   const [includeOutline, setIncludeOutline] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [result, setResult] = useState<{ success: boolean; path?: string; error?: string } | null>(null)
 
+  // 派生「当前项目下真正有效」的范围，而不是直接用 state。
+  //
+  // 挂载处已用 `key={项目token}` 保证换项目即重挂、state 回初值；这里是第二道：
+  // 卷可能在**同一个项目内**被删除（卷列表删卷后卷号集合就变了），
+  // 那种情况不会重挂，仍可能残留一个已不存在的卷号
+  const effectiveScope: ExportScope = volumes.length > 0 ? scope : 'book'
+  const effectiveVolumeNumber = effectiveScope === 'volume'
+    ? (volumes.some(v => v.volumeNumber === volumeNumber) ? volumeNumber : volumes[0]?.volumeNumber)
+    : undefined
+
   const handleExport = async () => {
     if (!currentProject) return
+    // ⚠️ 在选目录对话框（一个可能开着很久的 await）之前捕获。
+    // key 重挂只能重置 UI state，取消不了已经在跑的这个 Promise
+    const actionToken = getProjectToken()
     const dir = await ipc.invoke('dialog:select-folder')
     if (!dir) return
 
     setExporting(true)
     setResult(null)
-    const res = await exportNovel({ format, outputDir: dir, includeOutline })
+    const res = await exportNovel({
+      format, outputDir: dir, includeOutline,
+      scope: effectiveScope,
+      volumeNumber: effectiveVolumeNumber,
+      expectedToken: actionToken,
+    })
     setResult(res)
     setExporting(false)
   }
@@ -79,11 +103,61 @@ export default function ExportDialog({ isOpen, onClose }: Props) {
             ))}
           </div>
 
-          {/* 选项 */}
-          <label className="flex items-center gap-2 text-xs cursor-pointer text-[var(--color-text-secondary)]">
-            <input type="checkbox" checked={includeOutline} onChange={(e) => setIncludeOutline(e.target.checked)} />
-            包含故事大纲
-          </label>
+          {/* 导出范围（仅已分卷时出现） */}
+          {volumes.length > 0 && (
+            <div className="space-y-2 pt-1">
+              <div className="text-xs font-medium text-[var(--color-text-secondary)]">导出范围</div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setScope('book')}
+                  className={cn(
+                    'flex-1 px-3 py-2 rounded-lg text-xs border transition-colors',
+                    effectiveScope === 'book'
+                      ? 'bg-[var(--color-active)] border-[var(--color-accent)] text-[var(--color-text)]'
+                      : 'bg-[var(--color-panel)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-hover)]'
+                  )}
+                >
+                  全书
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScope('volume')}
+                  className={cn(
+                    'flex-1 px-3 py-2 rounded-lg text-xs border transition-colors',
+                    effectiveScope === 'volume'
+                      ? 'bg-[var(--color-active)] border-[var(--color-accent)] text-[var(--color-text)]'
+                      : 'bg-[var(--color-panel)] border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-hover)]'
+                  )}
+                >
+                  按卷
+                </button>
+              </div>
+              {effectiveScope === 'volume' && (
+                <select
+                  value={effectiveVolumeNumber ?? ''}
+                  onChange={(e) => setVolumeNumber(Number(e.target.value))}
+                  className="w-full px-3 py-2 rounded-lg text-xs bg-[var(--color-panel)] border border-[var(--color-border)] text-[var(--color-text)]"
+                >
+                  {volumes.map(v => (
+                    <option key={v.volumeNumber} value={v.volumeNumber}>
+                      第{v.volumeNumber}卷 · {v.title}（第 {v.startChapter}–{v.endChapter} 章）
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
+
+          {/* 选项。**只在 merged-md 下显示**——服务层的 includeOutline 目前只在
+              该分支实现（分卷前就如此，已登记待排期）。三种格式都摆出复选框，
+              等于对 split-md / txt 承诺一件不会发生的事 */}
+          {format === 'merged-md' && (
+            <label className="flex items-center gap-2 text-xs cursor-pointer text-[var(--color-text-secondary)]">
+              <input type="checkbox" checked={includeOutline} onChange={(e) => setIncludeOutline(e.target.checked)} />
+              {effectiveScope === 'volume' ? '包含本卷主线与卷大纲' : '包含故事大纲'}
+            </label>
+          )}
 
           {/* 结果 */}
           {result && (

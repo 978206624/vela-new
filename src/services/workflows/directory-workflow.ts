@@ -1,5 +1,7 @@
 import type { WorkflowDefinition } from '../../stores/workflow-store'
 import { useProjectStore } from '../../stores/project-store'
+import { getProjectToken } from '../../stores/volume-store'
+import { WORKFLOW_TOKEN_KEY } from './commands/base-command'
 import { ipc } from '../ipc-client'
 import type { BlueprintData } from '../../../electron/repositories/blueprint-repository'
 import { stripThinkingTags } from './workflow-utils'
@@ -96,8 +98,19 @@ export async function saveChapterBlueprint(blueprint: ChapterBlueprint): Promise
   await ipc.invoke('db:blueprint-upsert', blueprint)
 }
 
-export async function saveAllBlueprints(blueprints: ChapterBlueprint[]): Promise<void> {
-  await ipc.invoke('db:blueprint-upsert-many', blueprints)
+/**
+ * 批量落库章节蓝图。
+ *
+ * `expectedToken` **必须由长流程显式传入**：目录生成跨多批次、可达数分钟，
+ * 且工作流不随项目关闭而取消。用户中途切项目时，在途批次会把 A 的蓝图
+ * 写进 B 的库并覆盖同章内容——主进程靠这个 token 拒写。
+ * 返回值必须检查（`stale` 表示项目已切换），静默忽略等于守卫白加。
+ */
+export async function saveAllBlueprints(
+  blueprints: ChapterBlueprint[],
+  expectedToken?: number,
+): Promise<{ success: boolean; stale?: boolean; error?: string }> {
+  return await ipc.invoke('db:blueprint-upsert-many', blueprints, expectedToken)
 }
 
 /**
@@ -122,7 +135,23 @@ export async function getBlueprintCount(): Promise<number> {
 // 3. 工作流定义映射工厂 (Command 调度层)
 // ==========================================
 
-export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode: 'full' }): WorkflowDefinition {
+export function createDirectoryWorkflow(
+  params: DirectoryWorkflowParams = { mode: 'full' },
+  /**
+   * 由调用方在**更早的时刻**捕获的 token。
+   *
+   * **两条入口都必须传**：
+   * - Agent 路径的前置检查（有没有蓝图、架构齐不齐）是一串异步 IPC；
+   * - UI 路径（`ChapterCardEditor.handleBatchGenerate`）有 guard 与 confirm 两个长 await，
+   *   确认框还要等用户点。
+   *
+   * 若等到这里才捕获，「A 通过前置检查 → 切到 B → 在 B 上启动」
+   * 会捕获到**合法的 B token**，主进程守卫拦不住。
+   * 缺省仍在此捕获，只是为了兼容尚未改造的调用点，不代表那样是安全的。
+   */
+  capturedTokenOverride?: number,
+): WorkflowDefinition {
+  const capturedToken = capturedTokenOverride ?? getProjectToken()
   return {
     type: 'directory',
     title: params.mode === 'append' ? `📋 续写章节蓝图${params.startChapter ? `（从第 ${params.startChapter} 章）` : ''}` : '📋 生成章节蓝图（全量）',
@@ -163,6 +192,11 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
           context.data.coreSynopsis = synopsis
           // 注入节奏指导到 context，供 Command 读取
           if (params.pacingGuidance) context.data.pacingGuidance = params.pacingGuidance
+          // 起点 token 交给 Command：它逐批写库，每批都要带。
+          // ⚠️ 同时写 WORKFLOW_TOKEN_KEY——`BaseWorkflowCommand.callLLM` 的
+          // 「发模前核对项目未切换」只认这个键，只写 capturedToken 等于那道守卫不生效
+          context.data.capturedToken = capturedToken
+          context.data[WORKFLOW_TOKEN_KEY] = capturedToken
           if (params.mode === 'append') {
             const existing = await loadDirectoryBlueprints()
             context.data.existingBlueprints = existing
@@ -190,22 +224,15 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
           if (!project) throw new Error('未打开项目')
 
           const newBlueprints = context.data.newBlueprints as ChapterBlueprint[]
-          const existingBlueprints = context.data.existingBlueprints as ChapterBlueprint[]
 
-          callbacks.log('保存蓝图到数据库...')
-
-          let merged: ChapterBlueprint[]
-          if (params.mode === 'full') {
-            merged = newBlueprints
-            // TODO: 若需要清理冗余蓝图，可考虑添加 db:blueprint-delete-all 以严格符合全量替换的意图。
-            // 在当前 upsert-many 中，仅覆盖更新
-          } else {
-            const existingMap = new Map(existingBlueprints.map(b => [b.chapterNumber, b]))
-            for (const nb of newBlueprints) existingMap.set(nb.chapterNumber, nb)
-            merged = Array.from(existingMap.values()).sort((a, b) => a.chapterNumber - b.chapterNumber)
-          }
-
-          await saveAllBlueprints(merged)
+          // **两种模式都不再做最终保存**：Command 已在每批结束时权威落库并刷新资源，
+          // 而且那一步只补写"未成功预览写入"的章节，刻意避开正被用户编辑的那些。
+          //
+          // 这里再把累计的 newBlueprints 整体 upsert 一遍，就会用**陈旧副本**盖掉
+          // 用户在生成期间做的编辑——蓝图一落库就出现在编辑器里、当场可改，
+          // 窗口从「第一批出现」一直开到「最后一批结束」，不是理论风险。
+          // full 模式同样如此：它只是起点写死为 1，落库路径与 append 完全一致。
+          callbacks.log(`已生成 ${newBlueprints.length} 章（逐批落库，无需重复保存）`)
           useProjectStore.getState().refreshFileTree()
           return '已保存蓝图'
         },

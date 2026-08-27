@@ -52,7 +52,12 @@ export function registerDatabaseController() {
     return BlueprintRepository.getByChapter(chapterNumber)
   })
 
-  ipcMain.handle('db:blueprint-upsert', async (_event, data: BlueprintData) => {
+  ipcMain.handle('db:blueprint-upsert', async (_event, data: BlueprintData, expectedToken?: number) => {
+    // 与 upsert-many 同口径：缺省放行（兼容既有短流程），长流程必须显式传。
+    // 类型里声明了 expectedToken 而 handler 不实现，等于给调用方一个**假的**安全承诺
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
     try {
       BlueprintRepository.upsert(data)
       return { success: true }
@@ -61,7 +66,17 @@ export function registerDatabaseController() {
     }
   })
 
-  ipcMain.handle('db:blueprint-upsert-many', async (_event, items: BlueprintData[]) => {
+  ipcMain.handle('db:blueprint-upsert-many', async (_event, items: BlueprintData[], expectedToken?: number) => {
+    // 目录生成是长流程（多批次、可达数分钟）且**不随项目关闭而取消**。
+    // 用户在生成期间切到另一个项目时，在途批次会带着 A 的蓝图写进 B 的库、
+    // 覆盖 B 的同章蓝图。token 不符即拒写是唯一能兜住这条路径的地方——
+    // 渲染层的前置检查（「已有蓝图就不生成」）查的是发起时的项目，管不了之后切走。
+    //
+    // 兼容既有调用点：缺省 token 仍放行（与 db:log-llm-call 同口径），
+    // 长流程写入方必须显式传。
+    if (expectedToken !== undefined && getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
     try {
       BlueprintRepository.upsertMany(items)
       return { success: true }
@@ -532,6 +547,19 @@ ipcMain.handle('db:revision-create', async (_event, params: {
       return { success: true }
     } catch (err) {
       console.error('[db:volume-upsert] 失败:', err)
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('db:volume-advance-status', async (_event, chapterNumber: number, expectedToken?: number) => {
+    // 与其它卷写通道同口径：缺省 token 直接判 stale。
+    // 定稿后处理是长流程，必须显式带上起点 token
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      return { success: true, changed: VolumeRepository.advanceStatusByChapter(chapterNumber) }
+    } catch (err) {
       return { success: false, error: String(err) }
     }
   })

@@ -167,7 +167,13 @@ export abstract class BaseWorkflowCommand<TResult = string> {
             // 打字机预览须传 streamChunkMode: 'every'，否则单对象 JSON 全程零回调
             const shouldFire = options?.streamChunkMode === 'every' || chunk.includes('}')
             if (options?.onStreamChunk && shouldFire) {
-              try { options.onStreamChunk(fullContent) } catch { /* 增量解析失败不影响主流程 */ }
+              // ⚠️ 必须传**剥离 thinking 后**的文本，与 onDone 的 `cleaned` 同一规范。
+              // 传原文会让增量消费方（目录生成的流式预览入库）解析到推理段里的
+              // 临时 JSON——DeepSeek/Claude 的推理里出现「第 11 章草稿对象」是常态，
+              // 它会先于正式答案落库，而正式答案随后被「已预览过就跳过」滤掉，
+              // 数据库里永久留着推理时的临时版本。
+              // `stripThinkingTags` 的正则带 `|$`，未闭合的 `<think>`（流到一半）也能截断。
+              try { options.onStreamChunk(this.stripThinkingTags(fullContent)) } catch { /* 增量解析失败不影响主流程 */ }
             }
           },
           onDone: (text, usage) => {

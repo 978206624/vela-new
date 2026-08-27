@@ -25,6 +25,7 @@ import { DRAFT_STATUS_LABEL, DRAFT_STATUS_COLOR } from '../../shared/draft-statu
 import { PostProcessStatusPanel } from '../ui/PostProcessStatusPanel'
 import { getChapterFinalizeScope } from '../../services/workflows/workflow-utils'
 import { guardRepairPostProcess, guardFinalizeChapter } from '../../services/workflow-guards'
+import { getProjectToken } from '../../stores/volume-store'
 
 interface Props {
   filePath: string
@@ -211,6 +212,11 @@ export default function DraftEditor({ filePath, content }: Props) {
   /** 定稿 */
   const doFinalize = async () => {
     if (!meta || isChapterBusy) return
+    // ⚠️ 任何 await 之前捕获。下面 guard、confirm、读正文都是 await，
+    // 定稿后处理还要跨多次 LLM 调用（分钟级）才写到卷状态——
+    // 到那时现取会拿到用户切换后那个项目的合法 token，守卫原样放行，
+    // 于是 A 项目的章号被拿去改 B 项目的卷状态
+    const actionToken = getProjectToken()
     // 前端快速反馈：回溯定稿历史章会被后端 db:draft-finalize-exclusive handler 硬拦，
     // 这里提前拦截，避免启动 workflow 后才在后台报错（真正的硬拦截在 handler + execute 返回值检查）。
     const guard = await guardFinalizeChapter(meta.chapterNumber)
@@ -231,12 +237,19 @@ export default function DraftEditor({ filePath, content }: Props) {
 
       const body = await readDraftBody(filePath)
 
+      // 复核：确认对话框和读正文期间用户可能已经切走了。
+      // 前置的 guard 结论也随之失效（它查的是另一个项目的章节状态）
+      if (getProjectToken() !== actionToken) {
+        toast.error('项目已切换，本次定稿已取消')
+        return
+      }
+
       useWorkflowStore.getState().startWorkflow(createFinalizeWorkflow({
         chapterNumber: meta.chapterNumber,
         chapterTitle: meta.chapterTitle ?? '未知标题',
         draftPath: filePath,
         draftContent: body,
-      }), false)
+      }, actionToken), false)
     } catch (e) {
       toast.error(`定稿启动失败：${e}`)
     }
@@ -291,6 +304,11 @@ export default function DraftEditor({ filePath, content }: Props) {
   /** 修复定稿后处理 — 只重跑失败的步骤 */
   const doRepairFinalize = useCallback(async () => {
     if (!meta || isChapterBusy) return
+    // ⚠️ 与 doFinalize 同一纪律：任何 await 之前捕获。
+    // guard 查询和两次动态 import 都是 await，切项目发生在这期间时，
+    // 让工作流自己现取会拿到 B 的**合法** token —— 守卫看不出异常，
+    // 于是 A 的章号被拿去改 B 的卷状态。异步 handler 不会被项目关闭取消
+    const actionToken = getProjectToken()
     try {
       const guard = await guardRepairPostProcess(meta.chapterNumber)
       if (!guard.ok) {
@@ -299,7 +317,13 @@ export default function DraftEditor({ filePath, content }: Props) {
       }
       const { useWorkflowStore } = await import('../../stores/workflow-store')
       const { createRepairFinalizeWorkflow } = await import('../../services/workflows/chapter-workflow')
-      useWorkflowStore.getState().startWorkflow(createRepairFinalizeWorkflow(meta.chapterNumber), false)
+      // 复核：guard 结论在切项目后已失效（它查的是另一个项目的章节状态）
+      if (getProjectToken() !== actionToken) {
+        toast.error('项目已切换，本次修复已取消')
+        return
+      }
+      useWorkflowStore.getState().startWorkflow(
+        createRepairFinalizeWorkflow(meta.chapterNumber, actionToken), false)
     } catch (e) {
       toast.error(`修复启动失败：${e}`)
     }

@@ -354,8 +354,8 @@ export interface DatabaseChannels {
   // 2. blueprints
   'db:blueprint-get-all': { args: []; return: BlueprintData[] }
   'db:blueprint-get': { args: [chapterNumber: number]; return: BlueprintData | null }
-  'db:blueprint-upsert': { args: [data: BlueprintData]; return: { success: boolean; error?: string } }
-  'db:blueprint-upsert-many': { args: [items: BlueprintData[]]; return: { success: boolean; error?: string } }
+  'db:blueprint-upsert': { args: [data: BlueprintData, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  'db:blueprint-upsert-many': { args: [items: BlueprintData[], expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:blueprint-update-notes': { args: [chapterNumber: number, notes: string]; return: { success: boolean; error?: string } }
   'db:blueprint-update-target-words': { args: [chapterNumber: number, targetWords: number]; return: { success: boolean; error?: string } }
   'db:blueprint-delete-range': { args: [startChapter: number, endChapter: number, expectedToken?: number]; return: { success: boolean; deleted: number; stale?: boolean; error?: string } }
@@ -428,6 +428,11 @@ export interface DatabaseChannels {
   'db:volume-get-by-chapter': { args: [chapterNumber: number]; return: VolumeData | null }
   'db:volume-upsert': { args: [data: VolumeData, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:volume-update-status': { args: [volumeNumber: number, status: VolumeStatus, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  /** 原子卷状态流转：按章号定位卷、判定并条件更新，全在一个事务内 */
+  'db:volume-advance-status': {
+    args: [chapterNumber: number, expectedToken?: number]
+    return: { success: boolean; stale?: boolean; error?: string; changed?: { volumeNumber: number; title: string; status: VolumeStatus } | null }
+  }
   'db:volume-update-threads': { args: [volumeNumber: number, threads: OpenThread[], expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:volume-delete': { args: [volumeNumber: number, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   'db:volume-inspect-first': { args: []; return: FirstVolumeInspection }

@@ -231,6 +231,45 @@ export class VolumeRepository {
         tx()
     }
 
+    /**
+     * **原子**卷状态流转（供定稿后处理调用）。
+     *
+     * 为什么不能在渲染层「先 getByChapter 再 updateStatus」两步做：
+     * 后处理流水线含多次 LLM 调用，两步之间隔着可观的时间窗口。
+     * 用户在这期间把末卷从「止于第 10 章」延长到第 20 章，
+     * 旧判断仍会把它写成 `done`——一个刚被延长的卷立刻显示"已完成"。
+     * 故把「按章号定位卷 → 判定目标状态 → 条件更新」收进同一个事务，
+     * 判定所依据的边界与写入是同一份快照。
+     *
+     * 返回 `null` 表示无需变更（零卷 / 本章无卷归属 / 已是目标状态）。
+     */
+    static advanceStatusByChapter(chapterNumber: number): { volumeNumber: number; title: string; status: VolumeStatus } | null {
+        const db = requireDb()
+        const tx = db.transaction(() => {
+            const row = db.prepare(`
+        SELECT * FROM volumes
+        WHERE start_chapter <= ? AND end_chapter >= ?
+        ORDER BY volume_number ASC LIMIT 1
+      `).get(chapterNumber, chapterNumber) as VolumeRow | undefined
+            if (!row) return null
+
+            const vol = rowToData(row)
+            // 先判末章：单章卷（start === end）两个条件同时成立，应落在 done。
+            // 只认首章触发 writing——Spec §4.11 允许用户手动置回 planned 表示
+            // 「本卷暂时搁置」，任意中间章都触发会推翻用户的显式意图。
+            const next: VolumeStatus | null =
+                chapterNumber === vol.endChapter ? 'done'
+                    : (chapterNumber === vol.startChapter && vol.status === 'planned') ? 'writing'
+                        : null
+            if (!next || next === vol.status) return null
+
+            db.prepare(`UPDATE volumes SET status = ?, updated_at = datetime('now') WHERE volume_number = ?`)
+                .run(next, vol.volumeNumber)
+            return { volumeNumber: vol.volumeNumber, title: vol.title, status: next }
+        })
+        return tx() as { volumeNumber: number; title: string; status: VolumeStatus } | null
+    }
+
     /** 仅更新 status（供定稿后处理的卷状态自动流转）。返回是否命中行 */
     static updateStatus(volumeNumber: number, status: VolumeStatus): boolean {
         const validated = assertValidStatus(status, volumeNumber)

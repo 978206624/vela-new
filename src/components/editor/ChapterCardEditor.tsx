@@ -18,6 +18,7 @@ import {
   type DirectoryWorkflowParams,
 } from '../../services/workflows/directory-workflow'
 import { guardDirectoryGeneration } from '../../services/workflow-guards'
+import { getProjectToken } from '../../stores/volume-store'
 import DirectoryConfigDialog from '../dialogs/DirectoryConfigDialog'
 import { Button } from '../ui/Button'
 import { Input } from '../ui/Input'
@@ -146,7 +147,14 @@ export default function ChapterCardEditor() {
     if (!currentProject) return
     setSaving(true)
     const toSaveAll = blueprints.map(b => ({ ...b, targetWords: normalizeTargetWords(b.targetWords, currentProject.novelConfig.wordsPerChapter) }))
-    await saveAllBlueprints(toSaveAll)
+    const res = await saveAllBlueprints(toSaveAll)
+    // 必须检查返回值：写库失败时若照常清 dirty 并报「已保存」，
+    // 用户会以为改动落了盘，实际关掉编辑器就全丢了
+    if (!res.success) {
+      setSaving(false)
+      addLog('error', `❌ 保存蓝图失败：${res.error ?? '未知错误'}`)
+      return   // 保留 dirty，让用户能重试
+    }
     setBlueprints(toSaveAll)  // 同步归一后的值（理由同 handleSaveOne）
     setSaving(false)
     setDirty(false)
@@ -193,6 +201,11 @@ export default function ChapterCardEditor() {
   const handleBatchGenerate = async (params: DirectoryWorkflowParams) => {
     if (!currentProject) return
 
+    // ⚠️ 在**任何 await 之前**捕获。下面的 guard 与 confirm 都是长 await
+    //（确认框要等用户点），期间完全可能切项目；等到 createDirectoryWorkflow()
+    // 里才捕获，会拿到切换后项目的**合法 token**，主进程守卫识别不出来
+    const actionToken = getProjectToken()
+
     // 前置校验：故事架构是否就绪
     const guard = await guardDirectoryGeneration()
     if (!guard.ok) {
@@ -210,7 +223,13 @@ export default function ChapterCardEditor() {
       if (!yes) return
     }
 
-    startWorkflow(createDirectoryWorkflow(params))
+    // 异步确认期间可能已切项目：前置校验查的是原项目，结论已失效
+    if (getProjectToken() !== actionToken) {
+      addLog('error', '⚠️ 项目已切换，本次生成已取消')
+      toast.warning('项目已切换\n\n前置检查结果已失效，请重新发起生成。')
+      return
+    }
+    startWorkflow(createDirectoryWorkflow(params, actionToken))
     addLog('info', '🚀 已启动章节蓝图生成')
   }
 

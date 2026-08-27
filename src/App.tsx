@@ -50,6 +50,8 @@ export default function App() {
   const closeChapterCreation = useLayoutStore(s => s.closeChapterCreation)
   const initLLM = useLLMStore((s) => s.init)
   const loadRecentProjects = useProjectStore((s) => s.loadRecentProjects)
+  // 订阅式读取：getState() 在 render 里读不会触发重渲染，key 就永远停在首次挂载时的值
+  const projectToken = useProjectStore((s) => s.currentToken)
 
   // 初始化：主题 + LLM 模型 + 最近项目 + 缩放级别
   useEffect(() => {
@@ -209,7 +211,10 @@ export default function App() {
         prefill={chapterCreationPrefill}
         onClose={closeChapterCreation}
       />
+      {/* key 绑当前项目 token：换项目即重挂，导出范围/卷号/上次结果自然回到初值。
+          比在组件内用 effect 同步 setState 干净——那会触发级联渲染（eslint 亦禁止） */}
       <ExportDialog
+        key={`export-${projectToken ?? 'none'}`}
         isOpen={exportOpen}
         onClose={closeExport}
       />

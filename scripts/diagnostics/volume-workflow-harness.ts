@@ -57,6 +57,7 @@ import { initProjectDatabase, closeProjectDatabase, getProjectDb } from '../../e
 import { VolumeRepository, type VolumeData } from '../../electron/repositories/volume-repository'
 import { commitNextVolume, inspectFirstVolume } from '../../electron/repositories/volume-commit'
 import { BlueprintRepository } from '../../electron/repositories/blueprint-repository'
+import { PostProcessRepository } from '../../electron/repositories/post-process-repository'
 
 // ===== 3. 渲染层侧 =====
 
@@ -177,6 +178,16 @@ const ARCH = {
     synopsis: '全书情节大纲：主角从边镇少年一路成长为北境之主，先后经历夺镇、结盟、背叛与反攻，最终揭开玉佩背后的真相、终结王朝更替带来的长期动荡，故事在此彻底闭环收束。',
 }
 
+/**
+ * 造一张角色卡。`guardDirectoryGeneration` 要求角色卡非空
+ *（「角色图谱已生成」的反向约束），Agent 路径的用例必须先播种。
+ */
+function seedCharacter(): void {
+    getProjectDb()!.prepare(
+        `INSERT OR IGNORE INTO characters (name, role) VALUES ('沈砚', 'protagonist')`
+    ).run()
+}
+
 /** 把架构四大件写进 project_core（默认 freshEnv 只写了短文本，过不了 50 字闸门） */
 function seedArchitecture(): void {
     getProjectDb()!.prepare(
@@ -202,7 +213,26 @@ function setVolumes(vols: VolumeData[]): void {
  * 替换 LLM：按调用顺序依次返回预置的 JSON。
  * `failAt` 指定第几次调用（1-based）走 onError，用于验证失败路径的统计立即落库。
  */
-function stubLLM(responses: string[], opts: { failAt?: number; afterCall?: (n: number) => void } = {}): {
+function stubLLM(
+    responses: string[],
+    opts: {
+        failAt?: number
+        /** 第 N 次调用**完全结束之后**触发（模拟「两批之间」切项目） */
+        afterCall?: (n: number) => void
+        /**
+         * 第 N 次调用**流到一半时**触发（第一个 chunk 之后、onDone 之前）。
+         * 这才是真正危险的窗口：此时流式预览写入已经在发了、权威保存还没发，
+         * 挂在 afterCall 上验不到这一段——那时两种写入都早已落库。
+         */
+        duringCall?: (n: number) => void | Promise<void>
+        /**
+         * 后半段**不作为 chunk 推送**，只在 onDone 里随完整文本给出。
+         * 用于证明「整批保存确实补写了未预览到的章节」——否则第二个 chunk
+         * 会把剩余章节也预览掉，断言就成了空转（Codex round-07 指出）。
+         */
+        withholdTail?: boolean
+    } = {},
+): {
     calls: number; prompts: string[]
 } {
     const state = { calls: 0, prompts: [] as string[] }
@@ -220,18 +250,25 @@ function stubLLM(responses: string[], opts: { failAt?: number; afterCall?: (n: n
             const idx = state.calls++
             // 异步 resolve，模拟真实流式：executor 会 await 这个 Promise 链
             setTimeout(() => {
-                if (opts.failAt !== undefined && state.calls === opts.failAt) {
-                    callbacks.onError('模拟的模型调用失败')
-                    return
-                }
-                const text = responses[idx] ?? '{}'
-                // 切成两段推，验证 streamChunkMode 的触发时机
-                callbacks.onChunk(text.slice(0, Math.floor(text.length / 2)))
-                callbacks.onChunk(text.slice(Math.floor(text.length / 2)))
-                callbacks.onDone(text, { promptTokens: 10, completionTokens: 20, totalTokens: 30 })
-                // 模拟「第 N 次调用**结束之后**、下一次发起之前」用户切了项目。
-                // 必须挂在 onDone 之后：挂在调用内部就已经晚了，那时守卫早已放行
-                opts.afterCall?.(state.calls)
+                void (async () => {
+                    if (opts.failAt !== undefined && state.calls === opts.failAt) {
+                        callbacks.onError('模拟的模型调用失败')
+                        return
+                    }
+                    const text = responses[idx] ?? '{}'
+                    // 切成两段推，验证 streamChunkMode 的触发时机
+                    callbacks.onChunk(text.slice(0, Math.floor(text.length / 2)))
+                    // duringCall 可以是 async：同批次用例需要先等流式预览写入真正落库
+                    // （那是个 .then 链，不 await 的话编辑会跑在预览之前，测的就不是那个窗口）
+                    await opts.duringCall?.(state.calls)
+                    if (!opts.withholdTail) {
+                        callbacks.onChunk(text.slice(Math.floor(text.length / 2)))
+                    }
+                    callbacks.onDone(text, { promptTokens: 10, completionTokens: 20, totalTokens: 30 })
+                    // 模拟「第 N 次调用**结束之后**、下一次发起之前」用户切了项目。
+                    // 必须挂在 onDone 之后：挂在调用内部就已经晚了，那时守卫早已放行
+                    opts.afterCall?.(state.calls)
+                })()
             }, 0)
             return 'req-1'
         },
@@ -265,11 +302,17 @@ invokeHandler = async (channel, ...args) => {
             return BlueprintRepository.getByChapter(args[0] as number)
         case 'db:blueprint-get-all':
             return BlueprintRepository.getAll()
-        case 'db:blueprint-upsert-many':
+        case 'db:blueprint-upsert-many': {
+            // 复刻真实 controller：缺省 token 放行，token 不符即 stale
+            const expected = args[1] as number | undefined
+            if (expected !== undefined && expected !== currentToken) return { success: false, stale: true }
             BlueprintRepository.upsertMany(args[0] as never)
             return { success: true }
+        }
         case 'db:character-get-all':
-            return []
+            // 转发到真实表：`guardDirectoryGeneration` 用「角色卡是否为空」当
+            // 「角色图谱已生成」的反向约束，写死返回 [] 会让 Agent 路径永远进不去
+            return getProjectDb()!.prepare('SELECT name, role FROM characters').all() as never
         // 保存蓝图那步会调 refreshFileTree() 刷侧边栏资产树。harness 不关心文件树，
         // 返回空目录即可——但**必须显式路由**，未知通道会直接抛错炸掉整个 harness
         case 'fs:list-dir':
@@ -278,12 +321,61 @@ invokeHandler = async (channel, ...args) => {
         // 本 harness 只验证卷罗盘那一段，其余给最小可用返回值即可
         case 'fs:read-file':
             return { success: false, content: '' }
-        case 'db:draft-get-finalized':
-            return null
-        case 'db:draft-get-full':
-            return null
         case 'kb:search':
             return []
+        // ── 导出 / 卷状态流转（Task 19.3c）用到的通道 ──
+        case 'db:draft-get-finalized': {
+            const row = getProjectDb()!.prepare(
+                `SELECT id FROM drafts WHERE chapter_number = ? AND status = 'finalized' LIMIT 1`
+            ).get(args[0] as number) as { id: number } | undefined
+            return row ?? null
+        }
+        case 'db:draft-get-full': {
+            const row = getProjectDb()!.prepare(`
+                SELECT c.body as content FROM drafts d JOIN contents c ON c.id = d.content_id WHERE d.id = ?
+            `).get(args[0] as number) as { content: string } | undefined
+            return row ?? null
+        }
+        case 'db:volume-get-by-chapter':
+            return VolumeRepository.getByChapter(args[0] as number)
+        case 'db:volume-advance-status': {
+            const expected = args[1] as number | undefined
+            if (expected === undefined || expected !== currentToken) return { success: false, stale: true }
+            return { success: true, changed: VolumeRepository.advanceStatusByChapter(args[0] as number) }
+        }
+        case 'db:volume-update-status': {
+            // 复刻 db-controller 的守卫：**缺省 token 也判 stale**
+            const expected = args[2] as number | undefined
+            if (expected === undefined || expected !== currentToken) return { success: false, stale: true }
+            const ok = VolumeRepository.updateStatus(args[0] as number, args[1] as never)
+            return ok ? { success: true } : { success: false, error: '卷不存在' }
+        }
+        // ── 后处理记账（修复模式必经）。转发真实仓储而非写死返回值：
+        //    写死 null / [] 会让「跳过已成功步骤」的逻辑永远走不到，
+        //    X23b 想验的那一步根本执行不到，用例就成了空转 ──
+        case 'db:post-process-get-latest-run':
+            return PostProcessRepository.getLatestRun(args[0] as string, args[1] as string)
+        case 'db:post-process-get-steps':
+            return PostProcessRepository.getSteps(args[0] as string)
+        case 'db:post-process-create-run':
+            // 必须回 id：调用方检查 `!createRes.id` 并抛「创建跑批失败」，
+            // 只回 {success:true} 会让用例挂在一个与被测行为无关的错误上
+            return { success: true, id: PostProcessRepository.createRun(args[0] as never) }
+        case 'db:post-process-mark-step-ok':
+            PostProcessRepository.markStepOk(args[0] as string, args[1] as string)
+            return { success: true }
+        case 'db:post-process-mark-step-failed':
+            PostProcessRepository.markStepFailed(args[0] as string, args[1] as string, args[2] as string)
+            return { success: true }
+        case 'db:post-process-is-all-passed':
+            return PostProcessRepository.isAllCriticalPassed(args[0] as string, args[1] as string)
+        case 'fs:mkdir':
+            fs.mkdirSync(String(args[0]), { recursive: true })
+            return { success: true }
+        case 'fs:write-file':
+            fs.mkdirSync(path.dirname(String(args[0])), { recursive: true })
+            fs.writeFileSync(String(args[0]), String(args[1]), 'utf-8')
+            return { success: true }
         case 'db:project-core-get': {
             const row = getProjectDb()!.prepare(`SELECT * FROM project_core WHERE id='main'`).get() as Record<string, string>
             return { premise: row.premise, worldbuilding: row.worldbuilding, charactersArch: row.characters_arch, synopsis: row.synopsis }
@@ -1059,6 +1151,802 @@ ${prompt.slice(0, 500)}`)
         assert(!ctx.builder.build().includes('当前卷：'), '首章 prompt 里也不该有罗盘')
         assert(!logs.join('\n').includes('已注入本卷罗盘'),
             '模板根本没引用该占位符，日志不能谎报「已注入」')
+    })
+
+    console.log('\n▶ 卷状态流转 / 按卷导出 / Agent 续目录（Task 19.3c）')
+
+    /** 跑一次卷状态流转步骤（定稿后处理流水线里的那一步） */
+    async function runVolumeStatusStep(chapterNumber: number, token = currentToken) {
+        const { buildFinalizePostProcessSteps } = await import(
+            '../../src/services/workflows/commands/finalize-chapter.command')
+        const steps = buildFinalizePostProcessSteps(
+            { path: 'x' }, chapterNumber, `第${chapterNumber}章`, '正文', token)
+        const step = steps.find(st => st.key === 'volume_status')
+        assert(step, '定稿流水线里应有 volume_status 步骤')
+        const logs: string[] = []
+        await step!.executor({ log: (m: string) => logs.push(m), setProgress: () => {}, appendText: () => {} } as never)
+        return logs.join('\n')
+    }
+
+    await testCase('X1 首章定稿 → planned 流转为 writing；末章定稿 → done', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        VolumeRepository.upsert(vol(2, 11, 20, { title: '第二卷', status: 'planned' }))
+
+        await runVolumeStatusStep(11)
+        assertEq(VolumeRepository.get(2)!.status, 'writing', '首章定稿应流转为写作中')
+
+        await runVolumeStatusStep(20)
+        assertEq(VolumeRepository.get(2)!.status, 'done', '末章定稿应流转为已完成')
+    })
+
+    await testCase('X2 单章卷（start === end）→ 落在 done 而不是 writing', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        VolumeRepository.upsert(vol(2, 11, 11, { title: '单章卷', status: 'planned' }))
+        await runVolumeStatusStep(11)
+        // 两个条件同时成立时必须先判末章——否则这卷永远停在「写作中」
+        assertEq(VolumeRepository.get(2)!.status, 'done', '单章卷定稿后应直接完成')
+    })
+
+    await testCase('X3 用户手动置回 planned 表示「搁置」→ 中间章定稿不得顶回 writing', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        // 用户写了几章后决定搁置本卷，手动把状态改回 planned（Spec §4.11 允许）
+        VolumeRepository.upsert(vol(2, 11, 20, { title: '第二卷', status: 'planned' }))
+        await runVolumeStatusStep(15)
+        // 「任何章定稿都算开写」看似无害超集，实则会推翻用户的显式意图
+        assertEq(VolumeRepository.get(2)!.status, 'planned',
+            '中间章定稿不得覆盖用户手动设置的搁置状态')
+    })
+
+    await testCase('X4 已 done 的卷不被中间章回退，零卷整步跳过', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'done' }))
+        await runVolumeStatusStep(5)
+        assertEq(VolumeRepository.get(1)!.status, 'done', '已完成的卷不得被中间章拉回写作中')
+
+        // 零卷：没有任何卷，整步跳过且不报错
+        freshEnv()
+        const before = snapshot()
+        const logs = await runVolumeStatusStep(5)
+        assertUnchanged(before, '零卷时不应有任何写入')
+        assertEq(logs, '', '零卷时不该产生日志')
+    })
+
+    await testCase('X5 项目已切换 → 卷状态不写入，且**必须抛错**（不能被记成成功）', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'planned' }))
+        let threw = ''
+        try {
+            await runVolumeStatusStep(1, currentToken - 1)   // 用上一个项目的旧 token
+        } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+        assertEq(VolumeRepository.get(1)!.status, 'planned', '跨项目写入必须被守卫拦下')
+        // 只记日志正常返回的话，流水线会把这步标成成功，既不重试、修复模式也不重跑
+        assert(threw.includes('项目已切换'), `必须抛错而非静默返回，实为：${threw || '（没抛）'}`)
+    })
+
+    await testCase('X5b 边界改变后按新边界判定（非原子性的动态证明，见注释）', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'writing' }))
+        // 「后处理跑了几分钟，期间用户把末卷从止于 10 延长到 20」
+        VolumeRepository.upsert(vol(1, 1, 20, { title: '第一卷', status: 'writing' }))
+        await runVolumeStatusStep(10)
+        assertEq(VolumeRepository.get(1)!.status, 'writing',
+            '第 10 章已不是末章，刚被延长的卷不该显示「已完成」')
+        // ⚠️ 本用例**不构成原子性的动态证明**：它在调用事务之前就把边界改完了，
+        // 证明的是「判定读的是当前值、不是陈旧副本」。真正的读写交错需要在事务内部
+        // 注入并发写，本 harness 是单线程 + better-sqlite3 同步 API，构造不出来。
+        // 原子性由实现保证——判定与更新同在 `advanceStatusByChapter` 的一个 transaction 内。
+    })
+
+    await testCase('X6 按卷导出：只含本卷章节，文件名带卷名，大纲用本卷的', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 5, { title: '第一卷', premise: '卷一主线：夺回边镇', synopsis: '卷一大纲内容' }))
+        VolumeRepository.upsert(vol(2, 6, 10, { title: '第二卷', premise: '卷二主线：南征', synopsis: '卷二大纲内容' }))
+        setVolumes(VolumeRepository.getAll())
+
+        const { exportNovel } = await import('../../src/services/export-service')
+        const outDir = path.join(tmpRoot, `exp-${dbSeq}`)
+        const res = await exportNovel({
+            format: 'merged-md', outputDir: outDir, includeOutline: true,
+            scope: 'volume', volumeNumber: 2,
+        })
+        assert(res.success, `导出应成功：${res.error}`)
+        assert(res.path!.includes('第2卷'), `文件名应带卷名，实为：${res.path}`)
+
+        const content = fs.readFileSync(res.path!, 'utf-8')
+        assert(content.includes('第 6 章正文') && content.includes('第 10 章正文'), '应含本卷章节')
+        assert(!content.includes('第 5 章正文'), '不得含其它卷的章节')
+        assert(content.includes('卷二主线：南征'), '按卷导出应用本卷主线')
+        assert(!content.includes(ARCH.synopsis),
+            '按卷导出塞全书大纲会把后续卷剧情剧透给读者，且那描述的是整本书')
+    })
+
+    await testCase('X7 整本导出：各卷首章前插卷标题；零卷时逐字节维持原样', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 5, { title: '第一卷' }))
+        VolumeRepository.upsert(vol(2, 6, 10, { title: '第二卷' }))
+        setVolumes(VolumeRepository.getAll())
+
+        const { exportNovel } = await import('../../src/services/export-service')
+        const withVols = await exportNovel({
+            format: 'merged-md', outputDir: path.join(tmpRoot, `exp-a-${dbSeq}`),
+        })
+        assert(withVols.success, `导出应成功：${withVols.error}`)
+        const a = fs.readFileSync(withVols.path!, 'utf-8')
+        assert(a.includes('## 第1卷 · 第一卷') && a.includes('## 第2卷 · 第二卷'), '应插入两个卷标题')
+        // 标题必须紧挨着卷**首章**，不能插到卷中间
+        assert(a.indexOf('## 第2卷') < a.indexOf('第 6 章正文'), '卷二标题应在其首章之前')
+        assert(a.indexOf('## 第2卷') > a.indexOf('第 5 章正文'), '卷二标题不应插到卷一章节之前')
+
+        // 零卷项目：不应出现任何卷标题
+        freshEnv()
+        seedArchitecture()
+        const noVols = await exportNovel({
+            format: 'merged-md', outputDir: path.join(tmpRoot, `exp-b-${dbSeq}`),
+        })
+        assert(noVols.success, `零卷导出应成功：${noVols.error}`)
+        const b = fs.readFileSync(noVols.path!, 'utf-8')
+        assert(!b.includes('## 第1卷'), '零卷项目导出结果里不得出现卷标题（老项目零感知）')
+    })
+
+    await testCase('X8 按卷导出：卷内无定稿章 / 卷不存在 → 明确报错', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷' }))
+        VolumeRepository.upsert(vol(2, 50, 60, { title: '第二卷' }))  // 50–60 章没定稿
+        setVolumes(VolumeRepository.getAll())
+        const { exportNovel } = await import('../../src/services/export-service')
+
+        const empty = await exportNovel({
+            format: 'txt', outputDir: path.join(tmpRoot, `exp-c-${dbSeq}`),
+            scope: 'volume', volumeNumber: 2,
+        })
+        assert(!empty.success && empty.error!.includes('没有已定稿的章节'), `实为：${empty.error}`)
+
+        const missing = await exportNovel({
+            format: 'txt', outputDir: path.join(tmpRoot, `exp-d-${dbSeq}`),
+            scope: 'volume', volumeNumber: 99,
+        })
+        assert(!missing.success && missing.error!.includes('第 99 卷不存在'), `实为：${missing.error}`)
+
+        const noNumber = await exportNovel({
+            format: 'txt', outputDir: path.join(tmpRoot, `exp-e-${dbSeq}`), scope: 'volume',
+        })
+        assert(!noNumber.success && noNumber.error!.includes('必须指定卷序号'), `实为：${noNumber.error}`)
+    })
+
+    await testCase('X9 Agent 路径：无蓝图 → full；已有蓝图 → 从最大章号+1 追加', async () => {
+        freshEnv()
+        seedArchitecture()
+        seedCharacter()
+        const { startWorkflowTool } = await import('../../src/services/agent/tools/start-workflow.tool')
+
+        // 先清空蓝图（freshEnv 默认播了 1–10 章）
+        getProjectDb()!.prepare('DELETE FROM blueprints').run()
+        stubLLM(['{"blueprints":[]}', '{"blueprints":[]}', '{"blueprints":[]}'])
+        const r1 = await startWorkflowTool.execute({ workflow: 'generate_blueprint' } as never)
+        assert(r1.success, `无蓝图时应放行 full：${r1.error}`)
+        assert(useWorkflowStore.getState().globalLogs.some(l => l.message.includes('全量')),
+            '无蓝图时应走全量生成')
+
+        // 已有蓝图：故意造一个**有缺口**的分布（1,2,90），验证起始章取「最大章号+1」
+        freshEnv()
+        seedArchitecture()
+        seedCharacter()
+        getProjectDb()!.prepare('DELETE FROM blueprints').run()
+        for (const c of [1, 2, 90]) {
+            getProjectDb()!.prepare(`INSERT INTO blueprints (chapter_number,title,key_events) VALUES (?,?,?)`)
+                .run(c, `第${c}章`, 'e')
+        }
+        setVolumes([vol(1, 1, 200, { title: '第一卷' })])
+        stubLLM(['{"blueprints":[]}', '{"blueprints":[]}'])
+        const r2 = await startWorkflowTool.execute({ workflow: 'generate_blueprint' } as never)
+        assert(r2.success, `已有蓝图时应允许追加：${r2.error}`)
+        const title = useWorkflowStore.getState().history[0]?.title
+            ?? useWorkflowStore.getState().activeRuns[0]?.title ?? ''
+        assert(title.includes('第 91 章'),
+            `起始章应为「最大章号 90 + 1」而非「条数 3 + 1」。实际标题：${title}`)
+    })
+
+    await testCase('X10 Agent 路径：非法入参一律拒绝，且一次模型都不调', async () => {
+        freshEnv()
+        seedArchitecture()
+        seedCharacter()
+        const { startWorkflowTool } = await import('../../src/services/agent/tools/start-workflow.tool')
+        const llm = stubLLM(['{"blueprints":[]}'])
+
+        // inputSchema 只是给模型看的提示，执行链不按它校验 → 必须运行时验
+        // 1e308 是关键一例：Number.isInteger(1e308) 为 true，但 1e308 + 1 === 1e308，
+        // 目录生成的 `cursor = actualMax + 1` 会永远不前进、循环卡死并持续调用模型。
+        // 只有 isSafeInteger 拦得住它
+        for (const bad of [0, -1, 1.5, '2', Number.POSITIVE_INFINITY, NaN, 1e308]) {
+            const r = await startWorkflowTool.execute(
+                { workflow: 'generate_blueprint', blueprint_start_chapter: bad } as never)
+            assert(!r.success, `blueprint_start_chapter=${String(bad)} 应被拒绝`)
+            assert(r.error!.includes('安全整数'), `实为：${r.error}`)
+        }
+        const rc = await startWorkflowTool.execute(
+            { workflow: 'generate_blueprint', blueprint_count: 0 } as never)
+        assert(!rc.success && rc.error!.includes('安全整数'), `实为：${rc.error}`)
+        // 两个参数各自安全、相加溢出
+        const rsum = await startWorkflowTool.execute({
+            workflow: 'generate_blueprint',
+            blueprint_start_chapter: Number.MAX_SAFE_INTEGER, blueprint_count: 10,
+        } as never)
+        assert(!rsum.success && rsum.error!.includes('超出可表示范围'), `实为：${rsum.error}`)
+
+        // ↓ 以下两例走的是**派生起点**那条路：省略 start 时起点由「已有蓝图最大章号 + 1」
+        //   算出，原来的校验只看显式入参，这条路径上根本没有 start 可校验。
+        //   （上一轮我声称 X10 已覆盖它们，其实没有——Codex 点出来的）
+
+        // ① 已有蓝图到第 10 章（freshEnv 播的），只传天文数字的 count
+        const rderived = await startWorkflowTool.execute({
+            workflow: 'generate_blueprint', blueprint_count: Number.MAX_SAFE_INTEGER,
+        } as never)
+        assert(!rderived.success && rderived.error!.includes('超出可表示范围'),
+            `省略 start + MAX_SAFE count 应被拒，实为：${JSON.stringify(rderived)}`)
+
+        // ② 已有蓝图最大章号本身就是 MAX_SAFE_INTEGER → 派生起点 +1 已不是安全整数
+        getProjectDb()!.prepare(
+            `INSERT INTO blueprints (chapter_number, title, key_events) VALUES (?,?,?)`
+        ).run(Number.MAX_SAFE_INTEGER, '边界章', 'e')
+        const rderived2 = await startWorkflowTool.execute(
+            { workflow: 'generate_blueprint', blueprint_count: 5 } as never)
+        assert(!rderived2.success && rderived2.error!.includes('推导出的起始章号非法'),
+            `派生起点自身越界应被拒，实为：${JSON.stringify(rderived2)}`)
+
+        assertEq(llm.calls, 0, '参数非法时不该发起任何模型调用')
+    })
+
+    await testCase('X11 Agent 路径：起始章落在已有蓝图上 → 拒绝覆盖', async () => {
+        freshEnv()
+        seedArchitecture()
+        seedCharacter()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const { startWorkflowTool } = await import('../../src/services/agent/tools/start-workflow.tool')
+        const llm = stubLLM(['{"blueprints":[]}'])
+        // freshEnv 已有 1–10 章蓝图，指定从第 5 章开始 = 要覆盖
+        const r = await startWorkflowTool.execute(
+            { workflow: 'generate_blueprint', blueprint_start_chapter: 5 } as never)
+        assert(!r.success, 'Agent 只能向后追加')
+        assert(r.error!.includes('已有蓝图'), `实为：${r.error}`)
+        assertEq(llm.calls, 0, '拒绝时不该调用模型')
+    })
+
+    await testCase('X12 蓝图写通道的 token 守卫：stale 直接拒写', async () => {
+        freshEnv()
+        const { saveAllBlueprints } = await import('../../src/services/workflows/directory-workflow')
+        const before = snapshot()
+        const res = await saveAllBlueprints(
+            [{ chapterNumber: 77, title: 'CROSS-77', role: '发展', purpose: '', keyEvents: '',
+               characters: [], suspenseHook: '', userGuidance: '', notes: '', notesUpdatedAt: '', targetWords: 0 }],
+            currentToken - 1,   // 上一个项目的旧 token
+        )
+        assert(!res.success && res.stale, `应判 stale，实为：${JSON.stringify(res)}`)
+        assertUnchanged(before, 'stale 时一条都不该写进来')
+    })
+
+    await testCase('X12b LLM 返回后、落库前切项目 → 该批拒写且整个生成中止', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const before = snapshot()
+        // 切换点在第 1 批**流到一半**时：此时流式预览写入正在路上、权威保存还没发。
+        // 两条写入路径各自带着旧 token，必须都被拒——只拦住其中一条，
+        // 另一条照样把 A 的章节灌进 B 的库
+        const batch1 = JSON.stringify({
+            blueprints: [11, 12].map(n => ({
+                chapterNumber: n, title: `INFLIGHT-${n}`, role: '发展', purpose: 'p',
+                characters: [], keyEvents: 'e', suspenseHook: 'h',
+            })),
+        })
+        const llmState = stubLLM([batch1, batch1, batch1], {
+            duringCall: (n) => {
+                if (n === 1) {
+                    currentToken += 1
+                    useProjectStore.setState({ currentToken } as never)
+                }
+            },
+        })
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 30 })
+        )
+        // 只跑一批是**正确**的：第 1 批的保存被 token 守卫拒绝后立即抛错中止，
+        // 不该继续往下跑——继续只会让后续批次一次次撞同一堵墙，
+        // 用户看到「一直在生成」却什么都没落库
+        assertEq(llmState.calls, 1, '写入被拒后应立即中止，不再发起后续批次')
+        const leaked = getProjectDb()!.prepare(
+            `SELECT COUNT(*) c FROM blueprints WHERE title LIKE 'INFLIGHT-%'`).get() as { c: number }
+        assertEq(leaked.c, 0, '在途批次的内容一条都不该落进切换后的项目')
+        assertUnchanged(before, '切项目后不得有任何写入')
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
+        assert(logs.includes('项目已切换'),
+            `工作流应如实失败并说明原因，实为：\n${logs.slice(-400)}`)
+    })
+
+    await testCase('X13 零卷导出是确定的，且不含任何分卷结构（非跨版本 golden 比对）', async () => {
+        // 基线：零卷项目导出一次
+        freshEnv()
+        seedArchitecture()
+        const { exportNovel } = await import('../../src/services/export-service')
+        const baseRes = await exportNovel({
+            format: 'merged-md', outputDir: path.join(tmpRoot, `base-${dbSeq}`), includeOutline: true,
+        })
+        assert(baseRes.success, `基线导出应成功：${baseRes.error}`)
+        const baseline = fs.readFileSync(baseRes.path!, 'utf-8')
+
+        // ⚠️ 这是**同一实现连跑两次互比**，证明的是「零卷路径确定、无分卷副作用」，
+        // **不是**与分卷前版本的逐字节比对——那需要一份钉死的 golden 输出，
+        // 而 golden 里含项目名/流派等夹具字段，维护成本高于收益。
+        // 真正锁住「与分卷前一致」的是 V1（architecture 拼装逐字节比对），
+        // 它比的是分卷改造前后同一段拼接逻辑的输出。
+        const againRes = await exportNovel({
+            format: 'merged-md', outputDir: path.join(tmpRoot, `base2-${dbSeq}`), includeOutline: true,
+        })
+        assert(againRes.success, `复跑应成功：${againRes.error}`)
+        assertEq(fs.readFileSync(againRes.path!, 'utf-8'), baseline, '零卷导出应完全确定')
+
+        // 关键断言：基线里既不含卷标题，也不含任何「卷」字样的结构性插入
+        assert(!baseline.includes('## 第1卷'), '零卷项目不得出现卷标题')
+        assert(baseline.includes(ARCH.synopsis), '零卷仍应包含全书大纲（与分卷前一致）')
+    })
+
+    await testCase('X14 导出：文件系统失败必须如实报错，不得谎报成功', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { exportNovel } = await import('../../src/services/export-service')
+        // 让 fs:write-file 返回 {success:false}（真实 controller 会把权限不足/磁盘满转成它）
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'fs:write-file') return { success: false, error: '磁盘已满' }
+            return realHandler(channel, ...args)
+        }
+        try {
+            const res = await exportNovel({
+                format: 'merged-md', outputDir: path.join(tmpRoot, `fail-${dbSeq}`),
+            })
+            assert(!res.success, '写盘失败时不得返回成功')
+            assert(res.error!.includes('磁盘已满'), `应透传底层原因，实为：${res.error}`)
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('X15 导出：卷名含冒号时正文标题保原样、文件名才净化', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 用半角冒号——它在 Windows 上是非法文件名字符；
+        // 全角「：」是合法的，拿它测等于要求净化一个本不该净化的字符
+        VolumeRepository.upsert(vol(1, 1, 5, { title: '第二卷: 南征' }))
+        VolumeRepository.upsert(vol(2, 6, 10, { title: '第三卷' }))
+        setVolumes(VolumeRepository.getAll())
+        const { exportNovel } = await import('../../src/services/export-service')
+        const res = await exportNovel({
+            format: 'merged-md', outputDir: path.join(tmpRoot, `colon-${dbSeq}`),
+            scope: 'volume', volumeNumber: 1,
+        })
+        assert(res.success, `导出应成功：${res.error}`)
+        assert(!res.path!.includes(': '), `文件名必须净化掉半角冒号：${res.path}`)
+        const content = fs.readFileSync(res.path!, 'utf-8')
+        assert(content.includes('第二卷: 南征'),
+            '正文标题应保留原始卷名——把技术约束（文件名净化）泄漏给读者是缺陷')
+    })
+
+    await testCase('X16 append 最终保存不得覆盖生成期间的并发编辑', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        // 工作流启动时会把 1–10 章快照进 context；生成期间用户改了第 3 章
+        stubLLM(['{"blueprints":[]}'], {
+            afterCall: () => {
+                getProjectDb()!.prepare(
+                    `UPDATE blueprints SET title = '用户生成期间改的标题' WHERE chapter_number = 3`
+                ).run()
+            },
+        })
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 2 })
+        )
+        const ch3 = getProjectDb()!.prepare(
+            'SELECT title FROM blueprints WHERE chapter_number = 3').get() as { title: string }
+        assertEq(ch3.title, '用户生成期间改的标题',
+            'append 只该写新生成的章节；把启动时的旧快照整份重写回去会覆盖用户的并发编辑')
+    })
+
+    await testCase('X17 Agent：前置检查之后切项目 → 中止，不拿 A 的结论去写 B', async () => {
+        freshEnv()
+        seedArchitecture()
+        seedCharacter()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const { startWorkflowTool } = await import('../../src/services/agent/tools/start-workflow.tool')
+        const llm = stubLLM(['{"blueprints":[]}'])
+        const before = snapshot()
+
+        // 让「查蓝图」这一步之后、工作流启动之前发生项目切换
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            if (channel === 'db:blueprint-get-all') {
+                currentToken += 1
+                useProjectStore.setState({ currentToken } as never)
+            }
+            return r
+        }
+        try {
+            const res = await startWorkflowTool.execute({ workflow: 'generate_blueprint' } as never)
+            assert(!res.success, '前置检查结论已失效，必须中止')
+            assert(res.error!.includes('项目已切换'), `实为：${res.error}`)
+            assertEq(llm.calls, 0, '不该发起任何模型调用')
+            assertUnchanged(before, '不得对新项目产生任何写入')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('X18 导出范围跨项目不残留：切到零卷项目后回落全书', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 5, { title: '第一卷' }))
+        VolumeRepository.upsert(vol(2, 6, 10, { title: '第二卷' }))
+        setVolumes(VolumeRepository.getAll())
+        const { exportNovel } = await import('../../src/services/export-service')
+
+        // 模拟「上个项目选了按卷/第 2 卷」的残留 state 直接提交到零卷项目：
+        // 服务层必须给出明确错误而不是静默导出错内容
+        freshEnv()
+        seedArchitecture()
+        useVolumeStore.setState({ volumes: [], status: 'ready' })
+        const res = await exportNovel({
+            format: 'txt', outputDir: path.join(tmpRoot, `stale-${dbSeq}`),
+            scope: 'volume', volumeNumber: 2,
+        })
+        assert(!res.success && res.error!.includes('第 2 卷不存在'),
+            `零卷项目收到残留的卷号必须明确报错，实为：${res.error}`)
+    })
+
+    await testCase('X19 split-md 第二次导出章节变少：不得混入上次的残留章节文件', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷' }))
+        setVolumes(VolumeRepository.getAll())
+        const { exportNovel } = await import('../../src/services/export-service')
+        const outDir = path.join(tmpRoot, `split-${dbSeq}`)
+
+        const r1 = await exportNovel({ format: 'split-md', outputDir: outDir, scope: 'volume', volumeNumber: 1 })
+        assert(r1.success, `第一次导出应成功：${r1.error}`)
+        assertEq(fs.readdirSync(r1.path!).length, 10, '第一次应写出 10 章')
+
+        // 卷号与卷名都不变，只把末章从 10 缩到 6（很常见：章节被退回草稿 / 手动调边界）。
+        // 若沿用固定目录名，上次的 chapter_7..10.md 会原地留着，
+        // 用户拿到的「本卷全文」混着已经不属于本次范围的四章
+        VolumeRepository.upsert(vol(1, 1, 6, { title: '第一卷' }))
+        setVolumes(VolumeRepository.getAll())
+        const r2 = await exportNovel({ format: 'split-md', outputDir: outDir, scope: 'volume', volumeNumber: 1 })
+        assert(r2.success, `第二次导出应成功：${r2.error}`)
+        assert(r2.path !== r1.path, `两次范围不同必须写进不同目录，实为同一个：${r2.path}`)
+        const files = fs.readdirSync(r2.path!).sort()
+        assertEq(files.length, 6, `第二次目录里应只有 6 章，实为：${files.join(',')}`)
+        assert(!files.includes('chapter_7.md'), '缩小后的范围里不该出现第 7 章')
+    })
+
+    await testCase('X20 append 生成期间编辑「第一批新章」，最终不得被陈旧副本覆盖', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const mk = (ns: number[], tag: string) => JSON.stringify({
+            blueprints: ns.map(n => ({
+                chapterNumber: n, title: `${tag}-${n}`, role: '发展', purpose: 'p',
+                characters: [], keyEvents: 'e', suspenseHook: 'h',
+            })),
+        })
+        // 两批：11–12 与 13–14。在第 2 批流到一半时，模拟用户回头编辑了
+        // **第 1 批刚生成的第 11 章**（改标题并保存）。
+        // 旧实现在工作流末尾把 context 里累计的 newBlueprints 整份重写，
+        // 那份副本里第 11 章还是模型给的原标题 → 用户的编辑被静默吞掉
+        stubLLM([mk([11, 12], 'GEN'), mk([13, 14], 'GEN')], {
+            duringCall: (n) => {
+                if (n === 2) {
+                    BlueprintRepository.upsertMany([{
+                        chapterNumber: 11, title: 'USER-EDITED-11', role: '发展', purpose: 'p',
+                        characters: [], keyEvents: 'e', suspenseHook: 'h',
+                        userGuidance: '', notes: '', notesUpdatedAt: '', targetWords: 0,
+                    }] as never)
+                }
+            },
+        })
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 4 })
+        )
+        assertEq(BlueprintRepository.getByChapter(11)!.title, 'USER-EDITED-11',
+            '生成期间对已落库新章的编辑不得被工作流末尾的陈旧副本覆盖')
+        assertEq(BlueprintRepository.getByChapter(14)!.title, 'GEN-14', '后续批次仍应正常落库')
+    })
+
+    await testCase('X21 导出途中切项目：不得写出任何文件', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷' }))
+        setVolumes(VolumeRepository.getAll())
+        const { exportNovel } = await import('../../src/services/export-service')
+        const outDir = path.join(tmpRoot, `switch-${dbSeq}`)
+
+        // 切换点必须落在**读完卷之后、写盘之前**——否则读卷那道复核先拦下，
+        // 本用例就证明不了「落盘前那道」的存在（这正是第一版写错的地方：
+        // 开跑前就切，删掉落盘前的复核它照样绿）
+        const clickToken = currentToken
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            const r = await realHandler(channel, ...args)
+            // 逐章读正文是几百次 IPC、可达数十秒，是真实世界里最可能被切走的那一段
+            if (channel === 'db:draft-get-full' && currentToken === clickToken) {
+                currentToken += 1
+                useProjectStore.setState({ currentToken } as never)
+            }
+            return r
+        }
+        try {
+            const res = await exportNovel({
+                format: 'split-md', outputDir: outDir, expectedToken: clickToken,
+            })
+            assert(!res.success && res.error!.includes('项目已切换'),
+                `切项目后应明确中止，实为：${JSON.stringify(res)}`)
+            assert(!fs.existsSync(outDir), `中止时一个文件都不该落盘，但目录已存在：${outDir}`)
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('X21b merged-md 全书大纲：复核之后不得再读项目库', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([])
+        const { exportNovel } = await import('../../src/services/export-service')
+        const outDir = path.join(tmpRoot, `switch2-${dbSeq}`)
+
+        // 切换点卡在 `fs:mkdir` 上——它排在「落盘前复核」之后。
+        // 若全书大纲的读取留在 merged-md 分支里（复核之后），
+        // 这一刀就能让 A 的目录里写进 B 的全书大纲：
+        // 复核只有当它之后不再碰项目数据库时才算数
+        const clickToken = currentToken
+        const realHandler = invokeHandler
+        let coreReadAfterSwitch = false
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:project-core-get' && currentToken !== clickToken) {
+                coreReadAfterSwitch = true
+            }
+            const r = await realHandler(channel, ...args)
+            if (channel === 'fs:mkdir' && currentToken === clickToken) {
+                currentToken += 1
+                useProjectStore.setState({ currentToken } as never)
+            }
+            return r
+        }
+        try {
+            const res = await exportNovel({
+                format: 'merged-md', outputDir: outDir,
+                includeOutline: true, expectedToken: clickToken,
+            })
+            assert(!coreReadAfterSwitch, '最后一道复核之后不得再读项目库（全书大纲必须提前读完）')
+            assert(res.success, `本例中切换发生在复核之后，导出应正常完成：${res.error}`)
+            const body = fs.readFileSync(res.path!, 'utf-8')
+            assert(body.includes(ARCH.synopsis), '写出的应是复核时那个项目的大纲')
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('X22 空项目：Agent 指定起始章必须明确拒绝，不得静默生成第 1 章起', async () => {
+        freshEnv()
+        seedArchitecture()
+        seedCharacter()
+        // 清空 freshEnv 播的 1–10 章蓝图，构造「一张蓝图都没有」的新项目
+        getProjectDb()!.prepare('DELETE FROM blueprints').run()
+        setVolumes([])
+        const { startWorkflowTool } = await import('../../src/services/agent/tools/start-workflow.tool')
+        const llm = stubLLM(['{"blueprints":[]}'])
+
+        // 空项目走 mode:'full'，而 full 的起点在命令里**写死为 1**——
+        // 旧实现直接丢掉 startChapter，于是「第 50 章起 10 章」被"成功受理"、
+        // 实际生成第 1–10 章：范围与所求完全不同，还白烧一次模型调用
+        const r = await startWorkflowTool.execute({
+            workflow: 'generate_blueprint',
+            blueprint_start_chapter: 50, blueprint_count: 10,
+        } as never)
+        assert(!r.success, `空项目指定第 50 章起必须被拒，实为：${JSON.stringify(r)}`)
+        assert(r.error!.includes('只能从第 1 章开始'), `错误应说明原因，实为：${r.error}`)
+        assertEq(llm.calls, 0, '被拒时不该发起任何模型调用')
+        assertEq(BlueprintRepository.getAll().length, 0, '被拒时不该写入任何蓝图')
+
+        // 显式传 1 是合法的，不能被上面那道误伤
+        const ok = await startWorkflowTool.execute({
+            workflow: 'generate_blueprint',
+            blueprint_start_chapter: 1, blueprint_count: 3,
+        } as never)
+        assert(ok.success, `空项目从第 1 章起应放行，实为：${JSON.stringify(ok)}`)
+    })
+
+    await testCase('X20b 同一批内：流式预览已落库并被用户编辑，整批保存不得盖回模型版本', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        // 一批四章，前两章会落在第一个 chunk 里（预览写入 → 编辑器立刻可见可改）
+        const batch = JSON.stringify({
+            blueprints: [11, 12, 13, 14].map(n => ({
+                chapterNumber: n, title: `MODEL-${n}`, role: '发展', purpose: 'p',
+                characters: [], keyEvents: 'e', suspenseHook: 'h',
+            })),
+        })
+        let previewLanded = false
+        stubLLM([batch], {
+            // 后半段只在 onDone 给：13–14 章绝不会被流式预览写入，
+            // 于是「第 14 章仍然落库」只可能来自整批补写那条路（否则断言是空转）
+            withholdTail: true,
+            duringCall: async () => {
+                // 等预览写入那条 .then 链落定（它是异步的，不等就跑在它前面）
+                for (let i = 0; i < 20 && !previewLanded; i++) {
+                    await new Promise(r => setTimeout(r, 0))
+                    previewLanded = !!BlueprintRepository.getByChapter(11)
+                }
+                // 用户在编辑器里改了刚出现的第 11 章并保存
+                if (previewLanded) {
+                    BlueprintRepository.upsertMany([{
+                        chapterNumber: 11, title: 'USER-EDITED-11', role: '发展', purpose: 'p',
+                        characters: [], keyEvents: 'e', suspenseHook: 'h',
+                        userGuidance: '', notes: '', notesUpdatedAt: '', targetWords: 0,
+                    }] as never)
+                }
+            },
+        })
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 4 })
+        )
+        // 前置条件必须在这里断言：duringCall 跑在 stub 的 async IIFE 里，
+        // 在那儿抛出只会变成 unhandled rejection，用例照样绿——
+        // 那样"预览没落库"就会伪装成"覆盖没发生"，是最坏的一种假通过
+        assert(previewLanded, '前置条件不成立：流式预览未把第 11 章落库，本用例测不到同批次窗口')
+        assertEq(BlueprintRepository.getByChapter(11)!.title, 'USER-EDITED-11',
+            '同一批内被用户编辑过的章节，整批保存不得用模型版本盖回')
+        // 第 14 章在后半段里、从未作为 chunk 推送过，故它落库只能来自整批补写。
+        // 这条不是锦上添花：「跳过已预览」写歪了就会变成「漏写」，而漏写比覆盖更难发现
+        assertEq(BlueprintRepository.getByChapter(14)?.title, 'MODEL-14',
+            '只在 onDone 出现的章节必须由整批保存补写')
+    })
+
+    await testCase('X20c 预览写入失败的章节，必须由整批保存补上（跳过≠漏写）', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const batch = JSON.stringify({
+            blueprints: [11, 12, 13, 14].map(n => ({
+                chapterNumber: n, title: `MODEL-${n}`, role: '发展', purpose: 'p',
+                characters: [], keyEvents: 'e', suspenseHook: 'h',
+            })),
+        })
+        stubLLM([batch])
+
+        // 让**第一次** upsert-many 失败（那是流式预览那次），后续放行。
+        // 「只补写未成功预览的章节」这条优化，若把失败也当成功登记，
+        // 这几章就永远不会被写进去——静默丢章，比覆盖更难发现
+        let upsertCalls = 0
+        const realHandler = invokeHandler
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:blueprint-upsert-many') {
+                upsertCalls += 1
+                if (upsertCalls === 1) return { success: false, error: '模拟的预览写入失败' }
+            }
+            return realHandler(channel, ...args)
+        }
+        try {
+            await useWorkflowStore.getState().startWorkflow(
+                createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 4 })
+            )
+            assert(upsertCalls >= 2, `前置条件不成立：预期至少两次写入（预览 + 整批），实为 ${upsertCalls}`)
+            for (const n of [11, 12, 13, 14]) {
+                assertEq(BlueprintRepository.getByChapter(n)?.title, `MODEL-${n}`,
+                    `第 ${n} 章必须落库——预览失败不该让它被跳过`)
+            }
+        } finally {
+            invokeHandler = realHandler
+        }
+    })
+
+    await testCase('X20d 推理段（<think>）里的临时蓝图不得被预览写入并顶掉正式答案', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const bp = (n: number, tag: string) => ({
+            chapterNumber: n, title: `${tag}-${n}`, role: '发展', purpose: 'p',
+            characters: [], keyEvents: 'e', suspenseHook: 'h',
+        })
+        // DeepSeek / Claude 的推理里出现「先草拟一版第 11 章」是常态。
+        // 流式预览若扫的是**未剥离**的原文，会把 THINK-11 先落库并登记为"已预览"，
+        // 正式答案里的 MODEL-11 随后被「已预览就跳过」滤掉 —— 库里永久留着推理版
+        const text =
+            `<think>我先草拟一下：${JSON.stringify([bp(11, 'THINK')])}，感觉不好，重来。</think>` +
+            JSON.stringify({ blueprints: [11, 12].map(n => bp(n, 'MODEL')) })
+        stubLLM([text])
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 2 })
+        )
+        assertEq(BlueprintRepository.getByChapter(11)?.title, 'MODEL-11',
+            '落库的必须是正式答案，不能是推理段里的临时版本')
+        assertEq(BlueprintRepository.getByChapter(12)?.title, 'MODEL-12', '第 12 章应正常落库')
+    })
+
+    await testCase('X23 定稿工作流的 token 在**构造时**捕获，不是执行时现取', async () => {
+        freshEnv()
+        const { createFinalizeWorkflow } = await import('../../src/services/workflows/chapter-workflow')
+        const mod = await import('../../src/services/workflows/commands/finalize-chapter.command')
+
+        // 拦下 execute，只记录「最终到达 Command 的是哪个 token」。
+        // X5 直接把旧 token 注入步骤，只证明守卫本身有效，
+        // 证明不了**传下来的确实是旧 token** —— 这条补的正是那一环
+        const seen: Array<number | undefined> = []
+        const realExec = mod.FinalizeChapterCommand.prototype.execute
+        mod.FinalizeChapterCommand.prototype.execute = async function (this: {
+            params: { capturedToken?: number }
+        }) { seen.push(this.params.capturedToken) }
+
+        const params = {
+            chapterNumber: 3, chapterTitle: '第三章',
+            draftPath: 'x.md', draftContent: '正文',
+        }
+        try {
+            // ① 不传 override：构造时就该把当时的 token 钉住
+            const atConstruction = currentToken
+            const def = createFinalizeWorkflow(params)
+            // 工作流是排队执行的，未必立刻跑；这期间用户切走了
+            currentToken += 1
+            useProjectStore.setState({ currentToken } as never)
+            await def.steps[0].executor(
+                {} as never, { data: {} } as never,
+                { log: () => {}, setProgress: () => {}, appendText: () => {} } as never)
+            assertEq(seen[0], atConstruction,
+                '构造时钉住的 token 必须原样传到 Command；执行时现取会拿到切换后项目的合法 token')
+
+            // ② 传 override（UI / Agent 在点击入口捕获的那个）：必须优先于构造时的现取
+            const clickToken = currentToken - 5
+            const def2 = createFinalizeWorkflow(params, clickToken)
+            await def2.steps[0].executor(
+                {} as never, { data: {} } as never,
+                { log: () => {}, setProgress: () => {}, appendText: () => {} } as never)
+            assertEq(seen[1], clickToken, '显式传入的入口 token 必须优先于构造时现取')
+        } finally {
+            mod.FinalizeChapterCommand.prototype.execute = realExec
+        }
+    })
+
+    await testCase('X23b 修复后处理工作流：同样必须用入口 token，不得构造时现取', async () => {
+        freshEnv()
+        seedArchitecture()
+        VolumeRepository.upsert(vol(1, 1, 10, { title: '第一卷', status: 'planned' }))
+        const { createRepairFinalizeWorkflow } = await import('../../src/services/workflows/chapter-workflow')
+
+        // 修复路径与普通定稿是两条独立的构造函数，各修各的——
+        // round-09 之前只修了普通定稿那条，修复这条照旧在 guard/import 之后才现取。
+        // 这里用「卷状态是否被改动」当探针：入口 token 已过期，那一步必须拒写
+        const clickToken = currentToken - 1   // 用户点「修复」时还在上一个项目
+        const def = createRepairFinalizeWorkflow(3, clickToken)
+        try {
+            await def.steps[0].executor(
+                {} as never, { data: {} } as never,
+                { log: () => {}, setProgress: () => {}, appendText: () => {} } as never)
+        } catch { /* 管线把步骤失败记账、不外抛；证据取自记账表（见下） */ }
+        assertEq(VolumeRepository.get(1)!.status, 'planned',
+            '入口 token 已过期时，修复流水线不得改动卷状态')
+        // 必须验失败原因**来自 token 守卫**：只断言"状态没变"是不够的——
+        // 任何一步提前炸掉都会让状态没变，用例就成了空转
+        const failed = getProjectDb()!.prepare(
+            `SELECT step_key, ok, error_msg FROM post_process_steps
+             WHERE step_key='volume_status'`
+        ).get() as { error_msg?: string } | undefined
+        assert(!!failed, '卷状态那步必须出现在记账表里（而不是根本没执行到）')
+        assertEq((failed as { ok?: number }).ok, 0, '卷状态那步必须被记为失败')
+        assert((failed!.error_msg ?? '').includes('项目已切换'),
+            `失败原因必须是项目已切换，实为：${failed!.error_msg}`)
     })
 
     // ===== 汇总 =====

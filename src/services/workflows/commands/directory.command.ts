@@ -87,6 +87,9 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
     const architectureBase = (context.data.architectureBase as string) || ''
     const coreSynopsis = (context.data.coreSynopsis as string) || ''
     const existingBlueprints = (context.data.existingBlueprints || []) as ChapterBlueprint[]
+    // 目录生成跨多批次、可达数分钟，且工作流不随项目关闭而取消。
+    // 每批写库都要带这个起点 token，主进程据此拒绝跨项目写入
+    const capturedToken = context.data.capturedToken as number | undefined
 
     const globalGuidance = project.novelConfig.globalGuidance || ''
     const genre = project.novelConfig.genre || ''
@@ -245,9 +248,15 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       callbacks.setProgress(Math.round(((cursor - startChapter) / total) * 90))
 
       // 批次内流式增量入库：边生成边抽出"已闭合的单个蓝图对象"逐条保存 + 通知编辑器，
-      // 让蓝图像草稿一样一条条动态出现（不必等整批 JSON 完成；与批次数无关，单批次也生效）。
-      // 仅作"预览写入"，本批最终会被下方权威整批保存覆盖。
+      // 让蓝图像草稿一样一条条动态出现（不必等整批 JSON 完成；与批次数也无关，单批次也生效）。
+      //
+      // ⚠️ 预览写入是**权威的**，不是"稍后会被覆盖的临时值"：
+      // 它一落库就发 REFRESH_RESOURCE，蓝图立刻出现在编辑器里，用户当场就能改并保存。
+      // 若下方整批保存把同一批的 `parsed` 再写一遍，就会用模型版本盖掉用户刚存的编辑——
+      // 而且窗口就在同一批之内（流到一半时用户已经能编辑最前面几章了）。
+      // 故记下**已成功预览写入**的章号，整批保存只补写它们之外的部分。
       const previewSaves: Promise<unknown>[] = []
+      const previewSavedOk = new Set<number>()
       let scanOffset = 0 // 增量扫描偏移：仅从上次解析到的位置继续，避免每 chunk 从头重扫
       const onStreamChunk = (fullSoFar: string) => {
         if (context.cancelled) return
@@ -267,8 +276,16 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
         }
         if (fresh.length > 0) {
           previewSaves.push(
-            saveAllBlueprints(fresh)
-              .then(() => globalEventBus.emit('REFRESH_RESOURCE', { resources: ['blueprints'] }))
+            saveAllBlueprints(fresh, capturedToken)
+              .then(r => {
+                // stale 说明项目已切换：不刷新、也不再往下写，交由权威整批保存那步抛错终止
+                if (r.success) {
+                  // 只有**确认写成功**的才登记：失败的必须留给下方整批保存补写，
+                  // 否则一次预览失败就等于这几章永久丢失
+                  for (const b of fresh) previewSavedOk.add(b.chapterNumber)
+                  globalEventBus.emit('REFRESH_RESOURCE', { resources: ['blueprints'] })
+                }
+              })
               .catch(() => { /* 预览写入失败由下方权威整批保存兜底 */ })
           )
         }
@@ -294,9 +311,22 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       const parsed = parseTextBlueprints(resultText, cursor, volumeScopeEnd)
       newBlueprints.push(...parsed)
 
-      // ==== 权威整批入库（确保最后落地）====
+      // ==== 权威整批入库：只补写**未成功预览写入**的章节 ====
+      // 已成功预览写入的章节此刻可能正被用户编辑（它们早已出现在编辑器里），
+      // 重写一遍等于用模型版本盖掉用户的编辑。两者内容本就同源——
+      // 预览抽的是"已闭合的完整对象"，与 parseTextBlueprints 解析的是同一份 JSON。
+      const toWrite = parsed.filter(b => !previewSavedOk.has(b.chapterNumber))
+      if (toWrite.length > 0) {
+        const saveRes = await saveAllBlueprints(toWrite, capturedToken)
+        if (!saveRes.success) {
+          // 必须中止整个生成：继续跑只会让后续批次一次次撞同一堵墙，
+          // 而用户看到的是「一直在生成」却什么都没落库
+          throw new Error(saveRes.stale
+            ? '项目已切换，本次目录生成已中止（未写入任何蓝图到新项目）'
+            : `蓝图保存失败：${saveRes.error ?? '未知错误'}`)
+        }
+      }
       if (parsed.length > 0) {
-        await saveAllBlueprints(parsed)
         useProjectStore.getState().refreshFileTree()
         globalEventBus.emit('REFRESH_RESOURCE', { resources: ['blueprints'] })
       }

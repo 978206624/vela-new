@@ -2,6 +2,7 @@ import type { WorkflowDefinition } from '../../stores/workflow-store'
 import type { DraftMeta } from '../draft-index'
 
 import type { DraftStatus } from '../../shared/draft-status'
+import { getProjectToken } from '../../stores/volume-store'
 
 // ==========================================
 // 1. 结构与类型导出 (保留对外的向后兼容)
@@ -221,7 +222,19 @@ export function createReviewOnlyWorkflow(params: ReviewOnlyParams): WorkflowDefi
   }
 }
 
-export function createFinalizeWorkflow(params: FinalizeOnlyParams): WorkflowDefinition {
+/**
+ * 定稿工作流。
+ *
+ * `capturedTokenOverride`：调用方在**点击入口、任何 await 之前**捕获的项目 token。
+ * UI 路径在 guard、confirm、读正文三个 await 之后才走到这里，Agent 路径也在
+ * 一串前置检查之后——等进了这个函数才捕获已经晚了。缺省时退化为在此捕获，
+ * 至少能挡住「构造之后、执行之前」那一段（工作流是排队执行的，未必立刻跑）。
+ */
+export function createFinalizeWorkflow(
+  params: FinalizeOnlyParams,
+  capturedTokenOverride?: number,
+): WorkflowDefinition {
+  const capturedToken = capturedTokenOverride ?? getProjectToken()
   const chapterInfo = { chapterNumber: params.chapterNumber, title: params.chapterTitle, role: '', purpose: '', characters: [], keyEvents: '' }
   return {
     type: 'chapter_creation',
@@ -237,6 +250,9 @@ export function createFinalizeWorkflow(params: FinalizeOnlyParams): WorkflowDefi
             draftContent: params.draftContent,
             chapterNumber: params.chapterNumber,
             chapterInfo,
+            // 显式传下去。Command 内部**不得**再自行 getProjectToken()——
+            // 那时已经隔了「排队 + 动态 import」两层延迟
+            capturedToken,
           })
           return cmd.execute({ step, context, callbacks })
         },
@@ -276,7 +292,18 @@ export function createFinalizeWorkflow(params: FinalizeOnlyParams): WorkflowDefi
  * 修复定稿后处理工作流 — 当定稿后的三路推演失败时可重跑
  * 从 manuscript/ 读取已定稿内容，重新执行 FinalizeChapterCommand 的后处理部分
  */
-export function createRepairFinalizeWorkflow(chapterNumber: number): WorkflowDefinition {
+export function createRepairFinalizeWorkflow(
+  chapterNumber: number,
+  capturedTokenOverride?: number,
+): WorkflowDefinition {
+  // ⚠️ token 优先取调用方在**点击入口、任何 await 之前**捕获的那个。
+  // 修复模式会重跑含 LLM 调用的后处理步骤，其中卷状态流转要写库；
+  // 到那时现取会拿到用户切换后的新项目 token。
+  //
+  // 只在构造时捕获**不够**：入口（DraftEditor.doRepairFinalize）在
+  // guard 查询 + 两次动态 import 之后才走到这里，那几个 await 期间切项目，
+  // 构造时取到的已经是 B 的合法 token 了。缺省仍现取，作为漏传时的下限。
+  const capturedToken = capturedTokenOverride ?? getProjectToken()
   return {
     type: 'chapter_creation',
     title: `🔧 修复后处理 — 第${chapterNumber}章`,
@@ -307,7 +334,7 @@ export function createRepairFinalizeWorkflow(chapterNumber: number): WorkflowDef
           const { buildFinalizePostProcessSteps } = await import('./commands/finalize-chapter.command')
           const { runPostProcessPipeline, getChapterFinalizeScope } = await import('./workflow-utils')
           const scope = getChapterFinalizeScope(chapterNumber)
-          const steps = buildFinalizePostProcessSteps(project, chapterNumber, chapterTitle, full.content)
+          const steps = buildFinalizePostProcessSteps(project, chapterNumber, chapterTitle, full.content, capturedToken)
 
           await runPostProcessPipeline(project.path, scope, `第${chapterNumber}章定稿`, steps, callbacks, { onlyFailed: true })
 
