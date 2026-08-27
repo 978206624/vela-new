@@ -43,9 +43,31 @@ export class BasePromptBuilder {
  * 提供全链条上下文强类型注入，拒绝 raw Record<string,string> 的 "盲打模式"
  */
 export class ChapterPromptBuilder extends BasePromptBuilder {
-  
+
   withArchitecture(architecture: string) {
     this.variables.architecture = architecture;
+    return this;
+  }
+
+  /**
+   * 本卷罗盘的**稳定部分**：卷名 + 本卷主线 + 高优先级未回收伏笔。
+   * 卷内跨章不变，放在模板前缀缓存区。单卷模式传空串，
+   * 模板的「（如有）」标题会被 finalizePrompt 整段裁掉。
+   */
+  withVolumeCompass(compass: string) {
+    this.variables.volume_compass = compass;
+    return this;
+  }
+
+  /**
+   * 本卷罗盘的**逐章部分**：本章位于卷内第几章。
+   *
+   * 与 withVolumeCompass 分开，是因为这一行**每章都变**。
+   * 若把它并进稳定段放到 prompt 最前，会让同卷相邻两章在开头几十字就分叉，
+   * 后面的时间线、角色状态、全局指导全部共享不到前缀缓存——比不注入还糟。
+   */
+  withVolumePosition(position: string) {
+    this.variables.volume_position = position;
     return this;
   }
 

@@ -131,11 +131,30 @@ export function getVolumeOutline(
 /**
  * 「本卷罗盘」的取数——目录生成（19.3a）与正文写作（19.3b）共用同一份口径。
  *
- * 与 `getVolumeOutline` 同属生成关键路径，故同样只吃 `VolumeSnapshot`：
+ * 与既有 `getVolumeOutline` 同属**生成关键路径**，故同样只吃 `VolumeSnapshot`：
  * 未就绪时 fail closed，绝不把「加载中」当成单卷模式。
  *
- * `value === null` 表示**真单卷模式**（零卷），调用方应整段跳过卷相关注入。
+ * 返回**判别联合**而非「数据 + 可空」：四种状态各有不同的正确处理方式，
+ * 用 `null` 或布尔标志表达会让调用方在其中两种之间做出错误分支
+ * （尤其「真单卷模式」与「有卷但本章无归属」必须区分——前者是正常形态，
+ *  后者是分卷边界有问题）。
  */
+export type VolumeCompassResult =
+    /** 真单卷模式（零卷）。所有卷相关注入整段跳过，老项目零感知 */
+    | { kind: 'single' }
+    /** 章号精确落在某卷闭区间内。罗盘完全可信 */
+    | { kind: 'exact'; volume: VolumeCompassData }
+    /**
+     * 章号不属于任何卷，回落到**它之前**最近的那一卷（末卷之后、或卷间缺口）。
+     * 主线与伏笔仍是最贴近的承接上下文，值得注入；但位置信息已失真，须略去。
+     */
+    | { kind: 'prior'; volume: VolumeCompassData }
+    /**
+     * 有卷，但本章位于首卷起点之前，**没有任何前序卷可回落**。
+     * 此时不存在「最近一卷」，任何注入都是编造，调用方必须整段跳过。
+     */
+    | { kind: 'unassigned' }
+
 export interface VolumeCompassData {
     volumeNumber: number
     title: string
@@ -161,34 +180,38 @@ export interface VolumeCompassData {
 export function getVolumeCompass(
     snap: VolumeSnapshot,
     chapterNumber: number,
-): VolumeQuery<VolumeCompassData | null> {
-    const nr = notReady<VolumeCompassData | null>(snap)
+): VolumeQuery<VolumeCompassResult> {
+    const nr = notReady<VolumeCompassResult>(snap)
     if (nr) return nr
     const vols = (snap as { volumes: VolumeData[] }).volumes
-    if (vols.length === 0) return { ready: true, value: null }
+    if (vols.length === 0) return { ready: true, value: { kind: 'single' } }
 
-    // 越界回落最后一卷，与 getVolumeOutline 保持同一口径：
-    // 正文写作时，首卷末章之后、尚未续卷的那几章仍应看到最后一卷的罗盘，而不是什么都没有。
-    //
-    // ⚠️ 但**目录生成不能接受这个回落**——它会让 prompt 同时出现
-    // 「共 60 章」与「推演第 61–63 章」，正是本 Task 要消除的矛盾指令。
-    // 故调用方须自行校验 chapterNumber 是否真的落在返回卷的闭区间内
-    // （`directory.command.ts` 就是这么做的，不命中即 fail closed）。
-    const vol = getCurrentVolume(vols, chapterNumber) ?? getLastVolume(vols)
-    if (!vol) return { ready: true, value: null }
+    const toData = (v: VolumeData): VolumeCompassData => ({
+        volumeNumber: v.volumeNumber,
+        title: v.title,
+        startChapter: v.startChapter,
+        endChapter: v.endChapter,
+        premise: v.premise ?? '',
+        openingState: v.openingState ?? '',
+        openThreads: v.openThreads,
+    })
 
-    return {
-        ready: true,
-        value: {
-            volumeNumber: vol.volumeNumber,
-            title: vol.title,
-            startChapter: vol.startChapter,
-            endChapter: vol.endChapter,
-            premise: vol.premise ?? '',
-            openingState: vol.openingState ?? '',
-            openThreads: vol.openThreads,
-        },
-    }
+    const exact = getCurrentVolume(vols, chapterNumber)
+    if (exact) return { ready: true, value: { kind: 'exact', volume: toData(exact) } }
+
+    // ⚠️ 回落只能朝**过去**方向找，不能一律取最后一卷。
+    // 卷区间允许存在缺口（仓储只禁止重叠，不保证连续），
+    // 卷一 1–10、卷二 15–60 时写第 12 章若取「最后一卷」，
+    // 拿到的是**未来**的卷二——正文会被提前注入还没写到的主线与伏笔，
+    // 而文案还称它「最近一卷」，是双重错误。
+    const prior = vols
+        .filter(v => v.endChapter < chapterNumber)
+        .reduce<VolumeData | null>((acc, v) => (!acc || v.endChapter > acc.endChapter ? v : acc), null)
+    if (prior) return { ready: true, value: { kind: 'prior', volume: toData(prior) } }
+
+    // 本章位于首卷起点之前，没有任何前序卷可回落。
+    // 此时不存在「最近一卷」，硬给就是编造——交给调用方整段跳过
+    return { ready: true, value: { kind: 'unassigned' } }
 }
 
 /**

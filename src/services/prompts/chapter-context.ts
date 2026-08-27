@@ -4,6 +4,8 @@ import { ChapterPromptBuilder } from './prompt-builder'
 import { ipc } from '../ipc-client'
 import { DIR_PROMPTS } from '../../shared/project-paths'
 import type { ChapterInfo } from '../workflows/chapter-workflow'
+import { useVolumeStore } from '../../stores/volume-store'
+import { getVolumeCompass, describeNotReady, type VolumeCompassResult } from '../volume-service'
 
 /** 章节草稿 Token 软预算（中文约 1.5 字符/token，预留 ~4K 给输出） */
 export const CHAPTER_TOKEN_BUDGET = 28000
@@ -122,6 +124,56 @@ async function readChapterNotesTimeline(currentChapter: number): Promise<string>
 }
 
 /**
+ * 把卷罗盘拆成**两段**返回，这是刻意的：
+ *
+ * - `stable`：卷名 + 主线 + high 伏笔。卷内跨章完全不变，放进前缀缓存区。
+ * - `position`：「本章位置：X / Y 章」。**每章都变**，必须放到所有可缓存内容之后。
+ *
+ * ⚠️ 不要把两者合成一段塞在模板最前面。那样看似「罗盘是卷级的所以稳定」，
+ * 实际因为其中含逐章变化的位置，prompt 会在开头几十字就分叉，
+ * 后面的时间线、角色状态、全局指导全都共享不到前缀——比不放还糟。
+ *
+ * 只取 **high** 优先级的未回收伏笔：正文一章一章写，把整卷几十条铺进来
+ * 会淹没本章任务，也把稳定前缀撑大。完整台账由目录生成那一侧消费。
+ */
+function formatVolumeCompass(
+  result: VolumeCompassResult,
+  chapterNumber: number,
+): { stable: string; position: string } {
+  // single = 真单卷模式（老项目零感知）；
+  // unassigned = 本章在首卷之前、没有任何前序卷可回落，硬给就是编造
+  if (result.kind === 'single' || result.kind === 'unassigned') return { stable: '', position: '' }
+
+  const v = result.volume
+  const lines: string[] = [`当前卷：${v.title}（第 ${v.startChapter}–${v.endChapter} 章）`]
+
+  if (result.kind === 'prior') {
+    lines.push('（本章尚未纳入任何卷，以上为**它之前**最近一卷的上下文，仅供承接参考）')
+  }
+
+  if (v.premise.trim()) {
+    lines.push(`\n【本卷主线目标与核心冲突】\n${v.premise.trim()}`)
+  }
+
+  const high = v.openThreads.filter(t => t.urgency === 'high')
+  if (high.length > 0) {
+    lines.push(
+      `\n【本卷必须回收的高优先级伏笔】\n` +
+      high.map(t => `- [第${t.chapter}章埋设] ${t.thread}`).join('\n') +
+      `\n（不必在本章强行回收；但本章若触及相关线索，不得写出与之矛盾的内容。）`
+    )
+  }
+
+  // 位置只在精确命中时给。prior 时本章不属于该卷，硬算会得到
+  // 「本卷第 51 / 40 章」这种自相矛盾的值，比不给更糟
+  const position = result.kind === 'exact'
+    ? `本章位置：${v.title} 第 ${chapterNumber - v.startChapter + 1} / ${v.endChapter - v.startChapter + 1} 章`
+    : ''
+
+  return { stable: lines.join('\n'), position }
+}
+
+/**
  * 拼装某章草稿的完整上下文，按「稳定前缀 → 可变后缀」排列（命中 LLM 上下文缓存）。
  *
  * 返回的 `builder` 即用于实际发送，`segments` 即上下文预览的数据源 —— 两者同源，
@@ -172,10 +224,36 @@ export async function buildChapterContext(
   }
   const userGuidance = chapterInfo.userGuidance?.trim() || '（无微操指导）'
 
+  // ---- 本卷罗盘 ----
+  // 拆成 stable（卷名/主线/伏笔，卷内跨章不变）与 position（本章位置，逐章变），
+  // 分别落在模板的缓存命中区与缓存失效区，详见 formatVolumeCompass 的注释。
+  //
+  // 未就绪时**不阻断写作**：正文生成不像目录生成那样会写坏分卷结构，
+  // 少一段罗盘只是上下文变弱；为此中断用户的写稿不划算
+  //（与目录侧的 fail closed 是有意的不同取舍）。
+  //
+  // ⚠️ 「是否真的会发送」由模板是否引用占位符决定——首章模板与用户自定义模板
+  // 都可能不含它。日志与预览分段必须用同一个 referenced 判据，
+  // 否则会出现「日志说已注入、实际没发」或「预览显示空卡片」这类预览≠执行。
+  const tmplText = `${template.content}\n${buildSystemConstraints(templateKey, {})}`
+  const referenced = (k: string) => tmplText.includes(`{{${k}}}`)
+
+  const compassQ = getVolumeCompass(useVolumeStore.getState().getSnapshot(), chapterInfo.chapterNumber)
+  const compassParts = compassQ.ready
+    ? formatVolumeCompass(compassQ.value, chapterInfo.chapterNumber)
+    : { stable: '', position: '' }
+  const volumeCompass = referenced('volume_compass') ? compassParts.stable : ''
+  const volumePosition = referenced('volume_position') ? compassParts.position : ''
+  // describeNotReady 自带「分卷数据…」前缀，此处不能再加一遍
+  if (!compassQ.ready) say(`  ⚠️ ${describeNotReady(compassQ.reason)}，本章不注入卷罗盘`)
+  else if (volumeCompass) say(`  🧭 已注入本卷罗盘（${volumeCompass.length} 字）`)
+
   // ---- 缓存命中区（跨章稳定，前缀对齐）----
   const builder = new ChapterPromptBuilder(template)
     .withArchitecture(architecture)
     .withGlobalGuidance(mergedGuidance)
+    .withVolumeCompass(volumeCompass)
+    .withVolumePosition(volumePosition)
     .withWritingStyle(writingStyle)
     .withNovelConfig(project.novelConfig)
     .withWordNumber(wordNumber)
@@ -229,11 +307,10 @@ export async function buildChapterContext(
   const estimatedTokens = estTokens(builder.build())
 
   // ===== 分段：只纳入模板真正引用的占位符，确保「预览 == 执行」 =====
-  // systemSuffix 必须取「实际会被注入的内置约束」——finalizePrompt 强制从内置取，
-  // 不看被覆盖模板的 systemSuffix。用 buildSystemConstraints(key,{}) 拿到原始占位符串
-  // （空变量不替换，{{user_guidance}}/{{word_number}} 等保留），与执行端完全同源。
-  const tmplText = `${template.content}\n${buildSystemConstraints(templateKey, {})}`
-  const referenced = (k: string) => tmplText.includes(`{{${k}}}`)
+  // tmplText / referenced 已在上方「本卷罗盘」处定义——日志、注入与预览分段
+  // 必须共用同一个判据，分两处各算一份迟早会漂移。
+  // 其中 systemSuffix 取的是**内置**约束（finalizePrompt 强制从内置取，
+  // 不看被覆盖模板的 systemSuffix），故与执行端完全同源。
   const seg = (
     key: string, label: string, description: string, zone: ContextZone, content: string
   ): ContextSegment | null => {
@@ -251,6 +328,15 @@ export async function buildChapterContext(
     // ---- 缓存命中区（跨章稳定）----
     seg('architecture', '四段架构', '世界观 / 角色定位 / 设定 / 主线', 'stable', architecture),
     seg('global_guidance', '全局指导 + 项目提示词', 'globalGuidance + .vela/prompts', 'stable', mergedGuidance),
+    // 卷内跨章稳定，故归入缓存命中区；首章模板没有 {{volume_compass}} 占位符，
+    // seg() 的 referenced() 过滤会自动让它不出现在预览里（不伪造未发送的内容）
+    // ⚠️ 内容为空时**不建分段**：模板里罗盘用的是「（如有）」标题形态，
+    // 值为空时 finalizePrompt 会把整段裁掉、实际根本不发送。
+    // 若照常建一个空分段，预览会显示「本卷罗盘 ~0（空）」——既破坏「预览==执行」，
+    // 也让单卷模式的老项目看见本不该出现的分卷卡片（零感知承诺）
+    volumeCompass.trim()
+      ? seg('volume_compass', '本卷罗盘', '本卷主线 + 高优先级未回收伏笔（卷内跨章稳定）', 'stable', volumeCompass)
+      : null,
     // 文风 / 字数：以 word_number 占位符判定是否纳入（写稿模板必含）
     referenced('word_number')
       ? { key: 'style_words', label: '文风 / 字数', description: '写作风格与目标字数约束', zone: 'stable', content: styleAndWords, tokens: estTokens(styleAndWords) }
@@ -258,6 +344,10 @@ export async function buildChapterContext(
     seg('global_summary', '章节要点时间线', '前文蓝图 notes（裁剪 ≤3000 字）', 'stable', chapterTimeline),
     seg('character_states', '角色动态状态', '所有角色当前状态档案', 'stable', characterState),
     // ---- 缓存失效区（逐章变化）----
+    // 逐章变化，故归缓存失效区——它正是「罗盘不能整段放前缀」的原因
+    volumePosition.trim()
+      ? seg('volume_position', '本章在卷内的位置', '第 X / Y 章（逐章变化）', 'volatile', volumePosition)
+      : null,
     seg('previous_ending', '上一章定稿末尾', '上一章结尾约 1000 字', 'volatile', isFirstChapter ? '' : (previousEnding || '（无前文）')),
     seg('chapter_info', '本章蓝图', `第${chapterInfo.chapterNumber}章 蓝图信息`, 'volatile', chapterInfoText),
     seg('future_blueprints', '后续 1-5 章蓝图', '防止剧情提前', 'volatile', futureBlueprintsStr),

@@ -669,8 +669,13 @@ export const BUILTIN_PROMPTS: PromptTemplate[] = [
       global_guidance: '全局写作要求',
       word_number: '目标字数',
       writing_style: '文风描述（可选）',
+      volume_compass: '本卷罗盘的稳定部分：卷名 + 本卷主线 + 高优先级未回收伏笔（单卷模式为空）',
+      volume_position: '本章在卷内的位置（逐章变化，故与罗盘分开放置）',
     },
     content: `你正在连载写作最新章节。
+
+【本卷罗盘（如有）】
+{{volume_compass}}
 
 【剧情记忆库与前置断点上下文】
 - [全局剧情进展]：{{global_summary}}
@@ -678,6 +683,9 @@ export const BUILTIN_PROMPTS: PromptTemplate[] = [
 - [近期三章简要]：{{short_summary}}
 ★【上一章结尾最后一小段（极其关键，起笔必须无缝衔接）】★：
 {{previous_ending}}
+
+【本章在本卷中的位置（如有）】
+{{volume_position}}
 
 【本章写作方向与核心任务】
 {{chapter_info}}

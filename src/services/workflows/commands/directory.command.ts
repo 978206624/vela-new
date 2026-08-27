@@ -65,7 +65,7 @@ function normalizeBlueprint(p: Record<string, unknown>): ChapterBlueprint {
   }
 }
 
-/** 把卷罗盘拼成 prompt 用的「本卷定位」文本。零卷（compass 为 null）返回空串 */
+/** 把卷罗盘拼成 prompt 用的「本卷定位」文本。单卷模式传 null，返回空串 */
 function formatVolumeContext(compass: VolumeCompassData | null): string {
   if (!compass) return ''
   return [
@@ -160,13 +160,17 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       if (!compassQ.ready) throw new Error(`无法确定第 ${cursor} 章所属卷：${describeNotReady(compassQ.reason)}`)
       const compass = compassQ.value
 
-      // ⚠️ getVolumeCompass 对「不属于任何卷」的章号会回落最后一卷——
-      // 那对正文写作是合理默认，对目录生成却会重新制造矛盾指令：
-      // 最后一卷止于 60 时生成 61–63，prompt 会同时出现「共 60 章」与「推演 61–63 章」，
-      // 还会写入无卷归属的蓝图。故此处必须校验 cursor 真的落在该卷闭区间内。
-      if (compass && (cursor < compass.startChapter || cursor > compass.endChapter)) {
+      // 目录生成**只接受精确命中**：prior（回落前一卷）与 unassigned（首卷之前）
+      // 都意味着 cursor 不属于任何卷，放行会让 prompt 同时出现
+      // 「共 60 章」与「推演第 61–63 章」，还会写入无卷归属的蓝图。
+      // 正常入口下走不到这里——整区间已由 checkRangeCoverage 前置校验过，
+      // 本条是纵深防御（若将来有人放宽前置校验，它仍能兜住）。
+      if (compass.kind === 'prior' || compass.kind === 'unassigned') {
+        const tail = compass.kind === 'prior'
+          ? `（最近一卷「${compass.volume.title}」止于第 ${compass.volume.endChapter} 章）`
+          : '（本章在首卷起点之前）'
         throw new Error(
-          `第 ${cursor} 章不属于任何卷（当前最后一卷「${compass.title}」止于第 ${compass.endChapter} 章）。` +
+          `第 ${cursor} 章不属于任何卷${tail}。` +
           `请先「续写下一卷」建立卷区间，或把生成范围收回到已有卷内`
         )
       }
@@ -174,7 +178,9 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       // 单批**不得横跨卷界**：卷一 1–10 时从第 8 章生成 6 章，
       // 若不夹住就会得到 8–12 这一批——用卷一的大纲、声明「共 10 章」，
       // 却要求生成属于卷二的第 11–12 章，与本 Task 要消除的矛盾指令同源
-      const volumeScopeEnd = compass ? Math.min(endChapter, compass.endChapter) : endChapter
+      // 上面已排除 prior / unassigned，此处只剩 single（单卷模式）与 exact
+      const vol = compass.kind === 'exact' ? compass.volume : null
+      const volumeScopeEnd = vol ? Math.min(endChapter, vol.endChapter) : endChapter
       const batchEnd = Math.min(cursor + batchSize - 1, volumeScopeEnd)
       callbacks.log(`  正在生成第 ${cursor}–${batchEnd} 章...`)
 
@@ -187,20 +193,20 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       // 「全书规模」在分卷模式下报**本卷末章**：报全书总章数会与
       // 「请推演第 N–M 章」形成矛盾指令——AI 一边被告知全书 500 章、
       // 一边只写到第 60 章，收尾节奏必然错乱（Spec §4.11 要消除的正是这个）
-      const scopeTotal = compass ? compass.endChapter : totalChapters
-      const volumeContext = formatVolumeContext(compass)
+      const scopeTotal = vol ? vol.endChapter : totalChapters
+      const volumeContext = formatVolumeContext(vol)
       // 零卷必须传空串而非 formatOpenThreads 的「（无未回收伏笔）」占位文案——
       // 模板标题用的是「（如有）」形态，finalizePrompt 只在值为空时才裁掉整段，
       // 传占位文案会给单卷模式留一个无意义的空台账小节
-      const openThreads = compass && compass.openThreads.length > 0
-        ? formatOpenThreads(compass.openThreads)
+      const openThreads = vol && vol.openThreads.length > 0
+        ? formatOpenThreads(vol.openThreads)
         : ''
 
       let prompt: string
       // legacy 全量模板一次性要求生成 1..endChapter，且没有 volume_context / open_threads
       // 两个占位符。分卷项目走这条会拿着第一卷的 architecture 生成整本书，
       // 后续批次再也切不回第二卷——故它只对**真零卷**开放
-      if (compass === null && cursor === 1 && this.params.mode === 'full') {
+      if (vol === null && cursor === 1 && this.params.mode === 'full') {
         const template = getPromptTemplate('chapter_blueprint')
         if (!template) throw new Error('模板丢失')
         prompt = new DirectoryPromptBuilder(template)

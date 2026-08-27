@@ -274,6 +274,16 @@ invokeHandler = async (channel, ...args) => {
         // 返回空目录即可——但**必须显式路由**，未知通道会直接抛错炸掉整个 harness
         case 'fs:list-dir':
             return []
+        // 正文上下文拼装（buildChapterContext）会用到的只读通道。
+        // 本 harness 只验证卷罗盘那一段，其余给最小可用返回值即可
+        case 'fs:read-file':
+            return { success: false, content: '' }
+        case 'db:draft-get-finalized':
+            return null
+        case 'db:draft-get-full':
+            return null
+        case 'kb:search':
+            return []
         case 'db:project-core-get': {
             const row = getProjectDb()!.prepare(`SELECT * FROM project_core WHERE id='main'`).get() as Record<string, string>
             return { premise: row.premise, worldbuilding: row.worldbuilding, charactersArch: row.characters_arch, synopsis: row.synopsis }
@@ -893,6 +903,162 @@ ${prompt.slice(0, 500)}`)
         assertUnchanged(before, '库不变')
         const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join('\n')
         assert(logs.includes('第 11–14 章不属于任何卷'), `应点名缺口区间，实为：\n${logs.slice(-400)}`)
+    })
+
+    console.log('\n▶ 正文卷罗盘（Task 19.3b）')
+
+    /** 拼一次正文上下文，返回 { 实际发送的 prompt, 预览分段 } */
+    async function buildDraftContext(chapterNumber: number) {
+        const { buildChapterContext } = await import('../../src/services/prompts/chapter-context')
+        const ctx = await buildChapterContext({ chapterNumber, title: `第${chapterNumber}章`, userGuidance: '' } as never)
+        return { prompt: ctx.builder.build(), segments: ctx.segments }
+    }
+
+    await testCase('C1 零卷（单卷模式）：罗盘不注入，预览里**也不出现空卡片**', async () => {
+        freshEnv()
+        seedArchitecture()
+        const { prompt, segments } = await buildDraftContext(5)
+        assert(!prompt.includes('【本卷罗盘（如有）】'), `不该残留罗盘标题：\n${prompt.slice(0, 500)}`)
+        assert(!prompt.includes('当前卷：'), '不该出现卷信息')
+        // 实际 prompt 已被 finalizePrompt 整段裁掉，预览就不能再显示「本卷罗盘 ~0（空）」——
+        // 那既破坏「预览==执行」，也让单卷模式的老项目看见本不该有的分卷卡片
+        assertEq(segments.find(s => s.key === 'volume_compass'), undefined, '预览不得有空的罗盘分段')
+        assertEq(segments.find(s => s.key === 'volume_position'), undefined, '预览不得有空的位置分段')
+    })
+
+    await testCase('C2 精确命中：卷名/主线/high 伏笔进**稳定段**，位置进**逐章段**', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷' }),
+            vol(2, 11, 60, {
+                title: '第二卷 · 北境风雪', premise: '本卷主线：夺回北境十三镇', status: 'writing',
+                openThreads: [
+                    { chapter: 3, thread: '玉佩来历未明', urgency: 'high' },
+                    { chapter: 7, thread: '师门旧怨', urgency: 'low' },
+                    { chapter: 9, thread: '粮道被断', urgency: 'high' },
+                ],
+            }),
+        ])
+        const { prompt, segments } = await buildDraftContext(15)
+        assert(prompt.includes('第二卷 · 北境风雪'), '应注入卷名')
+        assert(prompt.includes('本卷主线：夺回北境十三镇'), '应注入本卷主线')
+        assert(prompt.includes('玉佩来历未明') && prompt.includes('粮道被断'), '两条 high 伏笔都要注入')
+        assert(!prompt.includes('师门旧怨'),
+            'low 优先级不进正文罗盘——正文一章一章写，铺满整卷伏笔会淹没本章任务、也撑大稳定前缀')
+        // 第 15 章是卷二（11–60）的第 5 章，共 50 章
+        assert(prompt.includes('第 5 / 50 章'), `位置应为 5/50。实际：\n${prompt.slice(0, 800)}`)
+
+        const stable = segments.find(s => s.key === 'volume_compass')
+        const pos = segments.find(s => s.key === 'volume_position')
+        assertEq(stable?.zone, 'stable', '卷级内容归缓存命中区')
+        assertEq(pos?.zone, 'volatile', '逐章位置归缓存失效区')
+        assert(!stable!.content.includes('/ 50 章'), '位置绝不能混进稳定段——那正是破坏前缀缓存的原因')
+    })
+
+    await testCase('C2b 同卷相邻两章：稳定前缀逐字节一致，只有位置段不同', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷' }),
+            vol(2, 11, 60, { title: '第二卷', premise: '本卷主线：夺回北境', status: 'writing' }),
+        ])
+        const a = await buildDraftContext(15)
+        const b = await buildDraftContext(16)
+        const stableA = a.segments.find(s => s.key === 'volume_compass')!.content
+        const stableB = b.segments.find(s => s.key === 'volume_compass')!.content
+        assertEq(stableA, stableB, '同卷内罗盘稳定段必须逐字节一致，否则前缀缓存失效')
+        const posA = a.segments.find(s => s.key === 'volume_position')!.content
+        const posB = b.segments.find(s => s.key === 'volume_position')!.content
+        assert(posA !== posB, '位置段本来就该逐章变——正因如此它不能待在稳定段里')
+        assert(a.prompt.indexOf(stableA) < a.prompt.indexOf(posA),
+            '罗盘稳定段应排在逐章位置之前，否则「稳定前缀」名不副实')
+    })
+
+    await testCase('C3 末卷之后：回落前一卷，给主线与伏笔但**不给**失真位置', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([
+            vol(1, 1, 10, { title: '第一卷' }),
+            vol(2, 11, 50, {
+                title: '第二卷', premise: '本卷主线：夺回北境',
+                openThreads: [{ chapter: 3, thread: '玉佩来历未明', urgency: 'high' }],
+            }),
+        ])
+        const { prompt, segments } = await buildDraftContext(61)
+        assert(prompt.includes('本卷主线：夺回北境'), '回落时主线仍是最贴近的承接上下文')
+        assert(prompt.includes('玉佩来历未明'), '伏笔同样注入')
+        assert(prompt.includes('尚未纳入任何卷'), '必须如实告知这是回落上下文')
+        assertEq(segments.find(s => s.key === 'volume_position'), undefined,
+            '越界时位置会算成「第 51 / 40 章」这种自相矛盾的值，必须整段不给')
+    })
+
+    await testCase('C3b 卷间缺口：回落**前一卷**，绝不能拿到未来卷', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 卷一 1–10、卷二 15–60，第 12 章落在缺口里
+        setVolumes([
+            vol(1, 1, 10, {
+                title: '第一卷', premise: '卷一主线：夺回边镇',
+                openThreads: [{ chapter: 3, thread: '卷一埋的伏笔', urgency: 'high' }],
+            }),
+            vol(2, 15, 60, {
+                title: '第二卷', premise: '卷二主线：南征（本章还没写到这儿）',
+                openThreads: [{ chapter: 20, thread: '卷二才埋的伏笔', urgency: 'high' }],
+            }),
+        ])
+        const { prompt } = await buildDraftContext(12)
+        assert(prompt.includes('卷一主线：夺回边镇'), '缺口应回落到它**之前**的卷一')
+        assert(!prompt.includes('卷二主线：南征'),
+            '取「最后一卷」会拿到未来的卷二，等于把还没写到的主线提前泄给模型')
+        assert(!prompt.includes('卷二才埋的伏笔'), '未来卷的伏笔更不能提前注入')
+    })
+
+    await testCase('C3c 首卷之前无前序卷 → 整段不注入（不能编造「最近一卷」）', async () => {
+        freshEnv()
+        seedArchitecture()
+        // 首卷从第 5 章才开始，第 2 章在它之前，没有任何前序卷可回落
+        setVolumes([vol(1, 5, 60, { title: '第一卷', premise: '卷一主线' })])
+        const { prompt, segments } = await buildDraftContext(2)
+        assert(!prompt.includes('当前卷：'), '没有前序卷时任何注入都是编造')
+        assert(!prompt.includes('卷一主线'), '不得把未来的首卷当成「最近一卷」')
+        assertEq(segments.find(s => s.key === 'volume_compass'), undefined, '预览同样不显示')
+    })
+
+    await testCase('C4 分卷数据未就绪：不阻断写作，且日志不重复「分卷数据」', async () => {
+        freshEnv()
+        seedArchitecture()
+        useVolumeStore.setState({ volumes: [], status: 'loading' })
+        const logs: string[] = []
+        const { buildChapterContext } = await import('../../src/services/prompts/chapter-context')
+        const ctx = await buildChapterContext(
+            { chapterNumber: 15, title: '第15章', userGuidance: '' } as never,
+            (m: string) => logs.push(m),
+        )
+        // 与目录生成的 fail closed 是**有意的不同取舍**：正文生成不会写坏分卷结构
+        assert(ctx.builder.build().length > 0, '未就绪不应抛错')
+        assert(!ctx.builder.build().includes('当前卷：'), '未就绪时不注入罗盘')
+        const joined = logs.join('\n')
+        assert(joined.includes('分卷数据'), `应有未就绪提示，实为：${joined}`)
+        assert(!joined.includes('分卷数据分卷数据'),
+            `describeNotReady 自带「分卷数据」前缀，调用点不能再加一遍：${joined}`)
+    })
+
+    await testCase('C5 首章模板没有该占位符 → 不注入、预览不显示、日志不谎报', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 10, { title: '第一卷', premise: '卷一主线' })])
+        const logs: string[] = []
+        const { buildChapterContext } = await import('../../src/services/prompts/chapter-context')
+        const ctx = await buildChapterContext(
+            { chapterNumber: 1, title: '第1章', userGuidance: '' } as never,
+            (m: string) => logs.push(m),
+        )
+        assertEq(ctx.segments.find(s => s.key === 'volume_compass'), undefined,
+            'first_chapter_draft 未引用 {{volume_compass}}，预览不得显示该行')
+        assert(!ctx.builder.build().includes('当前卷：'), '首章 prompt 里也不该有罗盘')
+        assert(!logs.join('\n').includes('已注入本卷罗盘'),
+            '模板根本没引用该占位符，日志不能谎报「已注入」')
     })
 
     // ===== 汇总 =====
