@@ -75,6 +75,27 @@ export interface VolumeData {
 
 const VALID_STATUS: readonly string[] = ['planned', 'writing', 'done']
 
+/**
+ * 卷详情保存的 **patch**：只带用户这次实际改过的列。
+ *
+ * 刻意**没有 `closingState`**——详情表单里没有那一栏，能改它的只有续卷事务
+ * 与定稿后处理。其余列全部可选，缺席即「本次不动这一列」。
+ *
+ * `startChapter` / `endChapter` **必须成对出现或都不出现**：区间重叠校验需要
+ * 完整区间，只给一端无法判断（`updateDetail` 会拒绝半截的边界）。
+ */
+export interface VolumeDetailPatch {
+    volumeNumber: number
+    title?: string
+    startChapter?: number
+    endChapter?: number
+    premise?: string
+    synopsis?: string
+    openingState?: string
+    status?: VolumeStatus
+    openThreads?: OpenThread[]
+}
+
 /** 库未打开时统一抛错，避免写方法静默 return void 被上层当成功 */
 function requireDb() {
     const db = getProjectDb()
@@ -109,7 +130,7 @@ function assertValidStatus(status: unknown, volumeNumber: number): VolumeStatus 
  *    都会跑 9 千万亿次、把应用冻死。主要防线是让那些地方改成按实际记录遍历，
  *    但那要求每一处都记得这么写；这道上限是不依赖记性的兜底。
  */
-function assertValidRange(data: VolumeData): void {
+function assertValidRange(data: Pick<VolumeData, 'volumeNumber' | 'startChapter' | 'endChapter'>): void {
     if (!Number.isSafeInteger(data.volumeNumber) || data.volumeNumber < 1) {
         throw new Error(`卷序号非法：${data.volumeNumber}（须为 ≥1 的安全整数）`)
     }
@@ -143,6 +164,48 @@ function rowToData(row: VolumeRow): VolumeData {
         closingState: row.closing_state,
         openThreads: parseOpenThreads(row.open_threads),
         status: coerceStatusForRead(row.status),
+    }
+}
+
+/**
+ * 事务内的两道**需要查库**的边界校验，`upsert` 与 `updateDetail` 共用。
+ *
+ * 抽出来是因为两条写入路径必须适用**同一套**规则：各写一份的话，
+ * 分叉的那份会放行另一条路径要拒绝的边界，而「只有最后一卷能改边界」
+ * 一旦被绕过，夹在中间的章节就失去归属，且没有任何报错。
+ */
+function assertBoundaryWritable(
+    db: ReturnType<typeof requireDb>,
+    data: Pick<VolumeData, 'volumeNumber' | 'startChapter' | 'endChapter'>,
+): void {
+    // 区间重叠校验：与除自身外的任何卷都不得有交集
+    const overlap = db.prepare(`
+        SELECT volume_number, start_chapter, end_chapter FROM volumes
+        WHERE volume_number != ? AND start_chapter <= ? AND end_chapter >= ?
+        LIMIT 1
+      `).get(data.volumeNumber, data.endChapter, data.startChapter) as
+        { volume_number: number; start_chapter: number; end_chapter: number } | undefined
+    if (overlap) {
+        throw new Error(
+            `第 ${data.volumeNumber} 卷区间 ${data.startChapter}–${data.endChapter} 与第 ${overlap.volume_number} 卷` +
+            `（${overlap.start_chapter}–${overlap.end_chapter}）重叠`
+        )
+    }
+
+    // 改动既有卷的章号边界时，只允许最后一卷：
+    // 改中间卷的边界会让夹在其中的章节失去归属（对齐「仅允许修改最新定稿章节」的线性约束）
+    const existing = db.prepare(
+        'SELECT start_chapter, end_chapter FROM volumes WHERE volume_number = ?'
+    ).get(data.volumeNumber) as { start_chapter: number; end_chapter: number } | undefined
+
+    if (existing && (existing.start_chapter !== data.startChapter || existing.end_chapter !== data.endChapter)) {
+        const maxRow = db.prepare('SELECT MAX(volume_number) as maxNum FROM volumes')
+            .get() as { maxNum: number | null }
+        if ((maxRow?.maxNum ?? 0) !== data.volumeNumber) {
+            throw new Error(
+                `只有最后一卷可以修改章号边界；第 ${data.volumeNumber} 卷不是最后一卷（当前最后一卷为第 ${maxRow?.maxNum} 卷）`
+            )
+        }
     }
 }
 
@@ -191,35 +254,7 @@ export class VolumeRepository {
         const db = requireDb()
 
         const tx = db.transaction(() => {
-            // 区间重叠校验：与除自身外的任何卷都不得有交集
-            const overlap = db.prepare(`
-        SELECT volume_number, start_chapter, end_chapter FROM volumes
-        WHERE volume_number != ? AND start_chapter <= ? AND end_chapter >= ?
-        LIMIT 1
-      `).get(data.volumeNumber, data.endChapter, data.startChapter) as
-                { volume_number: number; start_chapter: number; end_chapter: number } | undefined
-            if (overlap) {
-                throw new Error(
-                    `第 ${data.volumeNumber} 卷区间 ${data.startChapter}–${data.endChapter} 与第 ${overlap.volume_number} 卷` +
-                    `（${overlap.start_chapter}–${overlap.end_chapter}）重叠`
-                )
-            }
-
-            // 改动既有卷的章号边界时，只允许最后一卷：
-            // 改中间卷的边界会让夹在其中的章节失去归属（对齐「仅允许修改最新定稿章节」的线性约束）
-            const existing = db.prepare(
-                'SELECT start_chapter, end_chapter FROM volumes WHERE volume_number = ?'
-            ).get(data.volumeNumber) as { start_chapter: number; end_chapter: number } | undefined
-
-            if (existing && (existing.start_chapter !== data.startChapter || existing.end_chapter !== data.endChapter)) {
-                const maxRow = db.prepare('SELECT MAX(volume_number) as maxNum FROM volumes')
-                    .get() as { maxNum: number | null }
-                if ((maxRow?.maxNum ?? 0) !== data.volumeNumber) {
-                    throw new Error(
-                        `只有最后一卷可以修改章号边界；第 ${data.volumeNumber} 卷不是最后一卷（当前最后一卷为第 ${maxRow?.maxNum} 卷）`
-                    )
-                }
-            }
+            assertBoundaryWritable(db, data)
 
             db.prepare(`
         INSERT INTO volumes (
@@ -251,6 +286,108 @@ export class VolumeRepository {
             )
         })
         tx()
+    }
+
+    /**
+     * 卷详情编辑器的**脏字段**更新：只写用户这次实际改过的列。
+     *
+     * ## 为什么不复用 `upsert`（整行写）
+     *
+     * 两条独立的丢失路径，`upsert` 都挡不住：
+     *
+     * ① **表单里没有的列**。详情表单没有「收卷状态」，整行写会让渲染层
+     *    几分钟前的 `closing_state` 快照覆盖掉续卷事务刚写入的收束报告——
+     *    用户看不到那一栏，也就无从察觉自己抹掉了什么。
+     * ② **表单里有、但用户没改的列**。`status` 由末章定稿自动流转、
+     *    `open_threads` 由续卷事务写入 AI 新提炼的清单。而表单一旦变脏就
+     *    **拒绝**同步后台刷新（否则会吃掉用户正在打的字），于是「字段在界面上」
+     *    并不等于「用户看到的是最新值」。用户只改了卷大纲却整表提交，
+     *    就会把旧的 status / openThreads 写回去，静默撤销后台结果。
+     *
+     * 故本方法收的是 **patch**：没出现在 patch 里的列一个字都不动。
+     * 这比加 revision/CAS 便宜（不必动 migration），而且语义更准——
+     * 冲突根本不会发生，因为两边写的是不相交的列。
+     *
+     * 章号两端**必须成对出现**：重叠校验需要完整区间，只给一端无法判断。
+     * 它们也确实只有用户会改（续卷只新建卷，不动既有卷的边界）。
+     *
+     * @returns 事务后的**完整卷记录**；不命中返回 `null`（详情编辑只作用于已存在的卷，
+     *   由 handler 转成「这一卷已不存在」而不是静默插入一条新卷）。
+     *
+     *   ⚠️ 返回整行而不是布尔，是为了让渲染层能**直接把它合并进 store**。
+     *   早先渲染层靠写完再发一次 `loadAll()` 来刷新，而那次刷新可能读失败、
+     *   也可能被后续请求的序号顶掉——两种情况下 store 里都还是旧行，
+     *   但保存已被判定成功、草稿被清空，于是留下一个「没有脏标记的旧表单」；
+     *   用户接着编辑界面上那份旧值再保存，就把后台的新值覆盖了。
+     */
+    static updateDetail(patch: VolumeDetailPatch): VolumeData | null {
+        if (!Number.isSafeInteger(patch.volumeNumber) || patch.volumeNumber < 1) {
+            throw new Error(`卷序号非法：${patch.volumeNumber}（须为 ≥1 的安全整数）`)
+        }
+
+        const sets: string[] = []
+        const params: Array<string | number> = []
+
+        if (patch.title !== undefined) { sets.push('title = ?'); params.push(patch.title) }
+        if (patch.premise !== undefined) { sets.push('premise = ?'); params.push(patch.premise) }
+        if (patch.synopsis !== undefined) { sets.push('synopsis = ?'); params.push(patch.synopsis) }
+        if (patch.openingState !== undefined) { sets.push('opening_state = ?'); params.push(patch.openingState) }
+        if (patch.status !== undefined) {
+            sets.push('status = ?')
+            params.push(assertValidStatus(patch.status, patch.volumeNumber))
+        }
+        if (patch.openThreads !== undefined) {
+            sets.push('open_threads = ?')
+            params.push(serializeOpenThreads(patch.openThreads, patch.volumeNumber))
+        }
+
+        const hasStart = patch.startChapter !== undefined
+        const hasEnd = patch.endChapter !== undefined
+        if (hasStart !== hasEnd) {
+            // 只给一端就做不了重叠校验，也无法判断区间长度。
+            // 与其按库里的旧值补齐（那等于用一份可能过期的快照参与校验），不如直接拒绝
+            throw new Error('修改卷边界时必须同时提供起始章与结束章')
+        }
+        if (hasStart && hasEnd) {
+            assertValidRange({
+                volumeNumber: patch.volumeNumber,
+                startChapter: patch.startChapter!,
+                endChapter: patch.endChapter!,
+            })
+            sets.push('start_chapter = ?', 'end_chapter = ?')
+            params.push(patch.startChapter!, patch.endChapter!)
+        }
+
+        if (sets.length === 0) {
+            throw new Error(`第 ${patch.volumeNumber} 卷的保存载荷为空：没有任何字段需要更新`)
+        }
+
+        const db = requireDb()
+        const tx = db.transaction(() => {
+            const exists = db.prepare('SELECT 1 FROM volumes WHERE volume_number = ?')
+                .get(patch.volumeNumber)
+            if (!exists) return null
+
+            if (hasStart && hasEnd) {
+                assertBoundaryWritable(db, {
+                    volumeNumber: patch.volumeNumber,
+                    startChapter: patch.startChapter!,
+                    endChapter: patch.endChapter!,
+                })
+            }
+
+            // ⚠️ SET 列表由 patch 决定，且**永远不含 closing_state**。
+            // 这不是遗漏，是本方法存在的理由之一
+            const info = db.prepare(
+                `UPDATE volumes SET ${sets.join(', ')}, updated_at = datetime('now') WHERE volume_number = ?`
+            ).run(...params, patch.volumeNumber)
+            if (info.changes === 0) return null
+            // 在**同一事务内**读回，保证返回的就是这次写入后的状态
+            const row = db.prepare('SELECT * FROM volumes WHERE volume_number = ?')
+                .get(patch.volumeNumber) as VolumeRow | undefined
+            return row ? rowToData(row) : null
+        })
+        return tx() as VolumeData | null
     }
 
     /**

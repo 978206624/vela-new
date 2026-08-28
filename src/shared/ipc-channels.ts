@@ -374,7 +374,7 @@ export interface ModelProfile {
 // ===== 引入 DB 类型 =====
 import type { ProjectCoreData, ProjectCorePatch } from '../../electron/repositories/project-core-repository'
 import type { BlueprintData } from '../../electron/repositories/blueprint-repository'
-import type { VolumeData, VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
+import type { VolumeData, VolumeStatus, OpenThread, VolumeDetailPatch } from '../../electron/repositories/volume-repository'
 import type { CommitNextVolumePayload, CommitNextVolumeResult, FirstVolumeInspection } from '../../electron/repositories/volume-commit'
 import type { CharacterData, CharacterStateData } from '../../electron/repositories/character-repository'
 import type { DraftMeta, DraftFull } from '../../electron/repositories/draft-repository'
@@ -473,6 +473,23 @@ export interface DatabaseChannels {
   'db:volume-get': { args: [volumeNumber: number]; return: VolumeData | null }
   'db:volume-get-by-chapter': { args: [chapterNumber: number]; return: VolumeData | null }
   'db:volume-upsert': { args: [data: VolumeData, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
+  /**
+   * 卷详情编辑器的**字段范围**更新：载荷刻意**不含 `closingState`**。
+   *
+   * 详情表单里没有「收卷状态」这一栏，走整行 `upsert` 会让渲染层的旧快照
+   * 覆盖掉续卷事务并发写入的收束报告，而用户看不到那一栏、无从察觉。
+   * 与 Task 19.5 关掉的 `project:save` lost update 同类，修法也同源：不写自己不展示的字段。
+   */
+  'db:volume-update-detail': {
+    args: [patch: VolumeDetailPatch, expectedToken?: number]
+    /**
+     * 成功时**带回事务后的完整卷记录**，供渲染层直接合并进 store。
+     * 靠写完再发一次 `db:volume-get-all` 是不够的：那次刷新可能读失败、
+     * 也可能被后续请求顶掉，而保存已判定成功、草稿已清空，
+     * 留下的就是一个「没有脏标记的旧表单」。
+     */
+    return: { success: boolean; stale?: boolean; error?: string; volume?: VolumeData }
+  }
   'db:volume-update-status': { args: [volumeNumber: number, status: VolumeStatus, expectedToken?: number]; return: { success: boolean; stale?: boolean; error?: string } }
   /** 原子卷状态流转：按章号定位卷、判定并条件更新，全在一个事务内 */
   'db:volume-advance-status': {

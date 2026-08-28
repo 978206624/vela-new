@@ -1,4 +1,9 @@
 import { create } from 'zustand'
+// 静态引入而非动态 import：动态 import 一旦抛错会被 .catch 吞掉，
+// 「放弃修改并关闭」就会静默失效（Task 19.5 已经在 toast 上栽过同一个坑）。
+// 两个模块都不反向依赖 editor-store，没有循环
+import { discardVolumeDraftForTab } from './volume-draft-store'
+import { getProjectToken } from './volume-store'
 
 /** 编辑器 Tab 数据 */
 export interface EditorTab {
@@ -62,6 +67,23 @@ interface EditorState {
    * 在保存成功后调用，使警示灯、Tab 圆点消失。
    */
   markTabSaved: (tabId: string) => void
+  /**
+   * 直接设置 Tab 的 dirty 标记（不碰 content）。
+   *
+   * `updateTabContent` 会顺带把 content 写掉，只适合「内容就在 tab 上」的编辑器。
+   * 而卷详情这类**自己持有表单状态**的编辑器需要的只是「让 Tab 亮起未保存圆点」——
+   * 不给这条通道的话，它们要么滥用 updateTabContent 写一份假 content，
+   * 要么就享受不到关闭 Tab / ⌘W / 批量关闭时的未保存确认。
+   */
+  setTabDirty: (tabId: string, dirty: boolean) => void
+  /**
+   * 只改已存在 Tab 的标题，**不激活、不新建**。
+   *
+   * 保存成功后要让标签页文案跟上改过的卷名，但不能为此调 `openFile`——
+   * 那会把用户在保存在途期间**刚关掉**的 Tab 重新创建出来，或把当前焦点抢走。
+   * 找不到 Tab 时静默返回：那说明它已经被关了，本来就没有标题要改。
+   */
+  renameTab: (tabId: string, name: string) => void
   /** 清空所有 Tab */
   clearTabs: () => void
 }
@@ -106,6 +128,14 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
     // pinned Tab 不可关闭
     const target = tabs.find((t) => t.id === tabId)
     if (target?.pinned) return
+    // 卷详情 Tab 关掉就丢弃它的未保存草稿。
+    // 关闭路径有五条（单个 / ⌘W / 关闭其他 / 关闭右侧 / 关闭所有），
+    // 全都汇到这里；各路径自己记得清一遍迟早漏一条，而漏掉的那条会让
+    // 「放弃修改并关闭」变成假的——内容还在，重开就复活，且新 Tab 没有脏标记，
+    // 下一次关闭连确认都不弹
+    if (target?.type === 'volume') {
+      discardVolumeDraftForTab(tabId, getProjectToken())
+    }
     const newTabs = tabs.filter((t) => t.id !== tabId)
     set({
       tabs: newTabs,
@@ -136,6 +166,18 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   markTabSaved: (tabId) => {
     set((s) => ({
       tabs: s.tabs.map((t) => t.id === tabId ? { ...t, dirty: false } : t),
+    }))
+  },
+
+  setTabDirty: (tabId, dirty) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) => t.id === tabId ? { ...t, dirty } : t),
+    }))
+  },
+
+  renameTab: (tabId, name) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) => t.id === tabId ? { ...t, name } : t),
     }))
   },
 

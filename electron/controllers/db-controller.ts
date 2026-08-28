@@ -11,7 +11,7 @@ import { DraftRepository } from '../repositories/draft-repository'
 import { RevisionRepository } from '../repositories/revision-repository'
 import { ReviewRepository } from '../repositories/review-repository'
 import { PostProcessRepository } from '../repositories/post-process-repository'
-import { VolumeRepository, VolumeData, VolumeStatus, OpenThread } from '../repositories/volume-repository'
+import { VolumeRepository, VolumeData, VolumeStatus, OpenThread, type VolumeDetailPatch } from '../repositories/volume-repository'
 import { commitNextVolume, inspectFirstVolume, type CommitNextVolumePayload } from '../repositories/volume-commit'
 
 // 沿用的旧表
@@ -550,6 +550,26 @@ ipcMain.handle('db:revision-create', async (_event, params: {
       return { success: true }
     } catch (err) {
       console.error('[db:volume-upsert] 失败:', err)
+      return { success: false, error: String(err) }
+    }
+  })
+
+  /**
+   * 卷详情保存 —— **字段范围**更新，载荷不含 `closingState`。
+   * 走整行 upsert 会让详情里看不见的收卷状态被渲染层旧快照覆盖
+   * （见 `VolumeRepository.updateDetail` 的说明）。
+   */
+  ipcMain.handle('db:volume-update-detail', async (_event, patch: VolumeDetailPatch, expectedToken?: number) => {
+    if (expectedToken === undefined || getCurrentProjectToken() !== expectedToken) {
+      return { success: false, stale: true }
+    }
+    try {
+      const volume = VolumeRepository.updateDetail(patch)
+      if (!volume) return { success: false, error: `第 ${patch.volumeNumber} 卷不存在，无法保存` }
+      // 带回整行：渲染层据此直接合并进 store，不依赖另一次可能失败的全量刷新
+      return { success: true, volume }
+    } catch (err) {
+      console.error('[db:volume-update-detail] 失败:', err)
       return { success: false, error: String(err) }
     }
   })

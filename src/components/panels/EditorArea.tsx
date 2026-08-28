@@ -13,6 +13,7 @@ import WorldBuildingEditor from '../editor/WorldBuildingEditor'
 import ArchFileViewer from '../editor/ArchFileViewer'
 import DraftEditor from '../editor/DraftEditor'
 import VersionHistory from '../editor/VersionHistory'
+import VolumeEditor from '../editor/VolumeEditor'
 import ReviewReport from '../editor/ReviewReport'
 import ThreeWayMerge from '../editor/ThreeWayMerge'  // 保留引用以防其他入口使用
 import WelcomePage from '../pages/WelcomePage'
@@ -673,6 +674,9 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
         )}
         {activeTab?.type === 'volume-overview' && (
           <VolumeOverview />
+        )}
+        {activeTab?.type === 'volume' && (
+          <VolumeEditor key={activeTab.id} volumeNumber={activeTab.volumeNumber} />
         )}
         {activeTab?.type === 'review-report' && activeTab.content && (
           <ReviewReport

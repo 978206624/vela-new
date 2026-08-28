@@ -8,8 +8,8 @@
  * - **有卷**：卷卡片列表（卷名 / 状态徽章 / 章号范围 / 已写 / 进度条）。
  *
  * 右上角 `+` 触发续卷向导；点击分组标题打开「分卷总览」页，
- * 点击卷卡片打开该卷的**详情 Tab**（`type:'volume'`）。
- * 详情 Tab 的渲染组件由后续 Task 接入，本组件只负责路由。
+ * 点击卷卡片打开该卷的**详情 Tab**（`type:'volume'`，由 `EditorArea` 渲染
+ * `VolumeEditor`）。本组件只负责路由，不关心详情页内部。
  */
 import { useEffect } from 'react'
 import { Plus, Layers } from 'lucide-react'

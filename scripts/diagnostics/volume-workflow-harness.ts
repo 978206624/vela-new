@@ -125,6 +125,21 @@ function assertUnchanged(before: string, what: string): void {
     }
 }
 
+/**
+ * 等一个 promise 在给定毫秒内 settle，超时返回 false。
+ *
+ * 用在那些「回归会表现为**挂住**而不是抛错」的地方：直接 await 会让整个 harness
+ * 永远不结束——那仍是可观测的失败，但拿不到一条带原因的红，
+ * 临时库也不会被清理。
+ */
+async function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), ms) })
+    const outcome = await Promise.race([p.then(() => 'settled' as const), timeout])
+    if (timer) clearTimeout(timer)
+    return outcome === 'settled'
+}
+
 function countLLMCalls(): number {
     return (getProjectDb()!.prepare('SELECT COUNT(*) c FROM llm_calls').get() as { c: number }).c
 }
@@ -351,6 +366,12 @@ invokeHandler = async (channel, ...args) => {
             const expected = args[1] as number | undefined
             if (expected === undefined || expected !== currentToken) return { success: false, stale: true }
             return { success: true, changed: VolumeRepository.advanceStatusByChapter(args[0] as number) }
+        }
+        case 'db:volume-update-detail': {
+            const expected = args[1] as number | undefined
+            if (expected === undefined || expected !== currentToken) return { success: false, stale: true }
+            const volume = VolumeRepository.updateDetail(args[0] as never)
+            return volume ? { success: true, volume } : { success: false, error: '卷不存在' }
         }
         case 'db:volume-update-status': {
             // 复刻 db-controller 的守卫：**缺省 token 也判 stale**
@@ -3365,6 +3386,555 @@ ${prompt.slice(0, 500)}`)
             160,
             '有卷时取各卷 endChapter 最大值，忽略 novelConfig 的总章数',
         )
+    })
+
+    console.log('\n▶ 卷详情编辑器的落库口径（Task 19.4 批次二 T2）')
+
+    await testCase('X28 章号区间预检四道判据**互不掩护**，各自可单独辨认', async () => {
+        const { validateVolumeRange } = await import('../../src/shared/volume-limits')
+        const { MAX_VOLUME_CHAPTERS } = await import('../../src/shared/volume-limits')
+
+        assertEq(validateVolumeRange(101, 160), '', '合法区间必须放行')
+
+        // 四条夹具刻意各自让**一道**判据成为唯一那道——去掉任何一道，
+        // 对应那条就会返回空串（放行），而不是被另一道顺手接住。
+        // 这正是「两道守卫重叠时单独去掉任一道都不转红」的解法：给每道配专属夹具。
+        //
+        // ① 起始章非安全整数：用 1.5。去掉这道后 end=10 合法、10≥1.5、
+        //    span=9.5 未超限 → 会放行
+        assertEq(
+            validateVolumeRange(1.5, 10), '起始章号非法，须为 ≥1 的整数',
+            'parseChapterNumber 返回 NaN 或小数时必须拦下',
+        )
+        // ② 结束章非安全整数：用 1.5。去掉这道后 1.5≥1、span=1.5 未超限 → 会放行
+        assertEq(
+            validateVolumeRange(1, 1.5), '结束章号非法，须为 ≥1 的整数',
+            '结束章同样要按安全整数验',
+        )
+        // ③ 反向区间：两端都是合法安全整数，只有这道能拦。
+        //    去掉后 span = 5-10+1 = -4，不超限 → 会放行
+        assertEq(
+            validateVolumeRange(10, 5), '结束章（第 5 章）不能小于起始章（第 10 章）',
+            '反向区间只有第三道能拦',
+        )
+        // ④ 区间过长：两端合法、方向正确，只有这道能拦。
+        //    「两端都是安全整数」不代表「区间可遍历」
+        assertEq(
+            validateVolumeRange(1, MAX_VOLUME_CHAPTERS + 1),
+            `本卷共 ${MAX_VOLUME_CHAPTERS + 1} 章，超过单卷上限 ${MAX_VOLUME_CHAPTERS} 章`,
+            '超长区间只有第四道能拦',
+        )
+        // 边界另一侧：恰好等于上限要放行，否则上限就成了「少一章」
+        assertEq(validateVolumeRange(1, MAX_VOLUME_CHAPTERS), '', '恰好达到上限应放行')
+    })
+
+    await testCase('X29 保存 patch：只带 touched 点名的列，收卷状态永不出现', async () => {
+        const { buildVolumeSavePayload } = await import('../../src/services/volume-service')
+
+        const form = {
+            title: '  北境风雪 · 改  ',
+            startChapter: 101,
+            endChapter: 170,
+            premise: '新主线',
+            synopsis: '新大纲',
+            openingState: '新开卷',
+            status: 'done' as const,
+            openThreads: [
+                { chapter: 12, thread: '锈剑铭文', urgency: 'high' as const, _id: 't0' },
+                // 补录后没填内容的空行：留在台账里是纯噪声
+                { chapter: 101, thread: '   ', urgency: 'mid' as const, _id: 't1' },
+                { chapter: 47, thread: '师门叛徒', urgency: 'mid' as const, _id: 't2' },
+            ],
+        }
+
+        // ===== ① 全字段都改过：所有列都该进 patch，唯独收卷状态永远不进 =====
+        const full = buildVolumeSavePayload(2, form, [
+            'title', 'boundary', 'premise', 'synopsis', 'openingState', 'status', 'openThreads',
+        ])
+
+        // ⚠️ 核心不变量：`closingState` **根本不在 patch 里**。
+        // 早先写法是「从原记录带回、走整行 upsert」，那只能防住「保存一次就清空」，
+        // 防不住并发覆盖：用户打开第 N 卷详情 → 发起续卷（跨两次 LLM，分钟级）→
+        // 续卷事务写入 AI 提炼的收束报告 → 用户回详情点保存 → 几分钟前那份快照
+        // 把报告覆盖回旧值。表单里没有这一栏，用户看不到自己抹掉了什么。
+        assert(
+            !('closingState' in full),
+            '收卷状态不得出现在卷详情 patch 里（主进程 updateDetail 的 SET 列表同样没有它）',
+        )
+
+        assertEq(full.volumeNumber, 2, '卷序号是主键，只能由调用方给定')
+        assertEq(full.title, '北境风雪 · 改', '卷名要 trim，否则首尾空白会落库')
+        assertEq(full.startChapter, 101, '边界成对进 patch：起始章')
+        assertEq(full.endChapter, 170, '边界成对进 patch：结束章')
+        assertEq(full.status, 'done', '改过的状态要生效')
+        assertEq(full.openThreads?.length, 2, '内容为空白的伏笔行必须剔除')
+        // `_id` 是 React 的行身份。带进载荷会让字节数预检与仓储层实际序列化的
+        // 形态对不上（validateOpenThreads 的注释里记着同一个坑）
+        assertEq(
+            Object.keys(full.openThreads![0]).sort().join(','), 'chapter,thread,urgency',
+            '落库载荷只能有 chapter/thread/urgency 三个字段',
+        )
+        assertEq(full.openThreads![1].thread, '师门叛徒', '剔空行后剩下的两条顺序不变')
+
+        // ===== ② 只改了卷大纲：patch 里**只能有** synopsis =====
+        //
+        // 这一条防的是「静默撤销后台结果」：`status` 由末章定稿自动流转、
+        // `openThreads` 由续卷事务写入 AI 新提炼的清单，而表单变脏后就拒绝
+        // 同步后台刷新——此时整表提交会把用户压根没看过的旧值写回去。
+        const onlySynopsis = buildVolumeSavePayload(2, form, ['synopsis'])
+        assertEq(
+            Object.keys(onlySynopsis).sort().join(','), 'synopsis,volumeNumber',
+            '只改大纲时，patch 里除卷序号外只能有 synopsis',
+        )
+        assert(!('status' in onlySynopsis), 'status 未被触碰，不得写回——它由末章定稿自动流转')
+        assert(!('openThreads' in onlySynopsis), 'openThreads 未被触碰，不得写回——它由续卷事务写入')
+
+        // ===== ③ 边界必须成对 =====
+        const onlyBoundary = buildVolumeSavePayload(2, form, ['boundary'])
+        assertEq(
+            Object.keys(onlyBoundary).sort().join(','), 'endChapter,startChapter,volumeNumber',
+            '触碰边界时起止章一起进 patch：区间重叠校验需要完整区间',
+        )
+    })
+
+    await testCase('X30 updateDetail 事务不碰 closing_state，并发续卷的收束报告不被覆盖', async () => {
+        freshEnv()
+        // ⚠️ 这条用例验的是**仓储层事务**，不是渲染层快照，故必须真写进库。
+        // `setVolumes()` 只动 volume-store，`VolumeRepository.get()` 读不到它
+        VolumeRepository.upsert(vol(1, 1, 100, { status: 'done' }))
+        VolumeRepository.upsert(vol(2, 101, 160, {
+            status: 'writing',
+            closingState: '第二卷收束：雁门关破',
+            openThreads: [{ chapter: 12, thread: '锈剑铭文', urgency: 'high' }],
+        }))
+        const before = VolumeRepository.get(2)!
+        assert(before.closingState === '第二卷收束：雁门关破', '前置事实：收束报告已在库里')
+
+        // 用户在卷详情改了主线与状态并保存（patch 里没有 closingState）
+        const ok = VolumeRepository.updateDetail({
+            volumeNumber: 2,
+            title: '北境风雪 · 改',
+            premise: '用户改过的主线',
+            synopsis: '用户改过的大纲',
+            openingState: '用户改过的开卷',
+            status: 'done',
+        })
+        assert(ok, 'updateDetail 应命中第 2 卷')
+
+        const after = VolumeRepository.get(2)!
+        assertEq(after.closingState, '第二卷收束：雁门关破', '收卷状态必须原封不动')
+        assertEq(after.premise, '用户改过的主线', 'patch 里的字段要写进去')
+        assertEq(after.title, '北境风雪 · 改', '卷名要写进去')
+        assertEq(after.status, 'done', '状态要写进去')
+        // patch 里没有 openThreads → 那一列一个字都不该动
+        assertEq(after.openThreads.length, 1, '未出现在 patch 里的伏笔清单不得被清空')
+        assertEq(after.openThreads[0].thread, '锈剑铭文', '未触碰的伏笔内容不得被改写')
+
+        // 只给一端边界必须被拒绝：重叠校验需要完整区间，
+        // 按库里旧值补齐等于用一份可能过期的快照参与校验
+        let halfBoundaryRejected = false
+        try {
+            VolumeRepository.updateDetail({ volumeNumber: 2, startChapter: 105 })
+        } catch (e) {
+            halfBoundaryRejected = String(e).includes('必须同时提供起始章与结束章')
+        }
+        assert(halfBoundaryRejected, '只给一端边界应被明确拒绝')
+
+        // 空 patch 同样拒绝：静默成功会让 UI 报「已保存」而其实什么都没写
+        let emptyRejected = false
+        try {
+            VolumeRepository.updateDetail({ volumeNumber: 2 })
+        } catch (e) {
+            emptyRejected = String(e).includes('没有任何字段需要更新')
+        }
+        assert(emptyRejected, '空 patch 应被明确拒绝，而不是静默返回成功')
+
+        // 不存在的卷返回 null，而不是静默插入一条新卷
+        assertEq(
+            VolumeRepository.updateDetail({
+                volumeNumber: 99, title: 'x', startChapter: 900, endChapter: 910,
+            }),
+            null,
+            '详情编辑只作用于已存在的卷，不命中即 null',
+        )
+        assertEq(VolumeRepository.get(99), null, '不命中时不得插入新卷')
+
+        // ⚠️ 上面那条**证明不了 `exists` 那道守卫**：区间不重叠时，
+        // 就算去掉 exists，UPDATE 也只是命中 0 行、照样返回 null（两道互相掩护）。
+        // 让 exists 成为唯一那道的专属夹具是「不存在的卷 + 区间与既有卷重叠」：
+        // 没有 exists 先短路的话，会先撞上区间重叠校验并抛出
+        // 「第 99 卷区间 101–160 与第 2 卷重叠」——一句答非所问的报错，
+        // 真正的问题是这一卷根本不存在。
+        assertEq(
+            VolumeRepository.updateDetail({
+                volumeNumber: 99, title: 'x', startChapter: 101, endChapter: 160,
+            }),
+            null,
+            '不存在的卷即使区间与别人重叠，也该报「卷不存在」而不是抛重叠错误',
+        )
+
+        // ===== 返回整行：渲染层据此直接合并进 store，不依赖另一次可能失败的刷新 =====
+        const returned = VolumeRepository.updateDetail({ volumeNumber: 2, premise: '再改一次' })
+        assert(returned !== null, '命中时必须返回整行，而不是布尔')
+        assertEq(returned!.premise, '再改一次', '返回的必须是**本次写入后**的状态')
+        assertEq(
+            returned!.closingState, '第二卷收束：雁门关破',
+            '返回的整行要带上本次没碰过的列，渲染层才能整行替换 store 里那条',
+        )
+        assertEq(returned!.volumeNumber, 2, '返回行的主键要对得上')
+    })
+
+    await testCase('X33 写入成功即合并整行，不依赖另一次可能失败的 loadAll', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 100, { status: 'done' }))
+        VolumeRepository.upsert(vol(2, 101, 160, {
+            status: 'writing',
+            openThreads: [{ chapter: 12, thread: '旧伏笔 O1', urgency: 'high' }],
+        }))
+
+        const { useVolumeStore } = await import('../../src/stores/volume-store')
+        // 让 store 处于「已读到、但拿的是旧行」的状态
+        useVolumeStore.setState({
+            volumes: [vol(1, 1, 100, { status: 'done' }), vol(2, 101, 160, {
+                status: 'writing',
+                openThreads: [{ chapter: 12, thread: '旧伏笔 O1', urgency: 'high' }],
+            })],
+            status: 'ready',
+        })
+
+        // 后台把伏笔改成 O2（模拟续卷事务），**但不刷新 store**
+        VolumeRepository.updateOpenThreads(2, [{ chapter: 12, thread: '新伏笔 O2', urgency: 'high' }])
+
+        // 用户只改了大纲并保存
+        const res = await useVolumeStore.getState().updateDetail(
+            { volumeNumber: 2, synopsis: '用户改过的大纲' },
+            currentToken,
+        )
+        assert(res.success, '保存应成功')
+
+        // 关键：store 里那条必须已经是**事务后的整行**——
+        // 既有用户刚存的大纲，也有后台写入的 O2。
+        //
+        // 早先是「写完再发一次 loadAll() 去刷新」。而 loadAll 读失败只吞异常置 error、
+        // 被后续请求的序号顶掉时直接 return——两种情况 store 里都还是旧行 O1，
+        // 可保存已判定成功、草稿被清空，界面上就留下一个**没有脏标记的旧表单**；
+        // 用户接着编辑那份 O1 再保存，就把 O2 覆盖了。
+        const inStore = useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)!
+        assertEq(inStore.synopsis, '用户改过的大纲', 'store 里要有用户刚存的值')
+        assertEq(
+            inStore.openThreads[0].thread, '新伏笔 O2',
+            'store 里还必须带上后台写入的新伏笔——整行合并才不会留下过期表单',
+        )
+        // 别的卷不受影响
+        assertEq(useVolumeStore.getState().volumes.find(v => v.volumeNumber === 1)!.volumeNumber, 1, '第 1 卷仍在')
+        assertEq(useVolumeStore.getState().volumes.length, 2, '合并是替换那一条，不是重建整个数组')
+    })
+
+    await testCase('X34 在途的旧刷新不得盖掉合并结果，也不得把 store 卡在 loading', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 100, { status: 'done' }))
+        VolumeRepository.upsert(vol(2, 101, 160, { status: 'writing', synopsis: '旧大纲' }))
+
+        const { useVolumeStore } = await import('../../src/stores/volume-store')
+        await useVolumeStore.getState().loadAll()
+        assertEq(useVolumeStore.getState().status, 'ready', '前置：先读到一份就绪快照')
+
+        // 让 db:volume-get-all **先读库、后延迟返回**，精确复现那条竞态：
+        // 读取发生在写入之前，回包落地在写入之后
+        const orig = invokeHandler
+        let releaseRead: (() => void) | null = null
+        invokeHandler = async (channel, ...args) => {
+            const r = await orig(channel, ...args)
+            if (channel === 'db:volume-get-all' && releaseRead === null) {
+                await new Promise<void>(resolve => { releaseRead = resolve })
+            }
+            return r
+        }
+
+        try {
+            // ① 发起一次刷新（读到「旧大纲」后挂住）
+            const pending = useVolumeStore.getState().loadAll()
+            // 等它真的读完并卡在延迟上
+            for (let i = 0; i < 50 && releaseRead === null; i++) await new Promise(r => setTimeout(r, 5))
+            assert(releaseRead !== null, '前置：刷新应已读完库并挂在延迟上')
+            assertEq(useVolumeStore.getState().status, 'loading', '前置：此刻 store 处于 loading')
+
+            // ② 刷新在途时保存详情，主进程带回整行、就地合并
+            const res = await useVolumeStore.getState().updateDetail(
+                { volumeNumber: 2, synopsis: '用户改过的大纲' }, currentToken)
+            assert(res.success, '保存应成功')
+            assertEq(
+                useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)!.synopsis,
+                '用户改过的大纲', '合并后 store 里应是新值')
+
+            // ③ 放行那次旧刷新——它携带的是写入**之前**的「旧大纲」
+            releaseRead!()
+            await pending
+
+            // 核心断言一：旧回包不得把合并结果盖回去
+            assertEq(
+                useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)!.synopsis,
+                '用户改过的大纲',
+                '发起于写入之前的刷新回包，不得覆盖已合并的新行',
+            )
+            // 核心断言二：**状态必须落回 ready**。
+            // 早先的修法是在合并时 `loadSeq++` 作废在途请求，
+            // 而那次请求已经把 status 设成 loading、被作废后直接 return，
+            // 再没有任何路径恢复——store 会永久停在 loading，
+            // 侧栏与总览页一直转骨架，getSnapshot() 恒为未就绪，
+            // 目录生成被 fail-closed 拒绝、正文也拿不到卷罗盘
+            assertEq(useVolumeStore.getState().status, 'ready', 'store 不得被卡在 loading')
+            // 别的卷照常由刷新落地
+            assertEq(useVolumeStore.getState().volumes.length, 2, '刷新仍应带回全部卷')
+        } finally {
+            invokeHandler = orig
+        }
+
+        // ④ 保存**之后**发起的刷新是合法的，不得被误伤：
+        //    它读到的本就是新值，叠加应就地失效
+        VolumeRepository.updateDetail({ volumeNumber: 2, synopsis: '后台又改了一次' })
+        await useVolumeStore.getState().loadAll()
+        assertEq(
+            useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)!.synopsis,
+            '后台又改了一次',
+            '发起于写入之后的刷新必须正常落地，不能被旧的行级叠加钉住',
+        )
+    })
+
+    await testCase('X35 写入在途时发起的刷新必须等它结束，读到的新值不得被叠加盖回', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 100, { status: 'done' }))
+        VolumeRepository.upsert(vol(2, 101, 160, { status: 'writing', synopsis: '旧大纲' }))
+
+        const { useVolumeStore } = await import('../../src/stores/volume-store')
+        await useVolumeStore.getState().loadAll()
+
+        // 让写 IPC 慢下来，制造「事务已提交、回包还没到渲染层」那段窗口。
+        // 期间后台又改了同一卷，并发起一次刷新——它读到的是**更新**的数据。
+        const orig = invokeHandler
+        let writeCommitted: (() => void) | null = null
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:volume-update-detail') {
+                const r = await orig(channel, ...args)   // 事务已提交
+                // 提交之后、回包之前：后台再改一次同一卷
+                VolumeRepository.updateDetail({ volumeNumber: 2, status: 'done' })
+                await new Promise<void>(resolve => { writeCommitted = resolve })
+                return r
+            }
+            return orig(channel, ...args)
+        }
+
+        let refreshDone = false
+        try {
+            const writing = useVolumeStore.getState().updateDetail(
+                { volumeNumber: 2, synopsis: '用户改过的大纲' }, currentToken)
+            for (let i = 0; i < 50 && writeCommitted === null; i++) await new Promise(r => setTimeout(r, 5))
+            assert(writeCommitted !== null, '前置：写事务应已提交并挂在回包延迟上')
+
+            // 此刻发起刷新。它**必须等写入结束**再发 IPC——
+            // 否则它读到的数据与叠加的先后关系无从判断，
+            // 而序号又大于 atSeq，会让刚写下去的值被这次读取悄悄 revert
+            const refreshing = useVolumeStore.getState().loadAll().then(() => { refreshDone = true })
+            await new Promise(r => setTimeout(r, 30))
+            assertEq(refreshDone, false, '详情写入在途时，刷新必须先等着，不能抢跑')
+
+            writeCommitted!()
+            await writing
+            await refreshing
+        } finally {
+            invokeHandler = orig
+        }
+
+        const row = useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)!
+        // 刷新发起于写入**之后**（被推迟到写入结束），读到的是完整的最新状态：
+        // 既有用户存的大纲，也有后台在窗口里改的 status
+        assertEq(row.synopsis, '用户改过的大纲', '用户存的值要在')
+        assertEq(row.status, 'done', '窗口期内后台写入的 status 不得被行级叠加盖回旧值')
+        assertEq(useVolumeStore.getState().status, 'ready', '刷新应正常落地，不得卡在 loading')
+    })
+
+    await testCase('X36 reset 必须作废整代写入闸门：旧项目的未结算写入不得挡住新项目加载', async () => {
+        freshEnv()
+        VolumeRepository.upsert(vol(1, 1, 100, { status: 'done' }))
+        VolumeRepository.upsert(vol(2, 101, 160, { status: 'writing', synopsis: 'A 的大纲' }))
+
+        const { useVolumeStore } = await import('../../src/stores/volume-store')
+        await useVolumeStore.getState().loadAll()
+
+        // A 项目的详情写入卡住不返回
+        const orig = invokeHandler
+        let releaseWrite: (() => void) | null = null
+        invokeHandler = async (channel, ...args) => {
+            if (channel === 'db:volume-update-detail') {
+                const r = await orig(channel, ...args)
+                await new Promise<void>(resolve => { releaseWrite = resolve })
+                return r
+            }
+            return orig(channel, ...args)
+        }
+
+        try {
+            const writingA = useVolumeStore.getState().updateDetail(
+                { volumeNumber: 2, synopsis: 'A 存的大纲' }, currentToken)
+            for (let i = 0; i < 50 && releaseWrite === null; i++) await new Promise(r => setTimeout(r, 5))
+            assert(releaseWrite !== null, '前置：A 的写入应卡在回包上')
+
+            // A 项目的刷新进入等待
+            let refreshADone = false
+            const refreshA = useVolumeStore.getState().loadAll().then(() => { refreshADone = true })
+            await new Promise(r => setTimeout(r, 20))
+            assertEq(refreshADone, false, '前置：A 的刷新应在等写入')
+
+            // 切项目：reset 换代
+            useVolumeStore.getState().reset()
+            // ⚠️ 必须**带超时**地等：闸门没换代时等待者会重新入队，
+            // 直接 await 会把整个 harness 挂住（那是可观测的失败，但不是干净的红）。
+            // 超时即判定「没有立刻退出」，在有界时间内给出明确原因
+            assert(
+                await settledWithin(refreshA, 500),
+                'reset 后 A 的刷新必须立刻退出，不能重新入队（超时 = 它还在等旧项目的写入）',
+            )
+            assertEq(refreshADone, true, 'reset 后 A 的刷新必须已结束')
+            assertEq(useVolumeStore.getState().status, 'idle', 'A 的刷新退出时不得把状态写回 ready')
+
+            // B 项目打开：首次加载**不得**被 A 那个没结算的写入挡住。
+            // 早先计数是模块级全局的，reset 只 resolve 等待者却不清零，
+            // 于是等待者醒来看到计数仍 > 0 会立刻重新入队；
+            // B 的首次 loadAll 也会被这个属于 A 的计数堵死——
+            // 而 IPC 没有超时，A 的写入不 settle 就是永久卡死
+            let loadBDone = false
+            const loadB = useVolumeStore.getState().loadAll().then(() => { loadBDone = true })
+            assert(
+                await settledWithin(loadB, 500),
+                'B 的首次加载不得被上一个项目的未结算写入挡住（超时 = 被旧闸门堵死）',
+            )
+            assertEq(loadBDone, true, 'B 的首次加载应已完成')
+            assertEq(useVolumeStore.getState().status, 'ready', 'B 应正常读到就绪状态')
+
+            // 放行 A 那个迟到的写入：它只结算自己那一代，不得污染 B
+            releaseWrite!()
+            await writingA
+            assertEq(useVolumeStore.getState().status, 'ready', 'A 的迟到回包不得改变 B 的状态')
+            assertEq(
+                useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)!.synopsis,
+                'A 存的大纲',
+                '本轮同库，故内容相同；关键是上面那几条隔离断言，不是这一条',
+            )
+        } finally {
+            invokeHandler = orig
+            if (releaseWrite !== null) (releaseWrite as () => void)()
+        }
+    })
+
+    await testCase('X31 脏表单到来的后台快照必须「等」，而不是「跳过后推进游标」', async () => {
+        const { decideVolumeSnapshotSync } = await import('../../src/services/volume-service')
+
+        assertEq(decideVolumeSnapshotSync(false, false), 'none', '快照没变就无事可做')
+        assertEq(decideVolumeSnapshotSync(false, true), 'none', '快照没变时脏不脏都无事可做')
+        assertEq(decideVolumeSnapshotSync(true, false), 'adopt', '不脏就该把新值完整同步进表单')
+
+        // 这一条是本用例的核心。返回 'wait' 的语义是「**整块跳过**，
+        // 连『已同步到哪一份』的游标都不许推进」。
+        //
+        // 早先组件里的写法是「先无条件推进游标，再判脏决定要不要同步」，
+        // 于是：用户改大纲变脏 → 后台写了新伏笔、新快照到达 → 游标推进但表单不更新
+        // → 用户保存（patch 只带大纲，新伏笔这次没被覆盖）→ 脏标记清掉，
+        // 而游标已经等于最新快照，**再也不会进同步分支** → 界面上仍是旧伏笔、
+        // 看着却像已保存 → 用户随手改一下那份旧伏笔，整份旧清单落库，
+        // 后台的新清单被无声覆盖。
+        assertEq(
+            decideVolumeSnapshotSync(true, true), 'wait',
+            '脏的时候必须等：同步和推进游标都不能做，否则会留下一个没有脏标记的旧表单',
+        )
+
+        // ⚠️ 如实标注**证明力边界**：本用例只钉住「什么时候该同步」这条判据。
+        // 「同步时有没有把每个字段都写对」发生在组件渲染体内，
+        // 而本 harness 不挂载 React 组件，覆盖不到——那部分目前只有人工验证。
+    })
+
+    await testCase('X32 保存善后必须落在共享状态上：逐字段确认 + single-flight 租约', async () => {
+        const { useVolumeDraftStore } = await import('../../src/stores/volume-draft-store')
+        const S = () => useVolumeDraftStore.getState()
+        S().reset()
+
+        const TOKEN = 7
+        const VOL = 2
+        const mkDraft = (touched: string[]) => ({
+            title: 't', startRaw: '101', endRaw: '160', status: 'writing' as const,
+            premise: '', synopsis: '改过的大纲', openingState: '',
+            threads: [], threadChapterInputs: {}, nextThreadId: 0,
+            touched: touched as never,
+        })
+
+        // ===== ① 重挂载后仍读得到草稿：dirty / touched 由它派生，不由组件实例 =====
+        S().markTouched(TOKEN, VOL, 'openThreads')
+        S().set(TOKEN, VOL, mkDraft(['openThreads']))
+        const stampsA = S().getStamps(TOKEN, VOL)
+        assert(S().get(TOKEN, VOL) !== null, '重挂载后必须还能读到草稿')
+
+        // ===== ② 期间无人编辑 → 全部确认 → 草稿清空 =====
+        assertEq(
+            S().acknowledgeSave(TOKEN, VOL, ['openThreads'], stampsA), true,
+            '没人再改过时应全部确认并清空草稿（dirty=false、touched=[]）',
+        )
+        assertEq(S().get(TOKEN, VOL), null, '确认干净后草稿必须没了')
+
+        // ===== ③ 核心：保存 openThreads 的**途中**改了 synopsis =====
+        //
+        // 这里必须**逐字段**确认。早先用整卷一个版本号：只要期间动过任何字段，
+        // 版本就变，于是**已经成功落库的 openThreads 也得不到确认**、继续留在
+        // touched 里；等后台把 openThreads 更新掉，用户再保存 synopsis 时
+        // 那份旧值会跟着提交，把后台结果覆盖——正是本批次一直在堵的静默覆盖。
+        S().markTouched(TOKEN, VOL, 'openThreads')
+        S().set(TOKEN, VOL, mkDraft(['openThreads']))
+        const stampsB = S().getStamps(TOKEN, VOL)      // 保存 openThreads 时定格
+
+        S().markTouched(TOKEN, VOL, 'synopsis')        // 保存在途，用户又改了大纲
+        S().set(TOKEN, VOL, mkDraft(['openThreads', 'synopsis']))
+
+        assertEq(
+            S().acknowledgeSave(TOKEN, VOL, ['openThreads'], stampsB), false,
+            '还有未保存字段时不该清空草稿',
+        )
+        assertEq(
+            S().get(TOKEN, VOL)!.touched as unknown as string[], ['synopsis'],
+            '已落库的 openThreads 必须从 touched 里摘掉，只留真正没存的 synopsis',
+        )
+
+        // ===== ④ 反面：保存期间**这个字段自己**又被改过 → 不得确认 =====
+        S().set(TOKEN, VOL, mkDraft(['synopsis']))
+        const stampsC = S().getStamps(TOKEN, VOL)
+        S().markTouched(TOKEN, VOL, 'synopsis')        // 同一字段在途中又改
+        assertEq(
+            S().acknowledgeSave(TOKEN, VOL, ['synopsis'], stampsC), false,
+            '该字段在保存期间又被改过，不能当成已保存',
+        )
+        assertEq(
+            S().get(TOKEN, VOL)!.touched as unknown as string[], ['synopsis'],
+            '它得继续留在 touched 里等下一次保存',
+        )
+
+        // ===== ⑤ single-flight 租约：占用期间不许再发起 =====
+        S().reset()
+        const lease1 = S().beginSave(TOKEN, VOL)
+        assert(lease1 !== null, '首次应抢到租约')
+        assertEq(S().beginSave(TOKEN, VOL), null, '占用期间必须拒绝第二次发起')
+        assertEq(S().isSaving(TOKEN, VOL), true, '占用期间 isSaving 为真')
+        // 拿错 id 释放不掉——否则「A 释放了 B 的占用」会让 single-flight 形同虚设
+        S().endSave(TOKEN, VOL, lease1! + 999)
+        assertEq(S().isSaving(TOKEN, VOL), true, 'id 不匹配的回包不得释放占用')
+        S().endSave(TOKEN, VOL, lease1!)
+        assertEq(S().isSaving(TOKEN, VOL), false, '持有租约的那次回包才释放得掉')
+
+        // ===== ⑥ 归属：不同项目 token 的同号卷互不干扰 =====
+        S().set(TOKEN, VOL, mkDraft(['synopsis']))
+        assertEq(S().get(TOKEN + 1, VOL), null, '另一个项目的第 2 卷不该看到这份草稿')
+        assertEq(S().beginSave(TOKEN + 1, VOL) !== null, true, '另一个项目的保存不受本卷租约影响')
+        S().reset()
+
+        // ⚠️ 证明力边界：本用例验的是**共享状态的契约**（归属、逐字段确认时机、租约）。
+        // 「组件确实是从这份共享状态派生 dirty / touched / saving」在组件渲染体里，
+        // 本 harness 不挂载 React 组件，覆盖不到。
     })
 
     // ===== 汇总 =====

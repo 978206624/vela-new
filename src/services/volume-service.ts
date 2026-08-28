@@ -20,7 +20,8 @@
  */
 import { ipc } from './ipc-client'
 import type { NovelConfig } from '../shared/ipc-channels'
-import type { VolumeData, VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
+import type { VolumeData, VolumeStatus, OpenThread, VolumeDetailPatch } from '../../electron/repositories/volume-repository'
+import type { VolumeDetailField } from '../stores/volume-draft-store'
 import type { ProjectCoreData } from '../../electron/repositories/project-core-repository'
 
 /** 卷状态的中文展示文案。
@@ -365,6 +366,106 @@ export function describeOpenThreadCount(
     const count = v.openThreads?.length ?? 0
     if (count > 0) return count
     return getVolumeSummary(v) ? 0 : null
+}
+
+/**
+ * 后台快照到达时，卷详情表单该怎么办。
+ *
+ * - `'none'`：快照没变，无事可做。
+ * - `'adopt'`：表单不脏 → 把新值完整同步进表单，并推进「已同步到哪一份」的游标。
+ * - `'wait'`：表单脏 → **一个字都不动，尤其不推进游标**。
+ *
+ * ## `'wait'` 为什么必须连游标都不推进
+ *
+ * 早先的写法是「先无条件推进游标，再判脏决定要不要同步」，理由写的是
+ * 「不推进会死循环」——那个理由不成立：条件不成立时该分支不调用任何 setter，
+ * 不触发重渲染，谈不上循环。
+ *
+ * 而推进了游标会造成一个**没有脏标记的旧表单**：
+ * 用户改大纲变脏 → 后台写了新伏笔、新快照到达 → 游标推进但表单不更新 →
+ * 用户保存（patch 只带大纲，库里的新伏笔这次没被覆盖）→ 脏标记清掉，
+ * 而此时游标已经等于最新快照，**再也不会进同步分支** → 界面上仍是旧伏笔、
+ * 看着却像已保存 → 用户随手改一下那份旧伏笔，整份旧清单落库，后台的新清单被覆盖。
+ *
+ * 抽成纯函数是为了让这条判据可测：留在组件的渲染体里，它只能靠人工复现
+ * 上面那条五步路径。
+ *
+ * ⚠️ **证明力边界**：本函数只钉住「什么时候该同步」这条判据。
+ * 「同步时有没有把每个字段都写对」发生在组件内部，harness 不挂载 React 组件，
+ * 覆盖不到；那部分目前只有人工验证。
+ */
+export function decideVolumeSnapshotSync(
+    snapshotChanged: boolean,
+    dirty: boolean,
+): 'none' | 'adopt' | 'wait' {
+    if (!snapshotChanged) return 'none'
+    return dirty ? 'wait' : 'adopt'
+}
+
+/** 卷详情编辑器的表单值。伏笔行可能带 UI 专用的 `_id`，落库前必须剔掉 */
+export interface VolumeFormValues {
+    title: string
+    startChapter: number
+    endChapter: number
+    premise: string
+    synopsis: string
+    openingState: string
+    status: VolumeStatus
+    openThreads: Array<OpenThread & { _id?: string }>
+}
+
+/**
+ * 由「卷序号 + 表单值 + **本次触碰过的字段**」组装卷详情的落库 patch。
+ *
+ * ## 为什么是 patch 而不是整行
+ *
+ * 两条独立的丢失路径，整行提交都挡不住：
+ *
+ * ① **表单里没有的列**：`closingState`。详情表单没有这一栏，整行写会让渲染层
+ *    几分钟前的快照覆盖掉续卷事务刚写入的收束报告，而用户看不到自己抹掉了什么。
+ *    本函数的返回类型里**根本没有这个字段**。
+ * ② **表单里有、但用户没改的列**：`status` 由末章定稿自动流转、`openThreads`
+ *    由续卷事务写入 AI 新提炼的清单。而表单一旦变脏就拒绝同步后台刷新
+ *    （否则会吃掉用户正在打的字）——于是「字段在界面上」不等于「用户看到的是最新值」。
+ *    用户只改了卷大纲却整表提交，就会把旧值写回去，静默撤销后台结果。
+ *
+ * 故只把 `touched` 里点名的列放进 patch。这比加 revision/CAS 便宜（不动 migration），
+ * 语义也更准：冲突根本不会发生，因为两边写的是不相交的列。
+ *
+ * ## 边界成对
+ *
+ * `boundary` 一旦在 `touched` 里，起止章**一起**进 patch：区间重叠校验需要完整区间。
+ * 它们也确实只有用户会改（续卷只新建卷，不动既有卷的边界）。
+ *
+ * ## `_id` 不进载荷
+ *
+ * 那是 React 的行身份；带上去会让 `open_threads` 的字节数预检与仓储层实际
+ * 序列化的形态对不上（`validateOpenThreads` 注释里记着同一个坑）。
+ */
+export function buildVolumeSavePayload(
+    volumeNumber: number,
+    form: VolumeFormValues,
+    touched: readonly VolumeDetailField[],
+): VolumeDetailPatch {
+    const has = (f: VolumeDetailField) => touched.includes(f)
+    const patch: VolumeDetailPatch = { volumeNumber }
+
+    if (has('title')) patch.title = form.title.trim()
+    if (has('premise')) patch.premise = form.premise
+    if (has('synopsis')) patch.synopsis = form.synopsis
+    if (has('openingState')) patch.openingState = form.openingState
+    if (has('status')) patch.status = form.status
+    if (has('boundary')) {
+        patch.startChapter = form.startChapter
+        patch.endChapter = form.endChapter
+    }
+    if (has('openThreads')) {
+        // 空条目在台账里是纯噪声；显式挑字段而非展开，`_id` 才不会混进落库载荷
+        patch.openThreads = form.openThreads
+            .filter(t => t.thread.trim())
+            .map(t => ({ chapter: t.chapter, thread: t.thread, urgency: t.urgency }))
+    }
+    return patch
 }
 
 /** 取某章所属的卷；未分卷或章号落在所有卷区间之外返回 null */

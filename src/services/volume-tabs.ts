@@ -18,12 +18,15 @@ export function openVolumeOverview(): void {
 /**
  * 打开某一卷的**详情 Tab**（`type:'volume'`，对应设计稿 29）。
  *
- * ⚠️ 本函数只建立路由。Tab 的渲染组件（`VolumeEditor`）由后续 Task 接入 `EditorArea`；
- * 在那之前打开的详情 Tab 主体是空的。
+ * 该 Tab 由 `EditorArea` 的 `type === 'volume'` 分支渲染 `VolumeEditor`。
  *
  * Tab id 只由卷序号决定、**不含卷名**：若把卷名编进 id，改名后同一卷会开出
- * 第二个 Tab，而旧 Tab 还挂着已不存在的名字。`openFile` 对已存在的 Tab 会更新
- * `name`，所以改名后重新点击即可让标签页文案跟上。
+ * 第二个 Tab，而旧 Tab 还挂着已不存在的名字。
+ *
+ * ⚠️ 本函数会 `openFile`——**打开或激活**该 Tab，不存在就新建。
+ * 只想改标题时不要用它：`VolumeEditor` 保存成功后走的是
+ * `editor-store.renameTab()`，因为用本函数会把用户在保存在途期间
+ * 刚关掉的 Tab 复活，或把当前焦点抢走。
  */
 export function openVolumeDetail(volumeNumber: number, title: string): void {
   useEditorStore.getState().openFile({

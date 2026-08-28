@@ -100,6 +100,22 @@ def hit_exact(lines, case_id):
     return any(ln.startswith(prefix) for ln in lines)
 
 
+
+
+def assert_sources_pristine(snapshots):
+    """全部跑完后核对每个被变异过的文件与开跑前**逐字节相同**。
+
+    per-mutation 的 try/finally 已经会还原，这一道是兜底：本 Task 真实发生过
+    「源码里残留一个 while (false)，随后几轮的变异结论全部作废」——
+    而当时没有任何东西提示源码已脏，是靠人工比对才发现的。
+    """
+    dirty = [p.name for p, b in snapshots.items() if p.read_bytes() != b]
+    if dirty:
+        print("")
+        print(f"[X] 变异未还原干净，以下文件与开跑前不一致：{dirty}")
+        print("   本轮所有结论都不可信，请先用 git 恢复这些文件再重跑。")
+        sys.exit(3)
+    print("[OK] 源码完整性核对通过：所有被变异文件已逐字节还原")
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -112,13 +128,25 @@ def main():
         sys.exit(2)
     print("  退出码 0，基线全绿，可以开始变异")
 
+    # 开跑前的字节快照，跑完逐一核对（见 assert_sources_pristine）
+    snapshots = {m[1]: m[1].read_bytes() for m in MUTATIONS}
+
     results = []
     for label, path, old, new, expect in MUTATIONS:
-        src = path.read_text(encoding="utf-8")
-        assert old in src, f"{label}: 原串未命中 {path.name}，变异未生效"
-        assert src.count(old) == 1, f"{label}: 原串在 {path.name} 命中 {src.count(old)} 次，需唯一"
+        # ⚠️ 按**原始字节**读写。`read_text`/`write_text` 在 Windows 上默认做换行
+        # 转换（读时 CRLF→LF、写时 LF→os.linesep），对 LF 源文件会整体改成 CRLF——
+        # 变异检验不该有任何副作用，还原也必须字节级一致
+        src = path.read_bytes()
+        text = src.decode("utf-8")
+        # 原串按源文件实际换行归一，免得 LF 写法在 CRLF 文件里匹配不到
+        crlf = chr(13) + chr(10)
+        if crlf in text:
+            old = old.replace(chr(10), crlf)
+            new = new.replace(chr(10), crlf)
+        assert old in text, f"{label}: 原串未命中 {path.name}，变异未生效"
+        assert text.count(old) == 1, f"{label}: 原串在 {path.name} 命中 {text.count(old)} 次，需唯一"
         try:
-            path.write_text(src.replace(old, new), encoding="utf-8")
+            path.write_bytes(text.replace(old, new).encode("utf-8"))
             code, out = run_harness()
             lines = failure_lines(out)
             hit = hit_exact(lines, expect)
@@ -128,8 +156,9 @@ def main():
             for ln in lines:
                 print(f"  {ln}")
         finally:
-            path.write_text(src, encoding="utf-8")
+            path.write_bytes(src)
 
+    assert_sources_pristine(snapshots)
     print("\n" + "=" * 60)
     ok = True
     for label, expect, went_red, hit in results:

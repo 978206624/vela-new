@@ -129,6 +129,39 @@ export function validateOpenThreads(threads: ThreadLike[]): string {
 }
 
 /**
+ * 卷章号区间的提交前预检，返回空串表示通过。
+ *
+ * 与仓储层 `assertValidRange`（`electron/repositories/volume-repository.ts`）
+ * **同一套判据**——各写一份迟早分叉，而分叉的那份会放行主进程要拒绝的值，
+ * 用户则看到一条来自底层的报错而不是「结束章不能小于起始章」。
+ *
+ * 这里挡住的是「点了保存才被拒绝」；最终授权仍在仓储层事务内
+ * （它还要查区间重叠与「只有最后一卷能改边界」，那两条需要库）。
+ *
+ * ⚠️ 三条都要验，且**上下界分开**：
+ * - `isSafeInteger` 而非 `isInteger`——`Number.isInteger(1e21)` 为真，
+ *   而 `1e21 + 1 === 1e21`，这种章号落库后所有章号加减都会静默出错。
+ * - 区间长度单独卡：两端都是安全整数**不代表**区间可遍历
+ *   （`start=11, end=MAX_SAFE_INTEGER` 两端都合法，却有 9 千万亿章）。
+ */
+export function validateVolumeRange(startChapter: number, endChapter: number): string {
+  if (!Number.isSafeInteger(startChapter) || startChapter < 1) {
+    return '起始章号非法，须为 ≥1 的整数'
+  }
+  if (!Number.isSafeInteger(endChapter) || endChapter < 1) {
+    return '结束章号非法，须为 ≥1 的整数'
+  }
+  if (endChapter < startChapter) {
+    return `结束章（第 ${endChapter} 章）不能小于起始章（第 ${startChapter} 章）`
+  }
+  const span = endChapter - startChapter + 1
+  if (span > MAX_VOLUME_CHAPTERS) {
+    return `本卷共 ${span} 章，超过单卷上限 ${MAX_VOLUME_CHAPTERS} 章`
+  }
+  return ''
+}
+
+/**
  * 解析「本卷章数」输入框里的原始字符串，非法一律返回 `NaN`。
  *
  * ⚠️ 用 `Number()` 而非 `parseInt`。`Number.parseInt('1e21', 10) === 1`、

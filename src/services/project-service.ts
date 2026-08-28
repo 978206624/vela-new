@@ -19,6 +19,7 @@ import { coerceChapterRole } from '../shared/chapter-roles'
 import { useDraftStore } from '../stores/draft-store'
 import { useAgentStore } from '../stores/agent-store'
 import { useVolumeStore } from '../stores/volume-store'
+import { useVolumeDraftStore } from '../stores/volume-draft-store'
 import { invalidateVolumeFlow } from '../stores/volume-flow-store'
 import { ipc } from './ipc-client'
 
@@ -230,6 +231,10 @@ export async function onProjectClosed(closingToken?: number): Promise<void> {
   useCharacterStore.getState().reset()
   useDraftStore.getState().reset()
   useVolumeStore.getState().reset()
+  // 卷详情的未保存草稿同样清掉。它按 `projectToken:volumeNumber` 归属，
+  // 串不到别的项目去，但 token 每次打开都递增——不清的话旧条目永远读不到，
+  // 纯粹在内存里堆着
+  useVolumeDraftStore.getState().reset()
   // 续卷向导也要作废：它是模块级 store，给组件加 key 只重建组件本地 state，
   // 不清 store。不作废的话，A 的向导会原样出现在 B 的界面上，
   // 而里面写的「承接第二卷（截至第 160 章）」说的是 A 的卷
