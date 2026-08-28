@@ -11,6 +11,8 @@ import { useWorkflowStore } from '../../../stores/workflow-store'
 import { useDraftStore } from '../../../stores/draft-store'
 import { useEditorStore } from '../../../stores/editor-store'
 import { useLayoutStore } from '../../../stores/layout-store'
+import { useVolumeStore } from '../../../stores/volume-store'
+import { computeEffectiveTotalChapters } from '../../../services/volume-service'
 import { ipc } from '../../../services/ipc-client'
 import { Button } from '../../ui/Button'
 import { EmptyState } from '../../ui/EmptyState'
@@ -33,6 +35,18 @@ export default function ProjectTree() {
   const activeRuns = useWorkflowStore(s => s.activeRuns)
   // ✅ 精确订阅，避免 loadAllDrafts 执行后引用变化触发 useCallback/useEffect 循环
   const draftsByChapter = useDraftStore(s => s.draftsByChapter)
+
+  /**
+   * 卷表快照，供蓝图徽章的分母用。
+   *
+   * ⚠️ 必须放在**任何条件 return 之前**——组件下方有 `if (!currentProject)` 早退，
+   * hook 落在它后面会违反 hooks 调用顺序（eslint react-hooks/rules-of-hooks 会拦）。
+   *
+   * 不用 `getSnapshot()`：它每次调用都造一个新对象，当 zustand selector 会让
+   * useSyncExternalStore 每次都判定「变了」而反复重渲染。`volumes` 数组引用是稳定的。
+   */
+  const volumeStatus = useVolumeStore(s => s.status)
+  const volumes = useVolumeStore(s => s.volumes)
 
   // 存储各架构文件是否有实际内容（已生成）
   const [archStatus, setArchStatus] = useState<Record<string, boolean>>({})
@@ -131,6 +145,16 @@ export default function ProjectTree() {
 
   // 小说配置是否已完成（核心大纲非空视为已完成）
   const nc = currentProject.novelConfig
+  /**
+   * 蓝图徽章的分母：分卷后全书总章数以**卷表**为准（续卷会把它扩到新卷末章）。
+   *
+   * ⚠️ 这是**纯展示**路径，与生成路径的 fail-closed 要求不同：卷表还没读到时
+   * 回落 `novelConfig.totalChapters` 即可——展示错一个分母无害，
+   * 而把徽章整个藏起来反而更费解。生成路径喂错大纲才是有害的，那边照旧 fail closed。
+   */
+  const effectiveTotal = volumeStatus === 'ready'
+    ? computeEffectiveTotalChapters(volumes, nc.totalChapters)
+    : nc.totalChapters
   const configDone = !!(nc.coreOutline?.trim() || nc.protagonistProfile?.trim())
 
   // 故事架构进度
@@ -190,15 +214,15 @@ export default function ProjectTree() {
         iconName="layout-list"
         label="章节蓝图"
         desc="AI 生成的章节目录，可编辑"
-        badge={blueprintCount > 0 ? `${blueprintCount}/${nc.totalChapters} 章` : '待生成'}
+        badge={blueprintCount > 0 ? `${blueprintCount}/${effectiveTotal} 章` : '待生成'}
         badgeColor={
-          blueprintCount >= nc.totalChapters
+          blueprintCount >= effectiveTotal
             ? 'var(--color-success)'
             : blueprintCount > 0
               ? 'var(--color-warning, #eab308)'
               : undefined
         }
-        badgeDone={blueprintCount >= nc.totalChapters}
+        badgeDone={blueprintCount >= effectiveTotal}
         onClick={() => openBuiltinEditor('chapter-card-editor', '章节蓝图', 'chapter-card')}
         onContextMenu={e => showSidebarMenu([
           {

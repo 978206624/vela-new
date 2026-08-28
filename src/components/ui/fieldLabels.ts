@@ -29,6 +29,28 @@ export const FIELD_LABELS: Record<string, string> = {
   charactersArch: '人物群像',
   synopsis: '情节大纲',
   characterStates: '角色状态',
+  // —— 分卷（Phase 19）——
+  // ⚠️ `volumeTitle` / `volumePremise` / `volumeSynopsis` 目前**没有任何生产者**：
+  // 实际的 `VolumeData` 用的是 title/premise/synopsis，而 `read_project_state`
+  // 还不返回卷数据，`JsonCard` 按 JSON 原 key 查表，所以这三条**当前不可达**。
+  // 保留它们是 DEV-PLAN 明确指定的**预置**——等 Agent 侧出现卷数据工具、
+  // 输出带 volume 前缀的展示 key 时才生效（那三个裸 key 属于全书架构，
+  // 直接复用会让「本卷主线」显示成「故事前提」，故不能就地改成裸名）。
+  // 已登记待排期。
+  volumeNumber: '卷序号',
+  volumeTitle: '卷名',
+  volumePremise: '本卷主线',
+  volumeSynopsis: '本卷大纲',
+  startChapter: '起始章',
+  endChapter: '结束章',
+  openingState: '开卷状态',
+  closingState: '收卷状态',
+  openThreads: '未回收伏笔',
+  urgency: '优先级',
+  thread: '伏笔内容',
+  // 这两条是**当前就可达**的：卷记录用 `status`，伏笔条目用 `chapter`
+  status: '状态',
+  chapter: '章号',
   // —— 章节蓝图 ——
   chapterNumber: '章节号',
   role: '章节作用',
@@ -71,6 +93,17 @@ export const ENUM_LABELS: Record<string, Record<string, string>> = {
     antagonist: '反派',
     supporting: '配角',
     minor: '次要角色',
+  },
+  // 卷状态三态，与 VOLUME_STATUS_LABELS 同一套文案（那边是 UI 徽章，这边是资料卡）
+  status: {
+    planned: '未开始',
+    writing: '写作中',
+    done: '已完成',
+  },
+  urgency: {
+    high: '高',
+    mid: '中',
+    low: '低',
   },
 }
 

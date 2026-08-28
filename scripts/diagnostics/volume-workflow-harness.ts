@@ -3937,6 +3937,182 @@ ${prompt.slice(0, 500)}`)
         // 本 harness 不挂载 React 组件，覆盖不到。
     })
 
+    console.log('\n▶ 蓝图按卷分组（Task 19.4 批次二 T4）')
+
+    await testCase('X37 蓝图按卷分组：零卷不分组、空卷保留组头、越界章节不得丢失', async () => {
+        const { groupChaptersByVolume } = await import('../../src/services/volume-service')
+
+        const items = [
+            { chapterNumber: 1, id: 'a' },
+            { chapterNumber: 100, id: 'b' },
+            { chapterNumber: 101, id: 'c' },
+            { chapterNumber: 205, id: 'd' },   // 落在所有卷区间之外
+        ]
+
+        // ① 零卷 → 单组、volume 为 null，调用方据此维持不分组的原样渲染
+        const none = groupChaptersByVolume(items, [])
+        assertEq(none.length, 1, '零卷时只有一组')
+        assertEq(none[0].volume, null, '零卷那一组不带卷')
+        assertEq(none[0].items.length, 4, '零卷时一条都不能少')
+
+        // ①b **零卷 + 空列表**——这条才是 `if (vols.length === 0) return ...`
+        //     那句快路径的专属夹具。
+        //
+        //     我一度判断「那句是快路径、去掉后主流程产出完全相同的结果、
+        //     任何夹具都区分不开」，并据此删掉了对应变异。**那个判断是错的**：
+        //     items 非空时确实等价（全部落进 orphans、末尾补一组），
+        //     但 items 为空时 orphans 也为空 → 主流程一组都不补 → 返回 `[]`，
+        //     调用方拿到零组，界面上连「未分卷」这一段都没有。
+        //     教训：判断「两种写法等价」时，**空输入这一格必须单独试**。
+        assertEq(
+            groupChaptersByVolume([], []).length, 1,
+            '零卷且无条目时也必须返回一个空组，不能返回零组',
+        )
+        assertEq(groupChaptersByVolume([], [])[0].volume, null, '那一组同样不带卷')
+
+        // ② 有卷：按卷序分组；**第三卷是空的，组头仍要保留**
+        //    （它在说「这一卷还没生成蓝图」，隐藏掉反而是丢信息）
+        const vols = [
+            vol(1, 1, 100), vol(2, 101, 160), vol(3, 161, 200),
+        ]
+        const g = groupChaptersByVolume(items, vols)
+
+        // ⚠️ 下面三条刻意**各自先于**长度断言，且用不会越界的派生值表达——
+        // 都挤在「g.length === 4」一条上的话，三种不同的退化（丢孤儿 / 滤空组 /
+        // 不排序）会红在同一句话上，分不出是哪一种坏了。
+        //
+        // ③ 越界章节**必须**出现在「未归卷」组里。蓝图排到卷末章之后是允许的
+        //    中间态（孤儿蓝图），悄悄不显示会让用户以为蓝图没生成
+        assertEq(
+            g.filter(x => x.volume === null).flatMap(x => x.items.map(i => i.id)).join(','), 'd',
+            '越界章节必须归入未归卷组，一条都不能丢',
+        )
+        // ④ 空卷也要有组头：它在说「这一卷还没生成蓝图」，隐藏掉是丢信息
+        assertEq(
+            g.some(x => x.volume?.volumeNumber === 3 && x.items.length === 0), true,
+            '空卷必须保留分组头',
+        )
+
+        assertEq(g.length, 4, '三卷 + 一个「未归卷」组')
+        assertEq(g[0].volume!.volumeNumber, 1, '第一组是第 1 卷')
+        assertEq(g[0].items.map(i => i.id).join(','), 'a,b', '第 1、100 章归第一卷')
+        assertEq(g[1].items.map(i => i.id).join(','), 'c', '第 101 章归第二卷')
+
+        // ④ 组内保持传入顺序：调用方用**原下标**做选中态，重排会让点击选错行
+        const reordered = groupChaptersByVolume(
+            [{ chapterNumber: 100, id: 'x' }, { chapterNumber: 1, id: 'y' }], [vol(1, 1, 100)])
+        assertEq(reordered[0].items.map(i => i.id).join(','), 'x,y', '不得重新排序')
+
+        // ⑤ 卷表乱序传入时按卷序号排好，否则组头顺序会跟着调用方的数组顺序乱跳
+        const shuffled = groupChaptersByVolume(items, [vol(2, 101, 160), vol(1, 1, 100)])
+        assertEq(
+            shuffled.map(x => x.volume?.volumeNumber ?? 0).join(','), '1,2,0',
+            '分组按卷序号升序，未归卷排最后',
+        )
+    })
+
+    await testCase('X38 目录生成区间四道判据：措辞可辨；上限与派生末章各有专属夹具', async () => {
+        const { validateDirectoryRange, MAX_DIRECTORY_CHAPTERS } =
+            await import('../../src/shared/volume-limits')
+
+        assertEq(validateDirectoryRange(101, 60), '', '合法区间必须放行')
+        assertEq(validateDirectoryRange(1, MAX_DIRECTORY_CHAPTERS), '', '恰好达到上限应放行')
+
+        // ⚠️ 如实说清这四条夹具**各自证明到什么程度**，不笼统说「互不掩护」：
+        //   - 第③（上限）、第④（派生末章）**各有专属夹具**，去掉就放行；
+        //   - 第①（起点）、第②（数量）在**拒绝效果**上会被第④道接住，
+        //     夹具证明的是「按这个措辞分类拦下」，不是「唯有它能拦」。
+        //   按项目既有做法不硬拆重叠的守卫，只如实标注。
+        //
+        // ① 起点非安全整数：用 1.5。去掉这道后 count=10 合法、未超限、
+        //    派生末章 10.5 —— `Number.isSafeInteger(10.5)` 为 false，
+        //    会被第四道接住。故这条**同时**受一、四两道保护，如实标注：
+        //    它证明的是「这一对里至少有一道生效」，不硬拆
+        assert(
+            validateDirectoryRange(1.5, 10).includes('起始章号非法'),
+            '小数起点必须被第一道按「起始章号非法」拦下（第四道也能接住，措辞不同）',
+        )
+        // ② 数量非整数：用 1.5。起点 1 合法；去掉这道后派生末章 1.5 同样非安全整数，
+        //    会被第四道接住——故这条同样证明到「这一对里至少有一道生效」。
+        //
+        //    ⚠️ 另如实标注：第二道里 `isSafeInteger` 的「safe」部分**是冗余的**——
+        //    任何「是整数但不安全」的值都 ≥ 2^53，必然超过 MAX_DIRECTORY_CHAPTERS，
+        //    第三道（上限）总会先接住。它真正独有的作用只是拦非整数，即本条。
+        assert(
+            validateDirectoryRange(1, 1.5).includes('生成章数非法'),
+            '小数数量必须被第二道按「生成章数非法」拦下',
+        )
+        // ③ 超上限：起点、数量、派生末章**全都是**合法安全整数，只有这道能拦
+        assert(
+            validateDirectoryRange(1, MAX_DIRECTORY_CHAPTERS + 1).includes('单次最多生成'),
+            '超上限只有第三道能拦——这一条是四道里唯一没有重叠保护的',
+        )
+        // ④ 派生末章越界：起点与数量各自都是合法安全整数且未超上限，
+        //    相加却越出可精确表示的范围。只有这道能拦
+        assert(
+            validateDirectoryRange(Number.MAX_SAFE_INTEGER - 5, 100).includes('越界'),
+            '起点与数量各自合法、相加越界时只有第四道能拦',
+        )
+
+        // 零与负数走「数量非法」，不能悄悄当成 1
+        assert(validateDirectoryRange(1, 0).includes('生成章数非法'), '0 章必须拒绝')
+        assert(validateDirectoryRange(0, 10).includes('起始章号非法'), '第 0 章必须拒绝')
+    })
+
+    await testCase('X39 命令层先校验原始参数，再推导——改写过的值不能算通过', async () => {
+        freshEnv()
+        seedArchitecture()
+        // freshEnv 已经铺了第 1–10 章。再往后补两章、**中间留缺口**：
+        // 加上第 101、103 章之后，条数 = 12，而最大章号 = 103。
+        // 两种回落写法给出的起点差得很远（13 vs 104），断言因此可辨
+        BlueprintRepository.upsertMany([
+            { chapterNumber: 101, title: '一', role: '开篇', purpose: '', keyEvents: '', characters: [], suspenseHook: '', userGuidance: '', notes: '', notesUpdatedAt: '', targetWords: 0 },
+            { chapterNumber: 103, title: '三', role: '发展', purpose: '', keyEvents: '', characters: [], suspenseHook: '', userGuidance: '', notes: '', notesUpdatedAt: '', targetWords: 0 },
+        ] as never)
+        setVolumes([])
+        stubLLM([])
+
+        const run = async (params: Record<string, unknown>) => {
+            const runId = await useWorkflowStore.getState().startWorkflow(
+                createDirectoryWorkflow(params as never, currentToken))
+            const h = useWorkflowStore.getState().history.find(r => r.id === runId)
+            return h?.steps.map(s => s.error).filter(Boolean).join(' | ') ?? ''
+        }
+
+        // ① 显式非法起点必须被**原样**拒绝，而不是被 `|| fallback` 改写成合法起点
+        assert(
+            (await run({ mode: 'append', startChapter: 0, count: 5 })).includes('起始章号 0'),
+            '显式 startChapter=0 必须按原值报错，不能被回落改写后放行',
+        )
+        // ② 显式负数章数同理，不能被 `count && count > 0` 吞掉
+        assert(
+            (await run({ mode: 'append', startChapter: 5, count: -1 })).includes('生成章数 -1'),
+            '显式 count=-1 必须按原值报错',
+        )
+        // ③ 超上限必须在**钳制之前**拒绝：full 模式原先会先 Math.min 到全书章数再放行
+        assert(
+            (await run({ mode: 'full', count: 10001 })).includes('单次最多生成'),
+            'count 超上限必须拒绝原始请求，不能先钳到全书章数再通过',
+        )
+
+        // ④ 不传 startChapter 时回落用**最大章号 +1**，不是条数 +1。
+        //    库里是第 1–10 与第 101、103 章：条数 12 → 旧写法从第 13 章起
+        //    （落在早已存在的区段里，生成结果会 upsert 覆盖已有蓝图）；
+        //    最大章号 103 → 正确写法从第 104 章起。
+        //
+        //    ⚠️ 断言必须落在**实际算出来的区间**上。先前那条写成
+        //    `err.includes('第 4') || err === '' || !err.includes('第 3')`——
+        //    三个分支里任意一个都容易恒真，变异检验证明它两种实现下都绿，
+        //    等于什么都没验。改为直接读命令发出的那行日志。
+        useWorkflowStore.setState({ globalLogs: [] })
+        await run({ mode: 'append', count: 2 })
+        const logs = useWorkflowStore.getState().globalLogs.map(l => l.message).join(' | ')
+        assert(
+            logs.includes('生成第 104–105 章蓝图'),
+            `回落起点应为最大章号+1=104（条数+1=13 会落进已有章段并覆盖它们）。实际日志：${logs}`,
+        )
+    })
+
     // ===== 汇总 =====
     closeProjectDatabase()
     fs.rmSync(tmpRoot, { recursive: true, force: true })

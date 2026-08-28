@@ -9,11 +9,22 @@ import { cn } from '../../lib/utils'
  * - 失焦时若为空值，自动恢复为 min 属性值（若设置）或 "0"
  * - 业务组件可通过自定义 onBlur 覆盖恢复逻辑
  */
-const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
-  ({ className, type, onBlur, onFocus, ...props }, ref) => {
+interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
+  /**
+   * `type="number"` 失焦时**保留空值**，不做「空 → min ?? 0」的兜底。
+   *
+   * 需要它的场景：调用方要区分「没填」与「填了 0」。默认兜底会把空值悄悄变成 0，
+   * 于是「请填写章数」这条提示永远出不来，用户看到的是「生成章数非法：0」——
+   * 一句他没做过的事。默认行为保持不变，只有显式开启才改。
+   */
+  preserveEmptyOnBlur?: boolean
+}
+
+const Input = React.forwardRef<HTMLInputElement, InputProps>(
+  ({ className, type, onBlur, onFocus, preserveEmptyOnBlur, ...props }, ref) => {
     // 对 number 类型添加 onBlur 空值兜底
     const handleBlur: React.FocusEventHandler<HTMLInputElement> = (e) => {
-      if (type === 'number' && e.target.value === '') {
+      if (type === 'number' && e.target.value === '' && !preserveEmptyOnBlur) {
         // 恢复为 min 属性值或 "0"
         const fallback = props.min != null ? String(props.min) : '0'
         // 通过 nativeInputValueSetter 触发 React onChange

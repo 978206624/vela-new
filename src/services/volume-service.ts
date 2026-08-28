@@ -468,6 +468,44 @@ export function buildVolumeSavePayload(
     return patch
 }
 
+/**
+ * 按卷给「带章号的条目」分组（章节蓝图列表用，改造屏 11）。
+ *
+ * - **零卷**：返回单组 `volume: null`，调用方据此维持不分组的原样渲染。
+ * - **有卷**：按卷序升序各成一组；**落在所有卷区间之外**的条目归入末尾那组
+ *   （`volume: null`），不能丢——蓝图排到卷末章之后是允许的中间态，
+ *   悄悄不显示会让用户以为蓝图没生成。
+ *
+ * ⚠️ 遍历的是**条目**，不是章号区间。老库与外部导入的库里可能有超长卷，
+ * 按 `start..end` 逐章循环会让这个每次渲染都要跑的函数把界面冻住。
+ *
+ * 组内保持传入顺序（调用方已按章号排好），不重新排序——重排会让
+ * 选中项的下标映射失配。
+ */
+export function groupChaptersByVolume<T extends { chapterNumber: number }>(
+    items: readonly T[],
+    vols: readonly VolumeData[],
+): Array<{ volume: VolumeData | null; items: T[] }> {
+    if (vols.length === 0) return [{ volume: null, items: [...items] }]
+
+    const ordered = [...vols].sort((a, b) => a.volumeNumber - b.volumeNumber)
+    const groups = ordered.map(volume => ({ volume: volume as VolumeData | null, items: [] as T[] }))
+    const orphans: T[] = []
+
+    for (const item of items) {
+        const idx = ordered.findIndex(
+            v => item.chapterNumber >= v.startChapter && item.chapterNumber <= v.endChapter,
+        )
+        if (idx >= 0) groups[idx].items.push(item)
+        else orphans.push(item)
+    }
+
+    // 空卷也保留分组头：它在提示「这一卷还没生成蓝图」，隐藏掉反而是丢信息
+    const result = groups
+    if (orphans.length > 0) result.push({ volume: null, items: orphans })
+    return result
+}
+
 /** 取某章所属的卷；未分卷或章号落在所有卷区间之外返回 null */
 export function getCurrentVolume(vols: VolumeData[], chapterNumber: number): VolumeData | null {
     return vols.find(v => v.startChapter <= chapterNumber && v.endChapter >= chapterNumber) ?? null

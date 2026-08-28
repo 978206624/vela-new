@@ -162,6 +162,50 @@ export function validateVolumeRange(startChapter: number, endChapter: number): s
 }
 
 /**
+ * **单次目录生成**的章数上限。
+ *
+ * 住在这个文件里，是因为它与 `MAX_VOLUME_CHAPTERS` 是同一个理由的两面：
+ * 目录生成是**按批循环调用模型**的长流程，章数直接决定批次数，
+ * 「两端都是安全整数」同样不代表「跑得完」。
+ *
+ * ⚠️ 它是分卷之后**新增**的一道，不是原来就有的：
+ * 分卷之前，生成章数被小说配置里的总章数顺带钳住（`Math.min(total, v)`）；
+ * 分卷之后总章数随续卷不断扩展，那道钳制既失效又会误伤（用户想多生成几章会被悄悄改小），
+ * 于是按 DEV-PLAN 移除了它——而它**顺带**是当时唯一的数量上限。
+ *
+ * 分卷项目还有 `checkRangeCoverage`（区间须被卷连续覆盖）兜底，
+ * 但**零卷项目没有卷区间可校验**，那道直接放行。没有本上限，
+ * 一个误输入的巨大数字会让工作流持续烧模型调用。
+ */
+export const MAX_DIRECTORY_CHAPTERS = 10000
+
+/**
+ * 目录生成区间的提交前预检，返回空串表示通过。
+ *
+ * 渲染层（对话框）与 `DirectoryCommand` 入口共用同一份判据——
+ * 各写一份迟早分叉，而分叉的那份会放行另一条路径要拒绝的区间。
+ * 命令那一道是**最后防线**：`startWorkflow` 是公开入口，Agent 与将来的调用方
+ * 绕得过对话框，绕不过它。
+ */
+export function validateDirectoryRange(startChapter: number, count: number): string {
+  if (!Number.isSafeInteger(startChapter) || startChapter < 1) {
+    return `起始章号非法：${startChapter}（须为 ≥1 的整数）`
+  }
+  if (!Number.isSafeInteger(count) || count < 1) {
+    return `生成章数非法：${count}（须为 ≥1 的整数）`
+  }
+  if (count > MAX_DIRECTORY_CHAPTERS) {
+    return `单次最多生成 ${MAX_DIRECTORY_CHAPTERS} 章，当前 ${count} 章`
+  }
+  // 派生末章也要验：起点与数量各自合法，相加仍可能越出可精确表示的范围，
+  // 之后所有章号加减都会静默出错
+  if (!Number.isSafeInteger(startChapter + count - 1)) {
+    return `生成范围越界：从第 ${startChapter} 章起再生成 ${count} 章超出可精确表示的范围`
+  }
+  return ''
+}
+
+/**
  * 解析「本卷章数」输入框里的原始字符串，非法一律返回 `NaN`。
  *
  * ⚠️ 用 `Number()` 而非 `parseInt`。`Number.parseInt('1e21', 10) === 1`、

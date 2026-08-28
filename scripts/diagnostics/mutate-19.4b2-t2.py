@@ -25,6 +25,7 @@ LIMITS = ROOT / "src" / "shared" / "volume-limits.ts"
 REPO = ROOT / "electron" / "repositories" / "volume-repository.ts"
 DRAFT_STORE = ROOT / "src" / "stores" / "volume-draft-store.ts"
 VOLUME_STORE = ROOT / "src" / "stores" / "volume-store.ts"
+DIR_CMD = ROOT / "src" / "services" / "workflows" / "commands" / "directory.command.ts"
 
 # ⚠️ 关于 M14 的证明力边界（Codex T2 round-04 指出，如实记下）：
 # 旧写法的缺陷是「跳过同步但**照样推进 syncedFrom 游标**」，而游标推进发生在
@@ -269,6 +270,85 @@ MUTATIONS = [
         "      if (false) return\n    }\n    if (false) return",
         "X36",
         "reset 后 A 的刷新必须立刻退出",
+    ),
+    # ---- 蓝图按卷分组（T4）----
+    (
+        "M29 去掉零卷快路径（零卷 + 空列表时返回零组，界面上连「未分卷」都没有）",
+        SERVICE,
+        "    if (vols.length === 0) return [{ volume: null, items: [...items] }]",
+        "",
+        "X37",
+        "零卷且无条目时也必须返回一个空组",
+    ),
+    (
+        "M30 越界章节被丢弃（孤儿蓝图在界面上凭空消失）",
+        SERVICE,
+        "        else orphans.push(item)",
+        "        // mutated: 丢弃",
+        "X37",
+        "越界章节必须归入未归卷组",
+    ),
+    (
+        "M31 空卷不保留分组头（「这一卷还没生成蓝图」这条信息丢了）",
+        SERVICE,
+        "    const result = groups",
+        "    const result = groups.filter(g => g.items.length > 0)",
+        "X37",
+        "空卷必须保留分组头",
+    ),
+    (
+        "M32 不按卷序号排序（组头顺序跟着调用方数组乱跳）",
+        SERVICE,
+        "    const ordered = [...vols].sort((a, b) => a.volumeNumber - b.volumeNumber)",
+        "    const ordered = [...vols]",
+        "X37",
+        "分组按卷序号升序",
+    ),
+    # ---- 目录生成区间上限（T4）----
+    (
+        "M33 去掉单次生成章数上限（零卷项目可进入近乎无界的按批 LLM 循环）",
+        LIMITS,
+        "  if (count > MAX_DIRECTORY_CHAPTERS) {",
+        "  if (count > Number.MAX_SAFE_INTEGER) {",
+        "X38",
+        "超上限只有第三道能拦",
+    ),
+    (
+        "M34 去掉派生末章的越界校验",
+        LIMITS,
+        "  if (!Number.isSafeInteger(startChapter + count - 1)) {",
+        "  if (false) {",
+        "X38",
+        "相加越界时只有第四道能拦",
+    ),
+    # ⚠️ 这里**刻意没有**「count 的 isSafeInteger 放宽成 isInteger」那条变异。
+    # 试过，不转红：任何「是整数但不安全」的值都 ≥ 2^53，必然 > MAX_DIRECTORY_CHAPTERS，
+    # 于是第三道（上限）总会先接住它——两道在**数学上互为掩护**，构造不出专属夹具。
+    # 第二道真正独有的作用是拦**非整数**（1.5），那一格由 X38 的②号夹具证明。
+    # ---- 命令层：先验原始参数，再推导 ----
+    (
+        "M36 回落用条数+1 而非最大章号+1（有缺口时覆盖已有蓝图）",
+        DIR_CMD,
+        "      startChapter = this.params.startChapter ?? (maxExisting + 1)",
+        "      startChapter = this.params.startChapter ?? (existingBlueprints.length + 1)",
+        "X39",
+        "回落起点应为最大章号+1=104",
+    ),
+    (
+        "M37 显式非法起点被回落改写后放行",
+        DIR_CMD,
+        "    if (raw.startChapter !== undefined",
+        "    if (false && raw.startChapter !== undefined",
+        "X39",
+        "显式 startChapter=0 必须按原值报错",
+    ),
+    (
+        "M38 超上限先被 Math.min 钳到全书章数再放行",
+        DIR_CMD,
+        "      if (raw.count > MAX_DIRECTORY_CHAPTERS) {",
+        "      if (false) {",
+        "X39",
+        "count 超上限必须拒绝原始请求",
     ),
 ]
 

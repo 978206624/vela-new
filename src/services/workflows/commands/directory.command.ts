@@ -6,6 +6,7 @@ import { DirectoryPromptBuilder } from '../../prompts/prompt-builder'
 import { DirectoryWorkflowParams, ChapterBlueprint, parseTextBlueprints, saveAllBlueprints } from '../directory-workflow'
 import { globalEventBus } from '../../../shared/event-bus'
 import { coerceChapterRole } from '../../../shared/chapter-roles'
+import { validateDirectoryRange, MAX_DIRECTORY_CHAPTERS } from '../../../shared/volume-limits'
 import {
   getEffectiveTotalChapters, getVolumeCompass, getVolumeOutline, checkRangeCoverage, describeNotReady,
   type VolumeCompassData,
@@ -105,11 +106,44 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
     if (!totalQ.ready) throw new Error(`无法确定全书总章数：${describeNotReady(totalQ.reason)}`)
     const totalChapters = totalQ.value
 
+    /**
+     * ⚠️ **先校验调用方显式传进来的原始值，再做任何推导。**
+     *
+     * 下面那些 `|| fallback`、`count && count > 0`、`Math.min(count, total)`
+     * 都会把非法原值**改写成一段合法区间**，于是后面那道 `validateDirectoryRange`
+     * 看到的已经是改写后的结果——「最后防线」形同虚设。两个真实反例：
+     *   - `{mode:'append', startChapter:0, count:-1}` 会被改成
+     *     「从已有条数+1 一直生成到全书末尾」，派生区间合法、校验通过；
+     *   - `{mode:'full', count:10001}` 在全书仅 100 章时先被钳成 100，
+     *     再通过上限校验——而规格要求的是拒绝这个请求。
+     *
+     * `count === 0` 是既有契约里的哨兵（表示「不指定数量，生成到末尾」），
+     * 保留不动；**非零**的 count 一律按严格判据验。
+     */
+    const raw = this.params
+    if (raw.startChapter !== undefined
+      && (!Number.isSafeInteger(raw.startChapter) || raw.startChapter < 1)) {
+      throw new Error(`生成范围非法：起始章号 ${raw.startChapter}（须为 ≥1 的整数）`)
+    }
+    if (raw.count !== undefined && raw.count !== 0) {
+      if (!Number.isSafeInteger(raw.count) || raw.count < 1) {
+        throw new Error(`生成范围非法：生成章数 ${raw.count}（须为 ≥1 的整数）`)
+      }
+      if (raw.count > MAX_DIRECTORY_CHAPTERS) {
+        throw new Error(`生成范围非法：单次最多生成 ${MAX_DIRECTORY_CHAPTERS} 章，当前 ${raw.count} 章`)
+      }
+    }
+
     let startChapter = 1
     let endChapter = totalChapters
 
     if (this.params.mode === 'append') {
-      startChapter = this.params.startChapter || (existingBlueprints.length + 1)
+      // ⚠️ 回落用**现有最大章号 +1**，不是条数 +1。蓝图章号允许有缺口
+      //（用户删过中间几章、或按卷分段生成）：库里只有第 1、3 章时条数是 2，
+      // `2 + 1 = 3` 正好落在已有的第 3 章上，生成结果会 upsert 覆盖它。
+      // Agent 侧的 start-workflow.tool.ts 一直是按最大章号推的，这里曾是分叉点。
+      const maxExisting = existingBlueprints.reduce((m, b) => Math.max(m, b.chapterNumber), 0)
+      startChapter = this.params.startChapter ?? (maxExisting + 1)
       if (this.params.count && this.params.count > 0) {
         endChapter = startChapter + this.params.count - 1
       }
@@ -126,6 +160,17 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
         `若要续写新章节，请先「续写下一卷」扩展卷区间，或显式指定生成章数`
       )
     }
+
+    // ⚠️ 数量上限必须在**任何 LLM 调用之前**验，且不能只靠 checkRangeCoverage：
+    // 那道在**零卷项目**上返回 null 直接放行（没有卷区间可校验），
+    // 于是一个误输入的巨大 count 会让下面的按批循环持续烧模型调用。
+    //
+    // 放在空区间那道**之后**：两者都能拦下 count<1，但上面那条的措辞
+    // 会告诉用户「请先续写下一卷扩展卷区间」，比一句「生成章数非法：0」有用得多。
+    // 这道是最后防线：`startWorkflow` 是公开入口，Agent 与将来的调用方
+    // 绕得过对话框，绕不过这里。判据与对话框共用同一个纯函数，不会分叉。
+    const rangeError = validateDirectoryRange(startChapter, endChapter - startChapter + 1)
+    if (rangeError) throw new Error(`生成范围非法：${rangeError}`)
 
     // 整个请求区间必须被现有卷连续覆盖——**在任何 LLM 调用与落库之前**校验。
     // 逐批到了才发现是不够的：请求 58–63 时，58–60 那批会先跑完模型并把蓝图写进库，
