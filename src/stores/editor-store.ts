@@ -4,7 +4,7 @@ import { create } from 'zustand'
 export interface EditorTab {
   id: string
   name: string
-  type: 'chapter' | 'outline' | 'character' | 'config' | 'diff' | 'chapter-card' | 'world-building' | 'arch-file' | 'version-history' | 'review-report'
+  type: 'chapter' | 'outline' | 'character' | 'config' | 'diff' | 'chapter-card' | 'world-building' | 'arch-file' | 'version-history' | 'review-report' | 'volume-overview' | 'volume'
   filePath?: string
   content?: string
   /** diff 视图的原始内容 */
@@ -18,6 +18,14 @@ export interface EditorTab {
   reviewReport?: string
   /** 草稿所属章节号 */
   chapterNumber?: number
+  /**
+   * 卷详情 Tab 的卷序号（type='volume' 时必填）。
+   *
+   * 不从 tab id 里反解：id 是字符串拼出来的，解析失败会静默变成 NaN，
+   * 而 NaN 一路传到 `volumes.find()` 只会「查不到这一卷」，
+   * 表现成空白页而不是报错，排查时看不出是 id 格式变过。
+   */
+  volumeNumber?: number
   /** 草稿所在章节目录 */
   chapterDir?: string
   /** 审稿报告存放路径 */

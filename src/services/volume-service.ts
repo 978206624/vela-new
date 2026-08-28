@@ -77,6 +77,22 @@ export function isVolumeMode(snap: VolumeSnapshot): VolumeQuery<boolean> {
 }
 
 /**
+ * 全书有效总章数的**纯计算**部分（不含就绪判定）。
+ *
+ * - 分卷模式：各卷 `endChapter` 最大值（**卷表为准**）
+ * - 单卷模式：回落 `fallbackTotal`（即 `novelConfig.totalChapters`）
+ *
+ * 抽出来是因为纯展示路径（分卷总览页的副信息）也要这条规则，而它拿到的
+ * `volumes` 已经在 `status === 'ready'` 分支里了、不需要再走一遍 fail-closed。
+ * 若让它自己 `reduce` 一遍，这条规则就有了第二份实现——分叉的那份迟早
+ * 与卷表口径不一致。规则只写一次，就绪判定由下面的 `getEffectiveTotalChapters` 加。
+ */
+export function computeEffectiveTotalChapters(vols: VolumeData[], fallbackTotal: number): number {
+    if (vols.length === 0) return fallbackTotal
+    return vols.reduce((max, v) => Math.max(max, v.endChapter), 0)
+}
+
+/**
  * 全书有效总章数。
  * - 分卷模式：各卷 `endChapter` 最大值（**卷表为准**）
  * - 单卷模式：回落 `novelConfig.totalChapters`
@@ -91,8 +107,7 @@ export function getEffectiveTotalChapters(
     const nr = notReady<number>(snap)
     if (nr) return nr
     const vols = (snap as { volumes: VolumeData[] }).volumes
-    if (vols.length === 0) return { ready: true, value: novelConfig.totalChapters }
-    return { ready: true, value: vols.reduce((max, v) => Math.max(max, v.endChapter), 0) }
+    return { ready: true, value: computeEffectiveTotalChapters(vols, novelConfig.totalChapters) }
 }
 
 /**
@@ -274,6 +289,84 @@ export function checkRangeCoverage(
 }
 
 // ===== 展示用 helper：收数组即可，失败模式是安全默认值 =====
+
+/**
+ * 「有定稿」的判据。抽出来是因为侧栏卷卡片、分卷总览大卡两处都要用，
+ * 各写一份迟早分叉（其中一份会漏掉 `finalized` 之外的状态判断）。
+ */
+const hasFinalized = (drafts: Array<{ status: string }> | undefined): boolean =>
+    !!drafts?.some(d => d.status === 'finalized')
+
+/**
+ * 统计某章号闭区间内**已定稿**的章数。
+ *
+ * ⚠️ 遍历的是 draft-store 里**实际存在的章**，不是 `start..end` 这个区间。
+ * `MAX_VOLUME_CHAPTERS` 只约束新写入，老库与外部导入的库里仍可能有超长卷；
+ * 而本函数跑在侧栏与总览页这类**每次状态变更都要重算**的位置，
+ * 按区间循环会让渲染直接冻住。
+ *
+ * ⚠️ 返回值是**展示用近似值**，不是权威定稿清单：`draft-store.loadAllDrafts`
+ * 只扫「已有蓝图的章」，无蓝图却已定稿的章不在其中（与 `canDeleteVolume`
+ * 的口径说明同源）。用于进度条无害，不可当授权依据。
+ */
+export function countFinalizedInRange(
+    draftsByChapter: Record<number, Array<{ status: string }> | undefined>,
+    startChapter: number,
+    endChapter: number,
+): number {
+    let n = 0
+    for (const [ch, drafts] of Object.entries(draftsByChapter)) {
+        const c = Number(ch)
+        if (c < startChapter || c > endChapter) continue
+        if (hasFinalized(drafts)) n++
+    }
+    return n
+}
+
+/** 全书已定稿章数。口径与 `countFinalizedInRange` 同源（同样是展示用近似值） */
+export function countFinalizedTotal(
+    draftsByChapter: Record<number, Array<{ status: string }> | undefined>,
+): number {
+    let n = 0
+    for (const drafts of Object.values(draftsByChapter)) {
+        if (hasFinalized(drafts)) n++
+    }
+    return n
+}
+
+/**
+ * 卷卡片的「主线摘要」取数：`premise` 优先，为空回落 `synopsis`。
+ *
+ * ⚠️ 不能只看 `premise`。惰性建卷的第一卷由 `buildFirstVolumeDraft()` 构造，
+ * 它固定 `premise: ''`，而把**原有的全书大纲**放进 `synopsis`——只看 premise
+ * 会让首卷在总览页永远显示「尚无摘要」，而它其实有大纲。
+ *
+ * 抽成纯函数是为了可测：留在组件里，这条回落只能靠人工建一个首卷来验。
+ */
+export function getVolumeSummary(v: Pick<VolumeData, 'premise' | 'synopsis'>): string {
+    return v.premise?.trim() || v.synopsis?.trim() || ''
+}
+
+/**
+ * 卷卡片的未回收伏笔计数展示值。返回 `null` 表示「该写成 —」。
+ *
+ * 规则，按优先级：
+ * 1. **有伏笔就一定写出数字**。伏笔清单经 `db:volume-update-threads` 独立更新，
+ *    与 `premise`/`synopsis` 毫无绑定——用户完全可以在一个还没写大纲的卷里
+ *    先补录几条伏笔。此时把它显示成「—」是在**隐藏已经存在的确定数据**。
+ * 2. 没有伏笔、但**有大纲** → 写 `0`。台账已经建起来了，「0」是权威且有意义的
+ *    结论（本卷没有遗留伏笔），伪装成未知反而是退步。
+ * 3. 没有伏笔、也**没有大纲** → `null`。这时台账还没建，谈「0 条」会被读成
+ *    「已确认没有伏笔」（设计稿 27 第三张卡画的就是「—」）。
+ */
+export function describeOpenThreadCount(
+    v: Pick<VolumeData, 'premise' | 'synopsis' | 'openThreads'>,
+): number | null {
+    const count = v.openThreads?.length ?? 0
+    if (count > 0) return count
+    return getVolumeSummary(v) ? 0 : null
+}
+
 /** 取某章所属的卷；未分卷或章号落在所有卷区间之外返回 null */
 export function getCurrentVolume(vols: VolumeData[], chapterNumber: number): VolumeData | null {
     return vols.find(v => v.startChapter <= chapterNumber && v.endChapter >= chapterNumber) ?? null

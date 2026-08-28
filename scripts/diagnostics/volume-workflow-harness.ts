@@ -77,6 +77,8 @@ import {
 import { createDirectoryWorkflow } from '../../src/services/workflows/directory-workflow'
 import { useVolumeStore } from '../../src/stores/volume-store'
 import { useVolumeFlowStore, invalidateVolumeFlow } from '../../src/stores/volume-flow-store'
+// 只取类型：X26 用它做「除 project-switched 外全部 reason」的**编译期穷尽约束**
+import type { StartFlowFailReason } from '../../src/services/volume-flow'
 
 // ===== 迷你断言框架（与 volume-commit-harness 同款口径）=====
 
@@ -3209,6 +3211,160 @@ ${prompt.slice(0, 500)}`)
 
         assertEq(validateOpenThreads(rows), '',
             '预检必须按落库字段量：UI 专用字段计入限额会误拒仓储层本来接受的数据')
+    })
+
+    console.log('\n▶ 卷 UI 的展示口径（Task 19.4 批次二）')
+
+    await testCase('X24 已写章数只数区间内的 finalized（上下界各自可辨）', async () => {
+        const { countFinalizedInRange, countFinalizedTotal } =
+            await import('../../src/services/volume-service')
+
+        // 第 2 章有稿但都没定稿；第 9 章定稿但在窄区间之外
+        const drafts = {
+            1: [{ status: 'finalized' }],
+            2: [{ status: 'draft' }, { status: 'reviewed' }],
+            3: [{ status: 'finalized' }],
+            9: [{ status: 'finalized' }],
+        }
+
+        // 三条断言刻意各自只让**一道**判据成为唯一那道，避免「两道守卫互相掩护、
+        // 单独去掉任一道都不转红」（本 Task 已在别处栽过六次）：
+        //   ① 上界：start=1 时下界不排除任何章，去掉 `c > end` 就会多数到第 9 章
+        assertEq(countFinalizedInRange(drafts, 1, 3), 2, '第 1–3 章内定稿的是第 1、3 章')
+        //   ② 下界：end=9 时上界不排除任何章，去掉 `c < start` 就会多数到第 1 章
+        assertEq(countFinalizedInRange(drafts, 3, 9), 2, '第 3–9 章内定稿的是第 3、9 章')
+        //   ③ 定稿判据：区间里只有第 2 章，它有草稿但无定稿。把 `status==='finalized'`
+        //      放宽成「有草稿就算」会数出 1
+        assertEq(countFinalizedInRange(drafts, 2, 2), 0, '只有未定稿草稿的章不算已写')
+
+        assertEq(countFinalizedTotal(drafts), 3, '全书口径与区间口径同源：共 3 章有定稿')
+    })
+
+    await testCase('X25 区间可以大到不可遍历，统计仍只按实际记录走', async () => {
+        const { countFinalizedInRange } = await import('../../src/services/volume-service')
+
+        // 老库与外部导入的库仍可能有超长卷（MAX_VOLUME_CHAPTERS 只约束新写入），
+        // 而这个函数跑在侧栏与总览页这类每次状态变更都要重算的位置。
+        //
+        // ⚠️ 断言方式刻意**不是**「跑一遍看耗时」：若实现退化成
+        // `for (i=start; i<=end; i++)`，那种写法会挂死在 9 千万亿次循环里，
+        // harness 永远不结束——那是可观测的失败，但不是一条能在有界时间内
+        // 拿到的红。改用**只允许被访问 N 次的代理对象**：按记录遍历时
+        // (`Object.entries`) 恰好访问 2 次；按区间循环则在第 3 次访问时抛错，
+        // 微秒级变红且带明确原因。
+        const records: Record<number, Array<{ status: string }>> = {
+            1: [{ status: 'finalized' }],
+            5: [{ status: 'finalized' }],
+        }
+        const budget = Object.keys(records).length
+        let reads = 0
+        const guarded = new Proxy(records, {
+            get(target, prop, recv) {
+                // 只统计**数据键**的读取：Symbol 与原型方法不算遍历成本
+                if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+                    reads++
+                    if (reads > budget) {
+                        throw new Error(
+                            `统计按章号区间遍历了：读了第 ${reads} 个键（记录只有 ${budget} 条）。` +
+                            `必须按实际记录遍历，否则超长卷会让侧栏渲染冻住`
+                        )
+                    }
+                }
+                return Reflect.get(target, prop, recv)
+            },
+        })
+
+        assertEq(
+            countFinalizedInRange(guarded, 1, Number.MAX_SAFE_INTEGER), 2,
+            '两条记录都在区间内',
+        )
+        assertEq(reads, budget, `应恰好读 ${budget} 次（每条记录一次），实际 ${reads} 次`)
+    })
+
+    await testCase('X26 project-switched 刻意不提示，其余失败原因**全部**原样透传', async () => {
+        const { describeStartFlowResult } = await import('../../src/services/volume-flow')
+
+        assertEq(describeStartFlowResult({ ok: true, stage: 'wizard' }), null, '成功不提示')
+        // 这一条是判据的**唯一**保护点：去掉 `reason === 'project-switched'` 那行，
+        // 只有它会变红
+        assertEq(
+            describeStartFlowResult({ ok: false, reason: 'project-switched', message: '项目已切换，本次续卷已取消' }),
+            null,
+            'project-switched 是用户自己切走的，再弹一句等于告诉他他刚做过的事',
+        )
+
+        // 表驱动枚举**除 project-switched 外的全部** reason。
+        // 用 `Record<Exclude<...>>` 而非数组：数组漏一项 tsc 不会管，
+        // 而 Record 缺项直接编译失败——将来往联合里加 reason 却忘了归类时，
+        // 本用例会在编译期就拦下，而不是继续全绿。
+        const passthrough: Record<Exclude<StartFlowFailReason, 'project-switched'>, string> = {
+            'no-project': '未打开项目',
+            'busy': '已有续卷流程正在进行',
+            'no-finalized': '尚无定稿章节，先写完至少一章再续卷',
+            'inspect-failed': '首卷探查失败，请重试',
+        }
+        for (const [reason, message] of Object.entries(passthrough)) {
+            assertEq(
+                describeStartFlowResult({ ok: false, reason: reason as StartFlowFailReason, message }),
+                message,
+                `reason=${reason} 的原始 message 必须原样传到 UI`,
+            )
+        }
+        // 注：`if (res.ok) return null` 那一道**去不掉**——判别联合下，
+        // 删了它就访问不到 `res.reason`，tsc 直接报错。故本用例不宣称用变异证明过它。
+    })
+
+    await testCase('X27 卷卡摘要回落 synopsis；伏笔计数区分「确定的 0」与「还没建台账」', async () => {
+        const { getVolumeSummary, describeOpenThreadCount, computeEffectiveTotalChapters } =
+            await import('../../src/services/volume-service')
+
+        // 惰性首卷的真实形状：premise 恒为空，synopsis 是原有的全书大纲。
+        // 只看 premise 的实现会让它在总览页显示「尚无摘要」，而它其实有大纲
+        const lazyFirst = { premise: '', synopsis: '全书原大纲', openThreads: [] }
+        assertEq(getVolumeSummary(lazyFirst), '全书原大纲', 'premise 为空时必须回落 synopsis')
+        // premise 存在时优先它（否则「回落」会变成「永远用 synopsis」）
+        assertEq(
+            getVolumeSummary({ premise: '本卷主线', synopsis: '本卷大纲' }), '本卷主线',
+            'premise 有内容时优先展示它',
+        )
+        // 只有空白字符不算内容——否则一个换行就能让卡片显示一片空白
+        assertEq(getVolumeSummary({ premise: '  \n ', synopsis: '' }), '', '纯空白不算摘要')
+
+        // 有大纲 + 零条伏笔：这是**权威的 0**，必须写出数字
+        assertEq(describeOpenThreadCount(lazyFirst), 0, '有大纲的卷，0 条是确定结论，要如实写')
+        // 无大纲 + 零条：台账还没建，谈「0 条」会被读成「已确认没有伏笔」
+        assertEq(
+            describeOpenThreadCount({ premise: '', synopsis: '', openThreads: [] }), null,
+            '无大纲且无伏笔的卷应交给 UI 写「—」，不能报 0',
+        )
+        // 无大纲 + **有伏笔**：伏笔经 db:volume-update-threads 独立更新，与摘要毫无绑定。
+        // 只凭「有没有摘要」决定要不要显示数字，会把用户刚补录的伏笔藏成「—」
+        assertEq(
+            describeOpenThreadCount({
+                premise: '', synopsis: '',
+                openThreads: [
+                    { chapter: 3, thread: '锈剑铭文', urgency: 'high' },
+                    { chapter: 7, thread: '师门叛徒', urgency: 'mid' },
+                ],
+            }),
+            2,
+            '没写大纲但已补录伏笔时，必须如实写出条数——那是确定存在的数据',
+        )
+        assertEq(
+            describeOpenThreadCount({ premise: 'P', synopsis: '', openThreads: [{ chapter: 1, thread: 'x', urgency: 'mid' }] }),
+            1,
+            '有大纲时按实际条数',
+        )
+
+        // 顺带钉住「卷表为准」这条规则只有一份实现：总览页用的是同一个纯函数
+        assertEq(computeEffectiveTotalChapters([], 220), 220, '零卷回落 novelConfig.totalChapters')
+        assertEq(
+            computeEffectiveTotalChapters(
+                [vol(1, 1, 100), vol(2, 101, 160)] as never, 999,
+            ),
+            160,
+            '有卷时取各卷 endChapter 最大值，忽略 novelConfig 的总章数',
+        )
     })
 
     // ===== 汇总 =====

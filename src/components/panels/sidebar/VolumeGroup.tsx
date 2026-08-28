@@ -7,16 +7,19 @@
  * - **零卷**：说明块（当前为单卷模式），不列任何卷。
  * - **有卷**：卷卡片列表（卷名 / 状态徽章 / 章号范围 / 已写 / 进度条）。
  *
- * 右上角 `+` 触发续卷向导。这是 Phase 19 目前**唯一**的续卷入口——
- * 分卷总览页的 CTA 在后续批次接同一个 `startNextVolumeFlow()`。
+ * 右上角 `+` 触发续卷向导；点击分组标题打开「分卷总览」页，
+ * 点击卷卡片打开该卷的**详情 Tab**（`type:'volume'`）。
+ * 详情 Tab 的渲染组件由后续 Task 接入，本组件只负责路由。
  */
 import { useEffect } from 'react'
 import { Plus, Layers } from 'lucide-react'
 import { useVolumeStore } from '../../../stores/volume-store'
 import { useProjectStore } from '../../../stores/project-store'
 import { useDraftStore } from '../../../stores/draft-store'
-import { VOLUME_STATUS_LABELS } from '../../../services/volume-service'
-import { startNextVolumeFlow } from '../../../services/volume-flow'
+import { useEditorStore } from '../../../stores/editor-store'
+import { VOLUME_STATUS_LABELS, countFinalizedInRange } from '../../../services/volume-service'
+import { startNextVolumeFlow, describeStartFlowResult } from '../../../services/volume-flow'
+import { openVolumeOverview, openVolumeDetail, volumeTabId } from '../../../services/volume-tabs'
 import { toast } from '../../ui/Toast'
 import type { VolumeData, VolumeStatus } from '../../../../electron/repositories/volume-repository'
 
@@ -45,26 +48,38 @@ export default function VolumeGroup() {
   }, [projectPath, loadAll])
 
   /**
-   * 发起续卷。服务层只返回原因，提示由这里给——
-   * 其中 `project-switched` **刻意不弹**：那是用户自己切走的，
-   * 再弹一句「项目已切换」属于告诉他他刚做过的事
+   * 发起续卷。提示分派走共享的纯函数 `describeStartFlowResult`——
+   * 分卷总览页的 CTA 用的是同一份判据，其中 `project-switched` 刻意不弹：
+   * 那是用户自己切走的，再弹一句「项目已切换」属于告诉他他刚做过的事
    */
   const handleStart = async () => {
-    const res = await startNextVolumeFlow()
-    if (!res.ok && res.reason !== 'project-switched') toast.error(res.message)
+    const msg = describeStartFlowResult(await startNextVolumeFlow())
+    if (msg) toast.error(msg)
   }
 
   return (
     <div>
+      {/* 外层只负责布局，**不带交互语义**：给它套 role="button" 会形成
+          「按钮里包着按钮」，加号的 Enter/Space 还会冒泡到父行。
+          「打开总览」与「续写下一卷」拆成两个同级原生 <button>，
+          各自可 Tab 到、各自有焦点环 */}
       <div className="tree-item gap-1.5 select-none" style={{ paddingLeft: 10 }}>
-        <Layers size={14} style={{ color: 'var(--color-text-muted)' }} />
-        <span className="text-sm font-medium flex-1 min-w-0 truncate" style={{ color: 'var(--color-text)' }}>
-          分卷
-        </span>
         <button
-          className="flex-shrink-0 p-0.5 rounded hover:opacity-80"
+          type="button"
+          className="flex items-center gap-1.5 flex-1 min-w-0 text-left cursor-pointer rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+          onClick={openVolumeOverview}
+          title="打开分卷总览"
+        >
+          <Layers size={14} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+          <span className="text-sm font-medium min-w-0 truncate" style={{ color: 'var(--color-text)' }}>
+            分卷
+          </span>
+        </button>
+        <button
+          type="button"
+          className="flex-shrink-0 p-0.5 rounded hover:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
           title="续写下一卷"
-          onClick={(e) => { e.stopPropagation(); void handleStart() }}
+          onClick={() => void handleStart()}
           style={{ color: 'var(--color-text-muted)' }}
         >
           <Plus size={14} />
@@ -115,28 +130,36 @@ function ZeroVolumeBlock({ totalChapters }: { totalChapters: number }) {
 
 function VolumeCard({ volume }: { volume: VolumeData }) {
   // 已写章数 = 该卷区间内有定稿的章数。取自 draft-store（定稿优先），
-  // 不额外发 IPC——侧栏是高频渲染区。
+  // 不额外发 IPC——侧栏是高频渲染区。统计口径与分卷总览页共用
+  // `countFinalizedInRange`（它按**实际存在的章**遍历，不按区间循环，
+  // 理由见该函数注释）。
   //
-  // ⚠️ 遍历的是 **draft-store 里实际存在的章**，不是 `start..end` 这个区间。
-  // 新建的卷已受 `MAX_VOLUME_CHAPTERS` 约束，但老库/外部导入的库仍可能有超长卷，
-  // 而侧栏每次状态变更都要重算——按区间循环会让它在渲染时直接冻住
-  const writtenCount = useDraftStore(s => {
-    let n = 0
-    for (const [ch, drafts] of Object.entries(s.draftsByChapter)) {
-      const c = Number(ch)
-      if (c < volume.startChapter || c > volume.endChapter) continue
-      if (drafts?.some(d => d.status === 'finalized')) n++
-    }
-    return n
-  })
+  // ⚠️ 选择器必须返回**数字**：zustand v5 要求快照稳定，
+  // 返回新数组会让 useSyncExternalStore 每次都判定「变了」而反复重渲染
+  const writtenCount = useDraftStore(s => countFinalizedInRange(s.draftsByChapter, volume.startChapter, volume.endChapter))
+  // 当前打开的卷详情高亮（设计稿 29 左侧选中态）
+  const active = useEditorStore(s => s.activeTabId === volumeTabId(volume.volumeNumber))
   const total = volume.endChapter - volume.startChapter + 1
   // total 理论上恒 ≥1（仓储层校验 end≥start），除零保护是防御性的
   const pct = total > 0 ? Math.round((writtenCount / total) * 100) : 0
 
   return (
     <div
-      className="rounded-md p-2.5 mb-1.5"
-      style={{ border: '1px solid var(--color-border)' }}
+      role="button"
+      tabIndex={0}
+      className="rounded-md p-2.5 mb-1.5 cursor-pointer transition-colors"
+      style={{
+        border: `1px solid ${active ? 'var(--color-accent)' : 'var(--color-border)'}`,
+        background: active ? 'var(--color-active)' : 'transparent',
+      }}
+      onClick={() => openVolumeDetail(volume.volumeNumber, volume.title)}
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          openVolumeDetail(volume.volumeNumber, volume.title)
+        }
+      }}
+      title="打开卷详情"
     >
       <div className="flex items-center gap-2 mb-1.5">
         <span className="text-sm flex-1 min-w-0 truncate" style={{ color: 'var(--color-text)' }} title={volume.title}>

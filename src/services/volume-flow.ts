@@ -53,6 +53,19 @@ export const getFlowToken = (): number | undefined => useFlowRun.getState().toke
 export const getFlowId = (): number => useFlowRun.getState().flowId
 
 /**
+ * 发起失败的原因。**单独导出**是为了让消费方能对它做穷尽性约束——
+ * harness 用 `Record<Exclude<StartFlowFailReason,'project-switched'>, string>`
+ * 枚举「必须原样透传」的那几个；将来往联合里加一个新 reason 而忘了归类时，
+ * 那份 Record 会缺项，tsc 直接报错，而不是让用例继续全绿。
+ */
+export type StartFlowFailReason =
+  | 'no-project'
+  | 'busy'
+  | 'project-switched'
+  | 'no-finalized'
+  | 'inspect-failed'
+
+/**
  * 发起结果。**`ok:false` 不一定要报给用户**——`project-switched` 是用户
  * 自己切走的，弹个错反而莫名其妙；调用方按 reason 分派。
  */
@@ -60,9 +73,26 @@ export type StartFlowResult =
   | { ok: true; stage: 'wizard' | 'orphan' }
   | {
     ok: false
-    reason: 'no-project' | 'busy' | 'project-switched' | 'no-finalized' | 'inspect-failed'
+    reason: StartFlowFailReason
     message: string
   }
+
+/**
+ * 发起结果 → 用户可见提示。返回 `null` 表示**刻意不提示**。
+ *
+ * 判据留在这里而不是各入口自己写：侧栏「分卷」分组的 `+` 与分卷总览页的
+ * 「续写下一卷」都要发起同一条流程，两处各写一份 if 迟早分叉——
+ * 而分叉的那一份会在用户**自己**切走项目后弹一句「项目已切换」，
+ * 等于告诉他他刚做过的事。
+ *
+ * 不在这里直接弹 toast 的理由见文件头：服务层不碰 `document`，
+ * 且通知失败不该改变控制流。这里只回答「该说什么」，说不说得出去由调用方负责。
+ */
+export function describeStartFlowResult(res: StartFlowResult): string | null {
+  if (res.ok) return null
+  if (res.reason === 'project-switched') return null
+  return res.message
+}
 
 /**
  * 发起续卷流程。**入口第一行捕获 token 与实例号**，随后的探查都是 await。

@@ -1,4 +1,4 @@
-import { X, FileText, Settings, Users, ArrowLeftRight, MoreHorizontal, BookOpen, History, ClipboardCheck, Globe, ChevronLeft, ChevronRight, PenTool, Copy, Check } from 'lucide-react'
+import { X, FileText, Settings, Users, ArrowLeftRight, MoreHorizontal, BookOpen, History, ClipboardCheck, Globe, ChevronLeft, ChevronRight, PenTool, Copy, Check, Layers } from 'lucide-react'
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { ContextMenu, type ContextMenuEntry } from '../ui/ContextMenu'
 import {
@@ -17,6 +17,7 @@ import ReviewReport from '../editor/ReviewReport'
 import ThreeWayMerge from '../editor/ThreeWayMerge'  // 保留引用以防其他入口使用
 import WelcomePage from '../pages/WelcomePage'
 import KnowledgeOverview from '../pages/KnowledgeOverview'
+import VolumeOverview from '../pages/VolumeOverview'
 import { useProjectStore } from '../../stores/project-store'
 import { useEditorStore, type EditorTab } from '../../stores/editor-store'
 import { useLayoutStore } from '../../stores/layout-store'
@@ -493,6 +494,7 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
     if (type === 'world-building') return <Globe size={14} />
     if (type === 'version-history') return <History size={14} />
     if (type === 'review-report') return <ClipboardCheck size={14} />
+    if (type === 'volume-overview' || type === 'volume') return <Layers size={14} />
     return <FileText size={14} />
   }
 
@@ -668,6 +670,9 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
         )}
         {activeTab?.type === 'version-history' && (
           <VersionHistory />
+        )}
+        {activeTab?.type === 'volume-overview' && (
+          <VolumeOverview />
         )}
         {activeTab?.type === 'review-report' && activeTab.content && (
           <ReviewReport
