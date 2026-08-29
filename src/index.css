@@ -954,6 +954,13 @@
     animation: agent-cursor-blink 1s steps(1) infinite;
   }
 
+  /* 减少动效偏好：光标**仍然显示**（它是「正在输出」的唯一视觉信号），只停止闪烁 */
+  @media (prefers-reduced-motion: reduce) {
+    .ai-stream-cursor {
+      animation: none;
+    }
+  }
+
   /* ===== 品牌渐变文字 — 统一所有品牌标识使用（Logo 冰蓝→薰衣草紫） ===== */
   .brand-gradient {
     background: linear-gradient(135deg, #D97757, #E0A064);

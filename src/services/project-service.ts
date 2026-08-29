@@ -239,6 +239,16 @@ export async function onProjectClosed(closingToken?: number): Promise<void> {
   // 不清 store。不作废的话，A 的向导会原样出现在 B 的界面上，
   // 而里面写的「承接第二卷（截至第 160 章）」说的是 A 的卷
   invalidateVolumeFlow()
+  // 「重新生成本卷大纲」同理：不清空的话，模型继续跑到底、烧掉的钱不退，
+  // A 的待显示结果会出现在 B 的界面上。
+  // ⚠️ 必须 **await**：`closeProject()` 依赖本函数 resolve 时收尾已完成。
+  // fire-and-forget 会让本函数在「取消工作流 + 清 store」之前就返回，
+  // 旧模型调用可能跨过切库继续跑，延迟回调还能清掉新项目刚建立的状态
+  // （Codex round-02 major #5）。
+  // 静态 import 会成环（volume-regen → editor-store → …），故用动态 import
+  // 并**不加 .catch 吞掉**——收尾失败要暴露出来，不能静默
+  const { invalidateVolumeRegen } = await import('./volume-regen')
+  invalidateVolumeRegen()
 
   console.log('[ProjectService] 项目已关闭，Layer 2 Store 已重置')
 }

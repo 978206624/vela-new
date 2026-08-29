@@ -3,6 +3,7 @@ import { create } from 'zustand'
 // 「放弃修改并关闭」就会静默失效（Task 19.5 已经在 toast 上栽过同一个坑）。
 // 两个模块都不反向依赖 editor-store，没有循环
 import { discardVolumeDraftForTab } from './volume-draft-store'
+import { discardVolumeRegenResultForTab } from './volume-regen-store'
 import { getProjectToken } from './volume-store'
 
 /** 编辑器 Tab 数据 */
@@ -135,6 +136,10 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
     // 下一次关闭连确认都不弹
     if (target?.type === 'volume') {
       discardVolumeDraftForTab(tabId, getProjectToken())
+      // 待显示的 AI 生成结果同样要清。只清草稿的话，重开 Tab 时
+      // 「草稿里的 synopsis 等于 result」这个判据不再成立，界面会卡在一个
+      // 永远显示「已重新生成」但内容早已被放弃的幽灵态（Codex round-02 major #3）
+      discardVolumeRegenResultForTab(tabId, getProjectToken())
     }
     const newTabs = tabs.filter((t) => t.id !== tabId)
     set({

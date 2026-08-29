@@ -9,6 +9,8 @@
  *    警告（该文件同时导出组件与函数），且让「页面」反向依赖「侧栏」。
  */
 import { useEditorStore } from '../stores/editor-store'
+import { useVolumeDraftStore } from '../stores/volume-draft-store'
+import { getProjectToken } from '../stores/volume-store'
 
 /** 打开「分卷总览」页（设计稿 27/28 右侧主区） */
 export function openVolumeOverview(): void {
@@ -27,13 +29,28 @@ export function openVolumeOverview(): void {
  * 只想改标题时不要用它：`VolumeEditor` 保存成功后走的是
  * `editor-store.renameTab()`，因为用本函数会把用户在保存在途期间
  * 刚关掉的 Tab 复活，或把当前焦点抢走。
+ *
+ * ## 新建时要从草稿恢复 `dirty`
+ *
+ * 草稿（`volume-draft-store`）的寿命比 Tab 长：它只在保存成功、关闭 Tab、
+ * 项目关闭时被清。于是存在这条路径——「重新生成本卷大纲」跑着的时候用户
+ * 把 Tab 关了，生成完成时 `setTabDirty` 找不到目标（静默无效），
+ * 而草稿照样写进去了；重开 Tab 若不恢复脏标，`EditorArea` 会把它当干净 Tab，
+ * ⌘W **不弹确认直接关**，`closeTab` 顺手清掉草稿与结果——那份 AI 大纲
+ * 就这么静默没了（Codex round-03 major #2）。
+ *
+ * 靠「用户下一次编辑时 `touch()` 补脏标」不够：他可能重开后一眼看完就关。
  */
 export function openVolumeDetail(volumeNumber: number, title: string): void {
+  const hasDraft = useVolumeDraftStore.getState().get(getProjectToken(), volumeNumber) !== null
   useEditorStore.getState().openFile({
     id: `volume:${volumeNumber}`,
     name: `第${volumeNumber}卷 · ${title || '未命名'}`,
     type: 'volume',
     volumeNumber,
+    // 草稿在 = 有未保存改动。既有 Tab 被激活时 `openFile` 不会用这个值覆盖它，
+    // 只有新建那一次生效——正是需要的语义
+    dirty: hasDraft,
   })
 }
 

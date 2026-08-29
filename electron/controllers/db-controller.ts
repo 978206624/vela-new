@@ -220,6 +220,11 @@ export function registerDatabaseController() {
   ipcMain.handle('db:draft-get-max-finalized-chapter', async () => {
     return DraftRepository.getMaxFinalizedChapter()
   })
+  // 只读通道，无需 token 守卫（读错项目最多让「重新生成本卷大纲」的前置检查
+  // 拿到别的库的定稿清单而误报，不会写坏任何数据；调用方另有 token 复核）
+  ipcMain.handle('db:draft-list-finalized-in-range', async (_event, startChapter: number, endChapter: number) => {
+    return DraftRepository.listFinalizedChaptersInRange(startChapter, endChapter)
+  })
   ipcMain.handle('db:draft-next-version', async (_event, chapterNumber: number) => {
     return DraftRepository.getNextVersion(chapterNumber)
   })

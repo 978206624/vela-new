@@ -47,6 +47,7 @@ export type WorkflowType =
   | 'novel_import'            // 导入已有小说（逆向推演全流程）
   | 'character_profile'       // AI 补全角色人设（从出场正文反向推断）
   | 'volume'                  // 续写下一卷（盘点上一卷→提炼收束→生成卷大纲→确认写入）
+  | 'volume_synopsis'         // 重新生成**已存在的卷**的大纲（读上一卷收束→读本卷已写要点→生成→确认写入）
 
 /** 工作流步骤执行器 */
 export type StepExecutor = (

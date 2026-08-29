@@ -35,7 +35,7 @@
  * - 项目关闭 → `project-service.onProjectClosed()` 调 `reset()`
  */
 import { create } from 'zustand'
-import type { VolumeStatus, OpenThread } from '../../electron/repositories/volume-repository'
+import type { VolumeStatus, OpenThread, VolumeData } from '../../electron/repositories/volume-repository'
 
 /** 卷详情里**用户可改**的字段。边界两端合成一项：重叠校验需要成对提交 */
 export type VolumeDetailField =
@@ -89,6 +89,33 @@ interface VolumeDraftState {
 
   /** 记一次字段编辑：计数器 +1 并把新值盖到该字段上 */
   markTouched: (projectToken: number | undefined, volumeNumber: number, field: VolumeDetailField) => void
+  /**
+   * 把 AI 重新生成的卷大纲落成一份草稿（Task 19.4 T3）。
+   *
+   * 以**卷行快照**为基线重建整份草稿，只把 `synopsis` 换成生成结果、
+   * 只把 `synopsis` 记进 `touched`——于是用户点「保存」时的 patch 里只有大纲一列，
+   * 卷名/边界/状态/伏笔一概不动（Product-Spec §4.11：产物只有卷大纲一项）。
+   *
+   * ## 为什么可以直接以卷行快照为基线、不必与既有草稿合并
+   *
+   * 发起重生成的前置条件是**表单必须干净**（见 `volume-regen.ts`），
+   * 干净就意味着此刻没有草稿、表单显示的就是卷行。
+   *
+   * ⚠️ **已有草稿时拒绝采纳**——这是 Codex round-01 major finding：
+   * 生成期间用户可能在另一处修改了其它字段（理论上已被表单锁定，但若
+   * `disabled`/`readOnly` 因任何理由失效，组件仍能写草稿），无条件重建会
+   * 静默吞掉那些编辑。故**只在该卷此刻无草稿时**才落库。
+   *
+   * @returns `true` 表示成功落地，`false` 表示拒绝（已存在草稿或无 token）
+   *
+   * ⚠️ 本方法**不管 Tab 脏标**。那是 `editor-store` 的事，由调用方一并处理；
+   * 本 store 不引 editor-store，免得两个 store 互相依赖。
+   */
+  adoptGeneratedSynopsis: (
+    projectToken: number | undefined,
+    volume: VolumeData,
+    synopsis: string,
+  ) => boolean
   /** 取各字段当前的编辑戳快照（保存发起时定格） */
   getStamps: (projectToken: number | undefined, volumeNumber: number) => FieldStamps
 
@@ -172,6 +199,35 @@ export const useVolumeDraftStore = create<VolumeDraftState>((set, get) => ({
   getStamps: (projectToken, volumeNumber) => {
     const key = draftKey(projectToken, volumeNumber)
     return key ? { ...(get().stamps[key] ?? {}) } : {}
+  },
+
+  adoptGeneratedSynopsis: (projectToken, volume, synopsis) => {
+    const key = draftKey(projectToken, volume.volumeNumber)
+    if (!key) return false
+    // 已有草稿 → 拒绝：用户此刻在改别的字段，无条件重建会静默覆盖。
+    // round-01 major 的兜底，理论上 UI 已锁定全部控件，但锁可以被绕开
+    if (get().drafts[key] !== undefined) return false
+    const threads = (volume.openThreads ?? []).map((t, i) => ({ ...t, _id: `t${i}` }))
+    const draft: VolumeDraft = {
+      title: volume.title,
+      // 章号存**原始字符串**，与 VolumeEditor 的表单模型同款（理由见该组件注释）
+      startRaw: String(volume.startChapter),
+      endRaw: String(volume.endChapter),
+      status: volume.status,
+      premise: volume.premise ?? '',
+      synopsis,
+      openingState: volume.openingState ?? '',
+      threads,
+      threadChapterInputs: {},
+      nextThreadId: threads.length,
+      // 只有大纲被改过。这一项决定了保存时 patch 里有哪几列
+      touched: ['synopsis'],
+    }
+    set(s => ({ drafts: { ...s.drafts, [key]: draft } }))
+    // 打戳走 `markTouched` 而不是自己写：逐字段确认（`acknowledgeSave`）比对的
+    // 就是这个戳，另起一套写法迟早与它分叉
+    get().markTouched(projectToken, volume.volumeNumber, 'synopsis')
+    return true
   },
 
   beginSave: (projectToken, volumeNumber) => {

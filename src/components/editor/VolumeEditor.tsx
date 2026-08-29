@@ -40,7 +40,7 @@
  * 主进程守卫看不出异常。
  */
 import { useState, useId, useMemo } from 'react'
-import { Layers, Save, Trash2, Plus, RefreshCw } from 'lucide-react'
+import { Layers, Save, Trash2, Plus, RefreshCw, Sparkles, Square } from 'lucide-react'
 import { Button } from '../ui/Button'
 import { Input } from '../ui/Input'
 import { Label } from '../ui/Label'
@@ -50,6 +50,7 @@ import { toast } from '../ui/Toast'
 import { confirm } from '../ui/Confirm'
 import { useVolumeStore, getProjectToken } from '../../stores/volume-store'
 import { useVolumeDraftStore, type VolumeDraft, type VolumeDetailField } from '../../stores/volume-draft-store'
+import { useVolumeRegenStore, selectRegenRunFor, selectRegenResultFor } from '../../stores/volume-regen-store'
 import { useDraftStore } from '../../stores/draft-store'
 import { useEditorStore } from '../../stores/editor-store'
 import {
@@ -61,6 +62,11 @@ import {
   decideVolumeSnapshotSync,
 } from '../../services/volume-service'
 import { volumeTabId } from '../../services/volume-tabs'
+import {
+  startVolumeSynopsisRegen,
+  stopVolumeSynopsisRegen,
+  describeRegenOutcome,
+} from '../../services/volume-regen'
 import {
   MAX_OPEN_THREADS,
   parseChapterNumber,
@@ -129,6 +135,17 @@ function CenterNotice({ text }: { text: string }) {
       <span className="text-sm">{text}</span>
     </div>
   )
+}
+
+/** 步进器上的一个圆点（设计稿 30：✓ / ✦ / ○ 三态）。保持极简，避免引入额外依赖 */
+function StepDot({ done, active }: { done?: boolean; active?: boolean }) {
+  if (done) return <span style={{ color: 'var(--color-success)' }}>✓</span>
+  if (active) return <span style={{ color: 'var(--color-accent)' }}>✦</span>
+  return <span style={{ color: 'var(--color-text-muted)' }}>○</span>
+}
+
+function StepArrow() {
+  return <span style={{ color: 'var(--color-text-muted)', margin: '0 2px' }}>›</span>
 }
 
 function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeData[] }) {
@@ -249,6 +266,73 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
 
   const written = useDraftStore(s => countFinalizedInRange(s.draftsByChapter, volume.startChapter, volume.endChapter))
 
+  /**
+   * 「重新生成本卷大纲」的运行态（Task 19.4 T3）。
+   *
+   * 用**选择器函数**而非直接订阅 `run` / `result` 对象——zustand v5 要求
+   * selector 必须返回稳定引用，订阅对象会让每次 `setPartial` 触发整棵重渲染。
+   *
+   * 收口的两个函数（`selectRegenRunFor` / `selectRegenResultFor`）自己就只做过滤、
+   * 返回的是 store 里那个原对象，引用稳定。
+   */
+  const regenRun = useVolumeRegenStore(s => selectRegenRunFor(s, projectToken, volume.volumeNumber))
+  const regenResult = useVolumeRegenStore(s => selectRegenResultFor(s, projectToken, volume.volumeNumber))
+  /**
+   * 「正在为本卷生成中」= `regenRun` 存在。**不**含「已生成待保存」——后者由
+   * `regenAdopted` 单独表达，两态在头部副信息里的措辞不同（设计稿 30 的
+   * 「正在重新生成本卷大纲 · 已输出 386 字」与生成完成后的提示是两句话）。
+   */
+  const regenInProgress = regenRun !== null
+
+  /**
+   * 「草稿里那份大纲就是本条 AI 结果」——完成态 UI 与「要不要灌进 Textarea」
+   * 都以它为判据。
+   *
+   * ## 为什么判据是「草稿内容相等」而不是 `!dirty`
+   *
+   * service 成功时**先写草稿再 settle**，于是 result 就位那一刻表单**必然是脏的**
+   * （草稿在 = 脏，见下面 `dirty` 的定义）。拿 `!dirty` 当门是自我指涉：
+   * 门永远关着，新 synopsis 永远进不了文本框，用户点保存反而把旧大纲写回去。
+   * 这是 Codex round-01 的 blocker。
+   *
+   * 换成「草稿里的 synopsis 逐字等于 result.synopsis，且 touched 里有 synopsis」
+   * 之后，判据变成一个**可观察的事实**：这份草稿是不是那次生成的产物。
+   * 用户随后手改大纲，相等关系被打破，完成态提示自动消失——正是想要的语义。
+   */
+  const regenAdopted =
+    regenResult !== null
+    && draft !== undefined
+    && draft.synopsis === regenResult.synopsis
+    && draft.touched.includes('synopsis')
+
+  /**
+   * 「已灌进本地 state 的那条 result 的 regenId」。
+   *
+   * ⚠️ 用 `useState` 记住它、配合下面的**渲染期条件同步**，**不是 effect**：
+   * 在 effect 里 setState 会触发级联渲染（`react-hooks/set-state-in-effect`
+   * 也会拦下）。渲染期调整 state 是 React 官方推荐的「外部值变了就调整 state」
+   * 写法——同本组件 `syncedFrom` 那道。
+   *
+   * 组件不会因为新一条 result 到达而重新挂载（仍是同一个 `VolumeForm` 实例，
+   * `useState` 初值不会重跑），故必须靠「regenId 与已灌过的那条不同」来触发再灌一次。
+   */
+  const [adoptedRegenIdState, setAdoptedRegenId] = useState<number | null>(null)
+  /**
+   * 把草稿里那份 AI 大纲灌进本地 `synopsis` state（Textarea 显示的就是它）。
+   *
+   * 只改**本地 state**，不碰任何 store——渲染期写 store 会触发
+   * 「Cannot update a component while rendering a different component」。
+   * 草稿由 service 在 settle 之前就写好了，这里只是把它显示出来。
+   *
+   * `adoptedRegenIdState` 保证同一条 result 只灌一次：灌完之后用户手改大纲，
+   * 不会在下一次渲染被 result 覆盖回去。组件卸载重挂载（切 Tab 再切回）时
+   * state 归零、会重新灌一次——那时草稿仍在，灌的还是同一份，无害。
+   */
+  if (regenAdopted && regenResult !== null && adoptedRegenIdState !== regenResult.regenId) {
+    setAdoptedRegenId(regenResult.regenId)
+    setSynopsis(regenResult.synopsis)
+  }
+
   const boundaryEditable = canEditVolumeBoundary(volumes, volume.volumeNumber)
   // draft-store 只覆盖「已有蓝图的章」，故这是**预判**不是授权：
   // 最终由主进程事务直接查 drafts 表决定（见 VolumeRepository.remove）
@@ -280,6 +364,9 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
   const threadError = validateOpenThreads(persistedThreads)
   // 不脏就没什么可存的：允许点会向主进程发一个空 patch，那边只能报错
   const canSave = dirty && !saving && !!title.trim() && !rangeError && !threadError
+  /** 重新生成本卷大纲期间，「保存」换成「停止生成」。
+   *  其它逻辑都按 generating 来：脏 + 在跑 = 草稿与库都不会被这条调用动到。 */
+  const canStartRegen = !regenInProgress && !saving
 
   /**
    * 标记「用户改过了」。做四件事：
@@ -375,6 +462,10 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
       .acknowledgeSave(actionToken, volume.volumeNumber, savedFields, stampsAtSave)
     if (wentClean) {
       useEditorStore.getState().setTabDirty(volumeTabId(volume.volumeNumber), false)
+      // 那份 AI 结果已经落库了，「已重新生成 · 待保存」的提示该收掉。
+      // 只在 wentClean 时清：还有字段没确认就说明这次保存没走完，
+      // 提示留着更诚实（用户还得再点一次保存）
+      if (regenResult) useVolumeRegenStore.getState().adoptResult(regenResult.regenId)
     }
     // 卷名可能改过，让标签页文案跟上。
     // ⚠️ 用 `renameTab` 而不是 `openVolumeDetail`：后者会 `openFile`，
@@ -420,8 +511,35 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
     // 卷没了，它的草稿也不该留着——否则同号新卷（理论上不会有，但删完再续卷
     // 会重新用到这个号）打开时会捞到一份属于已删卷的编辑
     useVolumeDraftStore.getState().clear(actionToken, targetVolume)
+    // 待显示的 AI 结果同理：卷都删了，那份大纲无处可去
+    if (regenResult) useVolumeRegenStore.getState().discardResult(regenResult.regenId)
     useEditorStore.getState().closeTab(volumeTabId(targetVolume))
     toast.success(`第${targetVolume}卷已删除`)
+  }
+
+  /** 重新生成本卷大纲（设计稿 30）。
+   *
+   *  与 `handleSave` / `handleDelete` 同款纪律：token 在**点击这一刻**捕获。
+   *  本函数没有跨 await 的写库（service 层会捕获 token），但本组件要在按钮禁用、
+   *  失败 toast 之后判断归属——那条 token 不能等 click 之后再取。
+   *
+   *  拒绝原因由 service 层返回（见 `RegenFailReason`）。每个 reason 在 UI 层的
+   *  翻译就在这里——service 层不弹 toast（理由见 `volume-regen.ts` 文件头）。
+   */
+  const handleRegenerate = async () => {
+    const actionToken = getProjectToken()
+    const res = await startVolumeSynopsisRegen(volume, written)
+    // ⚠️ await 之后先核归属再动 UI。同 handleSave 注释里那条理由：
+    // service 层的 token 守卫挡住了串库，但挡不住旧回调改写当前界面
+    if (getProjectToken() !== actionToken) return
+    const msg = describeRegenOutcome(res)
+    if (msg) toast.error(msg)
+  }
+
+  const handleStopRegen = () => {
+    // 不核归属：停止永远安全——停掉的是已不归我的旧 run 也无所谓。
+    // service 层 `stopVolumeSynopsisRegen` 在没在跑的 run 时返回 false，本处什么都不做
+    stopVolumeSynopsisRegen()
   }
 
   return (
@@ -442,35 +560,97 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
             >
               {VOLUME_STATUS_LABELS[volume.status]}
             </span>
+            {regenInProgress && (
+              <span
+                className="text-[0.68rem] px-1.5 py-0.5 rounded flex-shrink-0"
+                style={{ background: 'var(--color-accent)', color: '#fff' }}
+              >
+                生成中
+              </span>
+            )}
             {dirty && <span className="text-[0.7rem] flex-shrink-0" style={{ color: 'var(--color-accent)' }}>● 未保存</span>}
           </div>
           {/* 设计稿 29 的副信息还有一项「上次更新 X 小时前」。`volumes` 表里确实有
               `updated_at`（各写方法也都刷新了它，值可信），但它没有出现在
               `VolumeData` / IPC 契约里，渲染层拿不到——与其显示一个编造的时间，
               不如先不显示这一项。已登记待排期 */}
-          <div className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
-            第 {volume.startChapter}–{volume.endChapter} 章 · 已写 {written} 章 · 未回收伏笔 {threads.length}
-          </div>
+          {regenInProgress && regenRun ? (
+            <div className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+              正在重新生成本卷大纲 · 已输出 {regenRun.partial.length} 字 · 模型 {regenRun.modelName}
+            </div>
+          ) : regenAdopted ? (
+            <div className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+              已重新生成 · 结果已填入「本卷大纲」· 点「保存」才会写入数据库
+            </div>
+          ) : (
+            <div className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+              第 {volume.startChapter}–{volume.endChapter} 章 · 已写 {written} 章 · 未回收伏笔 {threads.length}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-1.5 flex-shrink-0">
           <Button
             variant="ghost"
             size="icon"
             onClick={() => void handleDelete()}
-            disabled={!deletable}
-            title={deletable ? '删除此卷' : '本卷已有定稿章节，不可删除'}
+            disabled={!deletable || regenInProgress}
+            title={regenInProgress
+              ? '正在重新生成本卷大纲，不能删除'
+              : deletable ? '删除此卷' : '本卷已有定稿章节，不可删除'}
           >
             <Trash2 size={14} style={{ color: 'var(--color-text-muted)' }} />
           </Button>
-          <Button onClick={() => void handleSave()} disabled={!canSave}>
-            {saving ? <RefreshCw size={12} className="animate-spin" /> : <Save size={12} />}
-            {saving ? '保存中…' : '保存'}
-          </Button>
+          {regenInProgress ? (
+            <Button onClick={handleStopRegen} title="停止生成">
+              <Square size={12} />
+              停止生成
+            </Button>
+          ) : (
+            <>
+              <Button variant="outline" onClick={() => void handleRegenerate()} disabled={!canStartRegen}>
+                <Sparkles size={12} />
+                重新生成本卷大纲
+              </Button>
+              <Button onClick={() => void handleSave()} disabled={!canSave}>
+                {saving ? <RefreshCw size={12} className="animate-spin" /> : <Save size={12} />}
+                {saving ? '保存中…' : '保存'}
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
       {/* ===== 主体：左主区 + 右轨 360px ===== */}
       <div className="flex-1 grid grid-cols-[1fr_360px] gap-6 overflow-hidden px-6 py-4">
+        {/* ---- 四段步进器（设计稿 30；只在重生成中/有结果时渲染） ---- */}
+        {regenInProgress && regenRun && (
+          <div
+            className="col-span-2 flex items-center gap-1.5 text-xs flex-shrink-0 px-1"
+            style={{ color: 'var(--color-text-muted)' }}
+          >
+            <StepDot done /> 读取上一卷收束状态
+            <StepArrow />
+            <StepDot done /> 读取本卷已写 {written} 章要点
+            <StepArrow />
+            <StepDot active /> 生成本卷大纲
+            <StepArrow />
+            <StepDot /> 等待确认写入
+          </div>
+        )}
+        {regenAdopted && !regenInProgress && (
+          <div
+            className="col-span-2 flex items-center gap-1.5 text-xs flex-shrink-0 px-1"
+            style={{ color: 'var(--color-text-muted)' }}
+          >
+            <StepDot done /> 读取上一卷收束状态
+            <StepArrow />
+            <StepDot done /> 读取本卷已写 {written} 章要点
+            <StepArrow />
+            <StepDot done /> 生成本卷大纲
+            <StepArrow />
+            <StepDot active /> 等待确认写入
+          </div>
+        )}
         {/* ---- 左主区 ---- */}
         <div className="min-w-0 overflow-y-auto pr-1 space-y-4">
           <div>
@@ -483,6 +663,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                   value={title}
                   onChange={e => { setTitle(e.target.value); touch('title', { title: e.target.value }) }}
                   placeholder="如：北境风雪"
+                  readOnly={regenInProgress}
                 />
               </div>
               <div>
@@ -492,7 +673,13 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                   type="number"
                   min={1}
                   value={startRaw}
-                  disabled={!boundaryEditable}
+                  // 边界输入框双重门：
+                  // ① `!boundaryEditable` —— 非最后一卷本就不可改；
+                  // ② `regenInProgress` —— 生成期间边界**也是**输入约束的一部分
+                  // （见 volume-synopsis-regen.command.ts：startChapter/endChapter 决定
+                  // prompt 中的章号区间）。让用户在模型跑着时改了边界、完成时按旧区间
+                  // 生成的稿子就会错位。Codex round-02 major #1。
+                  disabled={!boundaryEditable || regenInProgress}
                   onChange={e => { setStartRaw(e.target.value); touch('boundary', { startRaw: e.target.value }) }}
                 />
               </div>
@@ -503,7 +690,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                   type="number"
                   min={1}
                   value={endRaw}
-                  disabled={!boundaryEditable}
+                  disabled={!boundaryEditable || regenInProgress}
                   onChange={e => { setEndRaw(e.target.value); touch('boundary', { endRaw: e.target.value }) }}
                 />
               </div>
@@ -514,13 +701,19 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                   value={status}
                   onValueChange={v => { setStatus(v as VolumeStatus); touch('status', { status: v as VolumeStatus }) }}
                   options={STATUS_OPTIONS}
+                  disabled={regenInProgress}
                 />
               </div>
             </div>
 
-            {!boundaryEditable && (
+            {!boundaryEditable && !regenInProgress && (
               <div className="text-xs mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
                 仅最后一卷可改边界——改中间卷的章号会让夹在其中的章节失去归属。
+              </div>
+            )}
+            {regenInProgress && (
+              <div className="text-xs mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                生成期间边界与其它字段都不可改——以免生成依据与表单不一致
               </div>
             )}
             {rangeError && (
@@ -536,6 +729,14 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
               <span className="text-xs font-normal" style={{ color: 'var(--color-text-muted)' }}>
                 目标 + 核心冲突，供目录生成与正文写作共同参照
               </span>
+              {/* 重新生成期间，主线是 AI 的「约束输入」不是产物（设计稿 30「未改动」）。
+                  把它**只读**而不是禁用输入框：disable 会让用户感觉表单坏了，
+                  readOnly 仍可见、且光标移上去能让他看出它没被锁死 */}
+              {regenInProgress && (
+                <span className="text-xs font-normal ml-2" style={{ color: 'var(--color-text-muted)' }}>
+                  · 未改动
+                </span>
+              )}
             </Label>
             <Textarea
               id={`${uid}-premise`}
@@ -543,6 +744,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
               value={premise}
               onChange={e => { setPremise(e.target.value); touch('premise', { premise: e.target.value }) }}
               placeholder="这一卷主角要达成什么、跟谁冲突"
+              readOnly={regenInProgress}
             />
           </div>
 
@@ -552,14 +754,48 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
               <span className="text-xs font-normal" style={{ color: 'var(--color-text-muted)' }}>
                 {volume.endChapter - volume.startChapter + 1} 章
               </span>
+              {/* 三态文案：生成中 / 结果已落草稿未保存 / 默认展示原内容 */}
+              {regenInProgress && regenRun ? (
+                <span className="text-xs font-normal ml-2" style={{ color: 'var(--color-accent)' }}>
+                  · AI 流式输出中 · 原内容将在确认后替换
+                </span>
+              ) : regenAdopted ? (
+                <span className="text-xs font-normal ml-2" style={{ color: 'var(--color-accent)' }}>
+                  · AI 已生成 · 原内容已被替换（保存后才入库）
+                </span>
+              ) : null}
             </Label>
-            <Textarea
-              id={`${uid}-synopsis`}
-              rows={16}
-              value={synopsis}
-              onChange={e => { setSynopsis(e.target.value); touch('synopsis', { synopsis: e.target.value }) }}
-              placeholder="按结构模式在卷内展开的情节走向"
-            />
+            {/* 生成中换成**只读预览容器**，不是给 textarea 加 caretColor。
+                原生 caret 只在控件获得焦点时才出现，而这里既不该抢焦点、也没有选区，
+                设计稿 30 末尾那个闪烁光标根本不会显示（Codex round-05 minor）。
+                改成自己渲染一个 `.ai-stream-cursor`——与 AI 输出面板同一个类，
+                样式与「减少动效」降级都在 index.css 里统一定义 */}
+            {regenInProgress && regenRun ? (
+              <div
+                id={`${uid}-synopsis`}
+                className="flex w-full rounded-md px-2.5 py-1.5 text-xs overflow-y-auto whitespace-pre-wrap break-words"
+                style={{
+                  border: '1px solid var(--color-accent)',
+                  background: 'var(--color-panel)',
+                  color: 'var(--color-text)',
+                  // 与 rows={16} 的 Textarea 视觉高度对齐（16 行 × 1.5 行高 × 12px 字号 + 内边距）
+                  height: '19rem',
+                }}
+                aria-live="polite"
+                aria-label="本卷大纲 · AI 流式输出中"
+              >
+                {regenRun.partial}
+                <span className="ai-stream-cursor" />
+              </div>
+            ) : (
+              <Textarea
+                id={`${uid}-synopsis`}
+                rows={16}
+                value={synopsis}
+                onChange={e => { setSynopsis(e.target.value); touch('synopsis', { synopsis: e.target.value }) }}
+                placeholder="按结构模式在卷内展开的情节走向"
+              />
+            )}
           </div>
         </div>
 
@@ -578,6 +814,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
               value={openingState}
               onChange={e => { setOpeningState(e.target.value); touch('openingState', { openingState: e.target.value }) }}
               placeholder="本卷开始时，主角与主要势力各处于什么状态"
+              readOnly={regenInProgress}
             />
           </div>
 
@@ -593,7 +830,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                 type="button"
                 className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:opacity-80 disabled:opacity-40"
                 style={{ color: 'var(--color-accent)' }}
-                disabled={threads.length >= MAX_OPEN_THREADS}
+                disabled={threads.length >= MAX_OPEN_THREADS || regenInProgress}
                 onClick={() => {
                   const next: ThreadRow[] = [
                     ...threads,
@@ -629,6 +866,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                         min={1}
                         className="w-[72px]"
                         value={threadChapterInputs[t._id] ?? String(t.chapter)}
+                        readOnly={regenInProgress}
                         onChange={e => {
                           // 存原始字符串 + 严格解析：`parseInt('1.5')===1`，
                           // 先转换再校验等于把用户输入静默改掉。
@@ -651,12 +889,14 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                         value={t.urgency}
                         onValueChange={v => patchThread(t._id, { urgency: v as OpenThread['urgency'] })}
                         options={URGENCY_OPTIONS}
+                        disabled={regenInProgress}
                       />
                       <button
                         type="button"
                         className="ml-auto p-1 rounded hover:opacity-80"
                         style={{ color: 'var(--color-text-muted)' }}
                         title={`删除第 ${i + 1} 条伏笔`}
+                        disabled={regenInProgress}
                         onClick={() => removeThread(t._id)}
                       >
                         <Trash2 size={13} />
@@ -667,6 +907,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
                       id={`${uid}-th-t-${t._id}`}
                       rows={2}
                       value={t.thread}
+                      readOnly={regenInProgress}
                       onChange={e => patchThread(t._id, { thread: e.target.value })}
                       placeholder="这条线索是什么、还欠读者一个什么交代"
                     />

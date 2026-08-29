@@ -12,8 +12,11 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-// 第一个参数选跑哪个 harness：commit（主进程事务）| workflow（渲染层编排）
-const which = process.argv[2] === 'workflow' ? 'volume-workflow-harness' : 'volume-commit-harness'
+// 第一个参数选跑哪个 harness：commit（主进程事务）| workflow（渲染层编排）| regen（重生卷大纲）
+const arg = process.argv[2]
+const which = arg === 'workflow' ? 'volume-workflow-harness'
+    : arg === 'regen' ? 'volume-regen-harness'
+    : 'volume-commit-harness'
 const entry = path.join(root, 'scripts', 'diagnostics', `${which}.ts`)
 const bundle = path.join(root, 'node_modules', '.cache', `${which}.mjs`)
 

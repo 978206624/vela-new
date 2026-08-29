@@ -423,6 +423,8 @@ export interface DatabaseChannels {
   'db:draft-get-finalized': { args: [chapterNumber: number]; return: DraftMeta | null }
   'db:draft-find-chapters-by-name': { args: [name: string, finalizedOnly?: boolean]; return: number[] }
   'db:draft-get-max-finalized-chapter': { args: []; return: number }
+  /** 列出某章号闭区间内已定稿的章号与定稿时间（升序）。供「重新生成本卷大纲」核对已写事实的完整性与新旧 */
+  'db:draft-list-finalized-in-range': { args: [startChapter: number, endChapter: number]; return: Array<{ chapterNumber: number; finalizedAt: string }> }
   'db:draft-next-version': { args: [chapterNumber: number]; return: number }
   'db:draft-update-status': { args: [id: number, status: string, wordCount?: number]; return: { success: boolean; error?: string } }
   'db:draft-finalize-exclusive': { args: [id: number, wordCount?: number]; return: { success: boolean; error?: string } }

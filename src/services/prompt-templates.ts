@@ -37,6 +37,7 @@ export const EDITABLE_PROMPT_KEYS: string[] = [
   // content 里只剩创作指导，开放编辑是安全的。
   'volume_closing_report',
   'volume_synopsis',
+  'volume_synopsis_regen',
   'first_chapter_draft',
   'next_chapter_draft',
   'refine_chapter',
@@ -599,6 +600,76 @@ export const BUILTIN_PROMPTS: PromptTemplate[] = [
 - premise 要同时说清「本卷主角想达成什么」和「阻力来自哪里」。
 - synopsis 按结构指导的分段组织，每段开头标注覆盖的章号区间（如「【第一幕 · 建置｜第{{volume_start}}–XX 章】」），内容写具体事件与转折，不写抽象概括。
 - **suggestedChapterCount 必须是 JSON 数字类型的整数**。默认填 {{chapter_count}}；**仅当**你判断本卷剧情体量与该章数明显不匹配时，才给出你建议的不同整数（作者会看到并决定是否采纳）。
+- 仅给出最终的 JSON 文本，不要解释。`,
+  },
+
+  {
+    key: 'volume_synopsis_regen',
+    name: '重生成本卷大纲',
+    description: '为一个已存在的卷重新推演卷内大纲；本卷主线与章号边界保持不变，已写章节不得被推翻',
+    systemRole: '你是一位经验丰富的网文架构师，擅长在既定的主线与已经写出来的章节之上，重新规划一卷的情节走向。',
+    variables: {
+      volume_title: '本卷卷名',
+      premise: '全书故事前提',
+      worldbuilding: '全书世界观设定',
+      characters_arch: '全书人物群像网络',
+      prev_closing_state: '上一卷的收卷状态（本卷为第一卷时为「无上一卷」）',
+      opening_state: '本卷开卷状态',
+      volume_premise: '本卷主线目标与核心冲突（**输入约束，不是产物**）',
+      open_threads: '本卷未回收伏笔台账',
+      written_notes: '本卷区间内已写章节的实际要点（既成事实，不得推翻）',
+      structure_guide: '本卷的结构指导（按选定故事模型在本卷章数内展开）',
+      volume_start: '本卷起始章号',
+      volume_end: '本卷结束章号',
+      chapter_count: '本卷章数',
+    },
+    content: `请为【{{volume_title}}】**重新**推演卷内大纲。本卷覆盖 第{{volume_start}}章 到 第{{volume_end}}章，共 {{chapter_count}} 章。
+
+作者对现有的本卷大纲不满意，要你在**保持下列既定条件不变**的前提下重写一份。
+
+【全书恒定设定】
+{{premise}}
+
+{{worldbuilding}}
+
+{{characters_arch}}
+
+【上一卷收束状态 —— 本卷的来路】
+{{prev_closing_state}}
+
+【本卷开卷状态】
+{{opening_state}}
+
+【本卷主线 —— 既定方向，不得改动】
+{{volume_premise}}
+
+【本卷未回收伏笔台账】
+{{open_threads}}
+
+【本卷已写章节的实际要点 —— 既成事实，不得推翻】
+{{written_notes}}
+
+【本卷结构指导】
+{{structure_guide}}
+
+【推演守则】
+1. **已写章节不得被推翻。** 上面【本卷已写章节的实际要点】里的事件都已经落到正文里、读者已经看过。新大纲里覆盖这些章号的部分**必须与它们一致**，你能做的是重新规划**它们之后**的走向。若要点为空（本卷还一章没写），整卷都可以重排。
+2. **本卷主线是给定的，不是让你重写的。** 新大纲要服务于上面那条主线，不得改换目标或核心冲突。作者若想改主线，会自己去改那一栏。
+3. **章号边界是给定的。** 大纲必须在第{{volume_start}}–{{volume_end}}章这个区间内展开完，不要延伸到区间之外，也不要建议改章数。
+4. **承接来路**：开篇格局必须与上一卷收束状态、本卷开卷状态严丝合缝。没有上一卷时（本卷是第一卷），以全书故事前提为起点。
+5. **伏笔要有交代**：台账里标记 high 的应在本卷内安排回收或实质推进；mid / low 可继续悬置，但不要遗忘。
+6. **不是全书收尾**：这是长篇的一个阶段，不要在本卷终结全书主线，也不要写大结局式的收束。`,
+    systemSuffix: `【输出格式规定】
+严格且仅按以下 JSON 格式输出：
+
+{
+  "synopsis": "本卷大纲，按结构指导分段展开，每段标明覆盖章号区间"
+}
+
+要求：
+- **只输出 synopsis 一个字段**。卷名、本卷主线、章数都是给定条件，不要重写，也不要额外输出它们——多输出的字段会被直接丢弃。
+- synopsis 按结构指导的分段组织，每段开头标注覆盖的章号区间（如「【第一幕 · 建置｜第{{volume_start}}–XX 章】」），内容写具体事件与转折，不写抽象概括。
+- 覆盖已写章节的那些段落，内容要与【本卷已写章节的实际要点】对得上。
 - 仅给出最终的 JSON 文本，不要解释。`,
   },
 

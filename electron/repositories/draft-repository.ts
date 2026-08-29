@@ -188,6 +188,44 @@ export class DraftRepository {
         return row?.maxChapter ?? 0
     }
 
+    /**
+     * 列出某章号闭区间内**已定稿**的章号与其定稿时间（按章号升序）。
+     *
+     * 存在的理由（Task 19.4 T3）：「重新生成本卷大纲」必须在调用模型之前确认
+     * 本卷每一个已定稿章节的 `notes` 都**存在且属于当前这一版定稿**——
+     * 已写章节是不可推翻的事实。两种故障态都得认出来：
+     *
+     * ① `notes` 为空：定稿流程是「先写 finalized，再跑可能失败的 notes 后处理」；
+     * ② `notes` 非空但**属于上一版**：Phase 14 允许重新定稿（改已定稿章节），
+     *    而 `finalizeExclusive` 不清 `blueprints.notes`，新版的后处理没跑完之前，
+     *    旧 notes 会冒充当前事实（Codex round-05 major #2）。
+     *
+     * 故返回 `finalizedAt`（该定稿稿件的 `updated_at`，`finalizeExclusive` 会刷新它），
+     * 由调用方与 `blueprints.notes_updated_at` 比对判断新旧。
+     *
+     * 为什么要一条新通道、而不是在渲染层逐章调 `getFinalizedByChapter`：
+     * 那是「按区间遍历」，卷区间上限 10000，最坏一万次 IPC。
+     * 也不能读渲染层的 `draft-store`——它只覆盖「已有蓝图的章」，
+     * 是展示用近似值，不能当 fail-closed 的授权依据。
+     */
+    static listFinalizedChaptersInRange(
+        startChapter: number,
+        endChapter: number,
+    ): Array<{ chapterNumber: number; finalizedAt: string }> {
+        const db = getProjectDb()
+        if (!db) return []
+        // 同章理论上至多一条 finalized（`finalizeExclusive` 事务保证），
+        // 真出现多条时取**最新**那条的时间——判「notes 是否属于当前版本」要用最严的基准
+        const rows = db.prepare(`
+            SELECT chapter_number as chapterNumber, MAX(updated_at) as finalizedAt
+            FROM drafts
+            WHERE status = 'finalized' AND chapter_number >= ? AND chapter_number <= ?
+            GROUP BY chapter_number
+            ORDER BY chapter_number
+        `).all(startChapter, endChapter) as Array<{ chapterNumber: number; finalizedAt: string | null }>
+        return rows.map(r => ({ chapterNumber: r.chapterNumber, finalizedAt: r.finalizedAt ?? '' }))
+    }
+
     /** 更新草稿状态 */
     static updateStatus(id: number, status: string, wordCount?: number): void {
         const db = getProjectDb()
