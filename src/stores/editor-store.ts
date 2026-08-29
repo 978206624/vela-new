@@ -32,6 +32,8 @@ export interface EditorTab {
    * 表现成空白页而不是报错，排查时看不出是 id 格式变过。
    */
   volumeNumber?: number
+  /** 章节蓝图 Tab 的特殊范围；未设置时显示全部或由 volumeNumber 锁定某卷 */
+  chapterScope?: 'unassigned'
   /** 草稿所在章节目录 */
   chapterDir?: string
   /** 审稿报告存放路径 */
@@ -94,10 +96,11 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   activeTabId: null,
 
   openFile: (tab) => {
+    const { tabs, activeTabId } = get()
     // diff 类型每次内容不同，只按 id 精确匹配（不走 filePath 去重）
     // 其他类型（含 review-report）按 filePath + type 去重
     const idOnly = tab.type === 'diff'
-    const existing = get().tabs.find((t) =>
+    const existing = tabs.find((t) =>
       t.id === tab.id ||
       (!idOnly && tab.filePath !== undefined && t.filePath === tab.filePath && t.type === tab.type)
     )
@@ -110,8 +113,22 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
         }))
       } else {
         // 其他类型 Tab：已打开，更新名称并直接激活
+        const chapterScopeChanged = tab.type === 'chapter-card'
+          && (existing.volumeNumber !== tab.volumeNumber || existing.chapterScope !== tab.chapterScope)
+        if (existing.name === tab.name && !chapterScopeChanged) {
+          if (activeTabId !== existing.id) set({ activeTabId: existing.id })
+          return
+        }
         set((s) => ({
-          tabs: s.tabs.map((t) => t.id === existing.id ? { ...t, name: tab.name } : t),
+          tabs: s.tabs.map((t) => t.id === existing.id
+            ? {
+                ...t,
+                name: tab.name,
+                ...(tab.type === 'chapter-card'
+                  ? { volumeNumber: tab.volumeNumber, chapterScope: tab.chapterScope }
+                  : {}),
+              }
+            : t),
           activeTabId: existing.id,
         }))
       }
@@ -151,6 +168,7 @@ export const useEditorStore = create<EditorState>()((set, get) => ({
   },
 
   setActiveTab: (tabId) => {
+    if (get().activeTabId === tabId) return
     set({ activeTabId: tabId })
   },
 

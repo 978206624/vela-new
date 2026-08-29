@@ -29,6 +29,8 @@ interface Props {
    * `start-workflow.tool.ts` 早就按最大章号推，UI 这条路一直是分叉的。
    */
   existingMaxChapter: number
+  /** 从某卷的子菜单打开时，将「当前卷」指向该卷；未设置时沿用末卷语义 */
+  volumeNumber?: number
   /**
    * 返回 true 表示工作流确实发起了；false 时对话框不关闭、也不提示「已提交」。
    *
@@ -45,7 +47,7 @@ interface Props {
 }
 
 /** 蓝图生成配置弹框 — 选择生成范围和模式 */
-export default function DirectoryConfigDialog({ isOpen, onClose, existingCount, existingMaxChapter, onConfirm }: Props) {
+export default function DirectoryConfigDialog({ isOpen, onClose, existingCount, existingMaxChapter, volumeNumber, onConfirm }: Props) {
   const currentProject = useProjectStore(s => s.currentProject)
 
   /**
@@ -120,7 +122,8 @@ export default function DirectoryConfigDialog({ isOpen, onClose, existingCount, 
   }
 
   /**
-   * 「当前卷」取**最后一卷**，不是「第 existingCount+1 章所属的卷」。
+   * 从卷子菜单进入时，「当前卷」取调用方指定卷；全书入口仍取**最后一卷**，
+   * 不是「第 existingCount+1 章所属的卷」。
    *
    * `existingCount` 是蓝图**条数**，不是最大章号——蓝图区间允许有缺口，
    * 拿条数 +1 去定位卷会在有缺口时指到错误的卷（同一个坑在 Agent 续写目录
@@ -132,7 +135,11 @@ export default function DirectoryConfigDialog({ isOpen, onClose, existingCount, 
    */
   const volumeStatus = useVolumeStore(s => s.status)
   const volumes = useVolumeStore(s => s.volumes)
-  const currentVolume = volumeStatus === 'ready' ? getLastVolume(volumes) : null
+  const currentVolume = volumeStatus === 'ready'
+    ? (volumeNumber === undefined
+        ? getLastVolume(volumes)
+        : volumes.find(v => v.volumeNumber === volumeNumber) ?? null)
+    : null
 
   /**
    * 有卷时**默认锁定当前卷**（Product-Spec §6.5「范围默认锁定为本卷」，

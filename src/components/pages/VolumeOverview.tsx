@@ -19,8 +19,8 @@
  * 用在进度条上无害；**不可**拿它当「能不能删这一卷」的授权依据
  * （那道在主进程事务里直接查 `drafts` 表）。
  */
-import { useEffect, useState } from 'react'
-import { Layers } from 'lucide-react'
+import { memo, useEffect, useMemo, useState } from 'react'
+import { Layers, Loader2, AlertCircle } from 'lucide-react'
 import { Button } from '../ui/Button'
 import { toast } from '../ui/Toast'
 import { useVolumeStore, getProjectToken } from '../../stores/volume-store'
@@ -30,10 +30,9 @@ import { ipc } from '../../services/ipc-client'
 import {
   VOLUME_STATUS_LABELS,
   computeEffectiveTotalChapters,
-  countFinalizedInRange,
-  countFinalizedTotal,
   describeOpenThreadCount,
   getVolumeSummary,
+  hasFinalized,
 } from '../../services/volume-service'
 import { startNextVolumeFlow, describeStartFlowResult } from '../../services/volume-flow'
 import { openVolumeDetail } from '../../services/volume-tabs'
@@ -51,11 +50,41 @@ export default function VolumeOverview() {
   const status = useVolumeStore(s => s.status)
   const projectName = useProjectStore(s => s.currentProject?.name ?? '')
   const totalChapters = useProjectStore(s => s.currentProject?.novelConfig.totalChapters ?? 0)
-  // 选择器返回数字（不是新数组）：zustand v5 的快照必须稳定，
-  // 返回新引用会让 useSyncExternalStore 判定「每次都变了」而反复重渲染
-  const writtenTotal = useDraftStore(s => countFinalizedTotal(s.draftsByChapter))
+  const draftsByChapter = useDraftStore(s => s.draftsByChapter)
 
   const [starting, setStarting] = useState(false)
+
+  /**
+   * 一次性算出**每卷**的已写数 + 全书已写数。
+   *
+   * 先分别按章号排序，再用双指针一次扫描卷区间与已定稿章节；主扫描为 O(卷数 + 章节数)，
+   * 加上排序为 O(V log V + C log C)，不再让每个章节逐卷查找。
+   *
+   * ⚠️ 必须**整页只跑这一次**：传 `Map<volumeNumber, written>` 给卡，
+   * 而不是每张卡再去查。Map 引用稳定（不重建），zustand 选择器照旧返回
+   * 同一引用，不会触发额外渲染。
+   */
+  const { writtenByVolume, writtenTotal } = useMemo(() => {
+    const map = new Map<number, number>()
+    const finalizedChapters = Object.entries(draftsByChapter)
+      .filter(([, drafts]) => hasFinalized(drafts))
+      .map(([chStr]) => Number(chStr))
+      .filter(Number.isSafeInteger)
+      .sort((a, b) => a - b)
+    const sortedVolumes = [...volumes].sort((a, b) => a.startChapter - b.startChapter)
+
+    let volumeIndex = 0
+    for (const ch of finalizedChapters) {
+      while (volumeIndex < sortedVolumes.length && sortedVolumes[volumeIndex].endChapter < ch) {
+        volumeIndex++
+      }
+      const volume = sortedVolumes[volumeIndex]
+      if (volume && ch >= volume.startChapter && ch <= volume.endChapter) {
+        map.set(volume.volumeNumber, (map.get(volume.volumeNumber) ?? 0) + 1)
+      }
+    }
+    return { writtenByVolume: map, writtenTotal: finalizedChapters.length }
+  }, [draftsByChapter, volumes])
 
   /**
    * 发起续卷。提示分派走共享的纯函数——其中 `project-switched` **刻意不弹**：
@@ -108,12 +137,12 @@ export default function VolumeOverview() {
       {/* ===== 主体 ===== */}
       <div className="flex-1 overflow-y-auto px-6 py-4">
         {status !== 'ready'
-          ? <NotReadyBlock status={status} />
+          ? <NotReadyBlock status={status} onRetry={() => void useVolumeStore.getState().loadAll()} />
           : volumes.length === 0
             ? <ZeroVolumeState onStart={() => void handleStart()} starting={starting} />
             : (
               <div className="space-y-3">
-                {volumes.map(v => <VolumeBigCard key={v.volumeNumber} volume={v} />)}
+                {volumes.map(v => <VolumeBigCard key={v.volumeNumber} volume={v} written={writtenByVolume.get(v.volumeNumber) ?? 0} />)}
               </div>
             )}
       </div>
@@ -122,26 +151,57 @@ export default function VolumeOverview() {
 }
 
 /** 加载中 / 失败。**不复用零卷态**——那会把「没读到」说成「没有卷」 */
-function NotReadyBlock({ status }: { status: 'idle' | 'loading' | 'error' }) {
+function NotReadyBlock({
+  status,
+  onRetry,
+}: {
+  status: 'idle' | 'loading' | 'error'
+  onRetry: () => void
+}) {
   if (status === 'error') {
     return (
       <div
         role="alert"
-        className="rounded-lg p-4 text-sm"
-        style={{ border: '1px solid var(--color-border)', color: 'var(--color-error, #ef4444)' }}
+        className="rounded-lg p-5 flex items-start gap-3"
+        style={{ border: '1px solid var(--color-error, #ef4444)', background: 'var(--color-bg-elevated)' }}
       >
-        分卷数据读取失败，请重新打开项目后重试。
+        <AlertCircle size={18} style={{ color: 'var(--color-error, #ef4444)', flexShrink: 0, marginTop: 1 }} />
+        <div>
+          <div className="text-sm font-semibold mb-1" style={{ color: 'var(--color-error, #ef4444)' }}>
+            分卷数据读取失败
+          </div>
+          <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+            可能数据库短暂不可用。可先重新加载；若仍失败，再查看 dev tools 的 IPC 日志定位具体通道。
+          </div>
+          <Button variant="outline" size="sm" className="mt-3" onClick={onRetry}>重新加载</Button>
+        </div>
       </div>
     )
   }
   return (
-    <div className="space-y-3">
-      {[0, 1].map(i => (
-        <div key={i} className="rounded-lg p-4" style={{ border: '1px solid var(--color-border)' }}>
-          <div className="h-4 rounded animate-pulse mb-3" style={{ background: 'var(--color-bg-elevated)', width: '30%' }} />
-          <div className="h-3 rounded animate-pulse" style={{ background: 'var(--color-bg-elevated)', width: '70%' }} />
-        </div>
-      ))}
+    <div className="space-y-4">
+      {/* 加载指示：图标 + 文字两件同时摆上，灰骨架只是辅助——用户进来
+          第一眼看到的是「在动 + 在说什么」，再看见下面模拟的卡片轮廓 */}
+      <div className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        <Loader2 size={14} className="animate-spin" />
+        <span>正在加载分卷数据…</span>
+      </div>
+      <div className="space-y-3" aria-hidden>
+        {[0, 1, 2].map(i => (
+          <div key={i} className="rounded-lg p-5" style={{ border: '1px solid var(--color-border)' }}>
+            <div className="flex items-center gap-3 mb-3">
+              <div className="h-4 rounded animate-pulse" style={{ background: 'var(--color-bg-elevated)', width: '22%' }} />
+              <div className="h-3 rounded animate-pulse" style={{ background: 'var(--color-bg-elevated)', width: '10%' }} />
+            </div>
+            <div className="h-3 rounded animate-pulse mb-2" style={{ background: 'var(--color-bg-elevated)', width: '80%' }} />
+            <div className="h-3 rounded animate-pulse mb-4" style={{ background: 'var(--color-bg-elevated)', width: '55%' }} />
+            <div className="flex items-center justify-between">
+              <div className="h-3 rounded animate-pulse" style={{ background: 'var(--color-bg-elevated)', width: '20%' }} />
+              <div className="h-2 rounded-full animate-pulse" style={{ background: 'var(--color-bg-elevated)', width: '40%' }} />
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -214,9 +274,9 @@ function ZeroVolumeState({ onStart, starting }: { onStart: () => void; starting:
 }
 
 /** 单卷大卡（设计稿 27 右侧）。点击打开该卷的详情 Tab */
-function VolumeBigCard({ volume }: { volume: VolumeData }) {
-  // 每张卡自己订阅，且选择器返回数字：理由同页面顶部那条注释
-  const written = useDraftStore(s => countFinalizedInRange(s.draftsByChapter, volume.startChapter, volume.endChapter))
+function VolumeBigCardImpl({ volume, written }: { volume: VolumeData; written: number }) {
+  // written 不再自己算——父组件一次遍历全部分好（见 VolumeOverview 顶部那
+  // 段 useMemo 注释）。这里只取数 + 算百分比
   const total = volume.endChapter - volume.startChapter + 1
   // total 理论上恒 ≥1（仓储层校验 end≥start），除零保护是防御性的
   const pct = total > 0 ? Math.round((written / total) * 100) : 0
@@ -295,3 +355,12 @@ function VolumeBigCard({ volume }: { volume: VolumeData }) {
     </div>
   )
 }
+
+/**
+ * 比较器：volume 是按引用比较的——父组件用 `volumes.map(v => ...)` 渲染时，
+ * zustand selector 给出的是同一引用，volume 对象引用不会无故换。
+ * `written` 是数字，按值比较。
+ * 不传 `default` 第三个参数：React.memo 默认是浅比较，对 { volume, written }
+ * 这种纯 props 对象已经够用。
+ */
+const VolumeBigCard = memo(VolumeBigCardImpl)

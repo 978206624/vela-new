@@ -253,13 +253,8 @@ export async function confirmNextVolume(args: {
     // 其间切出去再切回来，现取的 token 已经不是同一个了
     const res = await commitNextVolume(payload, result.capturedToken, result.deferredLLMLogs)
 
-    // ⚠️ **不在这里重拉卷表**。`commitNextVolume` 返回之前就发了
-    // `REFRESH_RESOURCE({resources:['volumes']})`，`ProjectService` 的监听会调
-    // `useVolumeStore.loadAll()`。这里再拉一次是重复刷新——同一次续卷两趟 IPC，
-    // 而且那条事件驱动的刷新**不受本流程归属判定管辖**，
-    // 想靠这里的判定「阻止 stale 后重拉」是做不到的。
-    // 事件那条自带 token 守卫（`loadAll` 内部有 token + 序号双重竞态守卫），
-    // 串不到别的项目去。
+    // `commitNextVolume` 在提交成功后已经直接刷新卷表；这里仅处理流程归属与 UI 收尾，
+    // 不重复发第二次读取。
     if (!ownsFlowState(actionToken, flowId)) return { ok: false, reason: 'stale' }
     if (!res.success) return { ok: false, reason: 'failed', message: res.error || '续卷写入失败' }
 
@@ -270,4 +265,3 @@ export async function confirmNextVolume(args: {
     return { ok: false, reason: 'failed', message: `续卷写入失败：${e}` }
   }
 }
-

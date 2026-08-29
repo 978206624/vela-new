@@ -17,10 +17,14 @@ import { ipc } from '../../../services/ipc-client'
 
 export default function DraftBoxGroup({
   draftsByChapter,
+  indent = 10,
+  defaultOpen = true,
 }: {
   draftsByChapter: Record<number, DraftMeta[]>
+  indent?: number
+  defaultOpen?: boolean
 }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(defaultOpen)
 
   // 所有章节号排序
   const chapterNums = Object.keys(draftsByChapter)
@@ -35,10 +39,12 @@ export default function DraftBoxGroup({
   return (
     <div>
       {/* 草稿箱标题行 */}
-      <div
-        className="tree-item gap-1.5 cursor-pointer select-none"
-        style={{ paddingLeft: 10 }}
+      <button
+        type="button"
+        className="tree-item gap-1.5 cursor-pointer select-none w-full text-left rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+        style={{ paddingLeft: indent }}
         onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
         title="草稿箱：AI 生成后的章节草稿在此管理，定稿后进入正文章节"
       >
         {open
@@ -52,14 +58,14 @@ export default function DraftBoxGroup({
             {activeChapterCount} 章
           </span>
         )}
-      </div>
+      </button>
 
       {open && (
         <div>
           {chapterNums.length === 0 ? (
             <div
               className="text-xs py-1"
-              style={{ paddingLeft: 34, color: 'var(--color-text-muted)' }}
+              style={{ paddingLeft: indent + 24, color: 'var(--color-text-muted)' }}
             >
               暂无草稿（从章节蓝图点击「写作此章」创作）
             </div>
@@ -69,6 +75,7 @@ export default function DraftBoxGroup({
                 key={chNum}
                 chapterNumber={chNum}
                 drafts={draftsByChapter[chNum] || []}
+                indent={indent + 16}
               />
             ))
           )}
@@ -83,9 +90,11 @@ export default function DraftBoxGroup({
 function DraftChapterGroup({
   chapterNumber,
   drafts,
+  indent,
 }: {
   chapterNumber: number
   drafts: DraftMeta[]
+  indent: number
 }) {
   const [open, setOpen] = useState(true)
 
@@ -121,7 +130,7 @@ function DraftChapterGroup({
       {/* 章节行 */}
       <div
         className="tree-item gap-1.5 cursor-pointer select-none"
-        style={{ paddingLeft: 26 }}
+        style={{ paddingLeft: indent }}
         onClick={() => setOpen(v => !v)}
         title={displayTitle}
       >
@@ -150,6 +159,7 @@ function DraftChapterGroup({
               draft={draft}
               chapterTitleText={displayTitle}
               isEffectiveFinalized={draft.status === 'finalized' && draft.version === effectiveFinalizedVersion}
+              indent={indent + 24}
             />
           ))}
 
@@ -157,7 +167,7 @@ function DraftChapterGroup({
           {archivedDrafts.length > 0 && (
             <div
               className="flex items-center gap-1 cursor-pointer select-none"
-              style={{ paddingLeft: 54 }}
+              style={{ paddingLeft: indent + 28 }}
               onClick={() => setShowArchived(v => !v)}
             >
               <span className="text-[0.7rem]" style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>
@@ -171,6 +181,7 @@ function DraftChapterGroup({
               draft={draft}
               chapterTitleText={displayTitle}
               archived
+              indent={indent + 24}
             />
           ))}
         </div>
@@ -186,12 +197,14 @@ function DraftItem({
   chapterTitleText,
   archived = false,
   isEffectiveFinalized = false,
+  indent,
 }: {
   draft: DraftMeta
   chapterTitleText: string
   archived?: boolean
   /** 是否为本章真正生效的定稿（同章最高版本 finalized）。仅此项标「生效中」并显示绿勾 */
   isEffectiveFinalized?: boolean
+  indent: number
 }) {
   /** 打开草稿到编辑器 */
   const openDraft = async () => {
@@ -244,7 +257,7 @@ function DraftItem({
     <div
       className="relative flex items-center gap-1.5 cursor-pointer hover:bg-[var(--color-hover)]"
       style={{
-        paddingLeft: 50,
+        paddingLeft: indent,
         paddingRight: 8,
         paddingTop: 3,
         paddingBottom: 3,

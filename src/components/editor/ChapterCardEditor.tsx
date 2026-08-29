@@ -34,8 +34,15 @@ import { CHAPTER_ROLES, CHAPTER_ROLE_COLORS, coerceChapterRole } from '../../sha
 
 // 章节定位常量（7 项口径 + 配色）已迁至 src/shared/chapter-roles.ts，统一引用
 
+interface ChapterCardEditorProps {
+  /** 从某卷子菜单打开时锁定该卷；未设置时维持全书视图 */
+  volumeNumber?: number
+  /** 范围外章节的异常数据视图 */
+  chapterScope?: 'unassigned'
+}
+
 /** 章节蓝图编辑器 — 读写 directory.json */
-export default function ChapterCardEditor() {
+export default function ChapterCardEditor({ volumeNumber, chapterScope }: ChapterCardEditorProps) {
   const currentProject = useProjectStore(s => s.currentProject)
   // 实际已写字数来源：订阅各章草稿元数据（草稿增删/定稿时变化，非流式高频，重渲染可接受）
   const draftsByChapter = useDraftStore(s => s.draftsByChapter)
@@ -145,8 +152,6 @@ export default function ChapterCardEditor() {
 
   useEffect(() => { blueprintsRef.current = blueprints }, [blueprints])
 
-  const selected = blueprints[selectedIdx] ?? null
-
   /**
    * 蓝图按卷分组（改造屏 11）。**零卷时不分组**，维持原样渲染。
    *
@@ -158,15 +163,66 @@ export default function ChapterCardEditor() {
    */
   const volumeStatus = useVolumeStore(s => s.status)
   const volumes = useVolumeStore(s => s.volumes)
+  const targetVolume = volumeNumber === undefined
+    ? null
+    : volumes.find(v => v.volumeNumber === volumeNumber) ?? null
+  const scoped = volumeNumber !== undefined || chapterScope === 'unassigned'
   const volumeGroups = useMemo(() => {
     const indexed = blueprints.map((bp, idx) => ({ bp, idx, chapterNumber: bp.chapterNumber }))
+    if (volumeNumber !== undefined) {
+      const volume = volumes.find(v => v.volumeNumber === volumeNumber) ?? null
+      let items = volume === null
+        ? []
+        : indexed.filter(item => item.chapterNumber >= volume.startChapter && item.chapterNumber <= volume.endChapter)
+      const editing = dirty ? indexed[selectedIdx] : undefined
+      if (editing && !items.some(item => item.idx === editing.idx)) {
+        items = [...items, editing].sort((a, b) => a.chapterNumber - b.chapterNumber)
+      }
+      return [{ volume, items }]
+    }
+    if (chapterScope === 'unassigned') {
+      let items = volumeStatus !== 'ready'
+        ? []
+        : indexed.filter(item => !volumes.some(
+            v => item.chapterNumber >= v.startChapter && item.chapterNumber <= v.endChapter,
+          ))
+      const editing = dirty ? indexed[selectedIdx] : undefined
+      if (editing && !items.some(item => item.idx === editing.idx)) {
+        items = [...items, editing].sort((a, b) => a.chapterNumber - b.chapterNumber)
+      }
+      return [{ volume: null, items }]
+    }
     if (volumeStatus !== 'ready' || volumes.length === 0) {
       return [{ volume: null, items: indexed }]
     }
     return groupChaptersByVolume(indexed, volumes)
-  }, [blueprints, volumes, volumeStatus])
+  }, [blueprints, chapterScope, dirty, selectedIdx, volumeNumber, volumes, volumeStatus])
+  const visibleIndexes = useMemo(
+    () => volumeGroups.flatMap(group => group.items.map(item => item.idx)),
+    [volumeGroups],
+  )
+  const effectiveSelectedIdx = visibleIndexes.includes(selectedIdx)
+    ? selectedIdx
+    : (visibleIndexes[0] ?? -1)
+  const selected = effectiveSelectedIdx >= 0 ? blueprints[effectiveSelectedIdx] ?? null : null
   /** 只有一组且无卷 = 未分卷，渲染时不插分组头 */
-  const grouped = volumeGroups.length > 1 || volumeGroups[0]?.volume !== null
+  const grouped = scoped || volumeGroups.length > 1 || volumeGroups[0]?.volume !== null
+  const visibleBlueprintCount = visibleIndexes.length
+  const editorTitle = targetVolume
+    ? `第${targetVolume.volumeNumber}卷 · 章节蓝图`
+    : volumeNumber !== undefined
+      ? `第${volumeNumber}卷 · 章节蓝图`
+    : chapterScope === 'unassigned'
+      ? '未归卷章节 · 蓝图'
+      : '章节蓝图'
+  const scopedNextWriteChapter = nextWriteChapter !== null
+    && chapterScope !== 'unassigned'
+    && (volumeNumber === undefined
+      || (targetVolume !== null
+        && nextWriteChapter >= targetVolume.startChapter
+        && nextWriteChapter <= targetVolume.endChapter))
+    ? nextWriteChapter
+    : null
 
   // 每章实际已写字数：定稿优先、否则最新草稿（version 降序首条）的 word_count。useMemo 限制重复计算。
   const actualWordsByChapter = useMemo(() => {
@@ -180,8 +236,9 @@ export default function ChapterCardEditor() {
 
   /** 更新选中章节蓝图的字段 */
   const updateField = <K extends keyof ChapterBlueprint>(key: K, value: ChapterBlueprint[K]) => {
+    if (selectedIdx !== effectiveSelectedIdx) setSelectedIdx(effectiveSelectedIdx)
     setBlueprints(prev =>
-      prev.map((b, i) => (i === selectedIdx ? { ...b, [key]: value } : b))
+      prev.map((b, i) => (i === effectiveSelectedIdx ? { ...b, [key]: value } : b))
     )
     markDirty()
   }
@@ -194,7 +251,7 @@ export default function ChapterCardEditor() {
     const toSave = { ...selected, targetWords: normalizeTargetWords(selected.targetWords, currentProject.novelConfig.wordsPerChapter) }
     await saveChapterBlueprint(toSave)
     // 同步本地状态为归一后的值，避免"输入全局值保存后仍显示正数(像钉住)"与 0=跟随全局 UI 不一致
-    setBlueprints(prev => prev.map((b, i) => (i === selectedIdx ? toSave : b)))
+    setBlueprints(prev => prev.map((b, i) => (i === effectiveSelectedIdx ? toSave : b)))
     setSaving(false)
     setDirty(false)
     addLog('info', `✅ 第 ${selected.chapterNumber} 章蓝图已保存`)
@@ -221,9 +278,31 @@ export default function ChapterCardEditor() {
 
   /** 新建空章节 */
   const handleAddChapter = () => {
-    const maxNum = blueprints.reduce((m, b) => Math.max(m, b.chapterNumber), 0)
+    if (chapterScope === 'unassigned') return
+    if (volumeNumber !== undefined && targetVolume === null) {
+      toast.warning('这卷已不存在，请从侧栏重新打开章节蓝图')
+      return
+    }
+    let newChapterNumber: number
+    if (targetVolume) {
+      const occupied = new Set(blueprints.map(b => b.chapterNumber))
+      let firstMissing: number | null = null
+      for (let chapter = targetVolume.startChapter; chapter <= targetVolume.endChapter; chapter += 1) {
+        if (!occupied.has(chapter)) {
+          firstMissing = chapter
+          break
+        }
+      }
+      if (firstMissing === null) {
+        toast.warning('本卷章号范围内已没有可新增的章节')
+        return
+      }
+      newChapterNumber = firstMissing
+    } else {
+      newChapterNumber = blueprints.reduce((m, b) => Math.max(m, b.chapterNumber), 0) + 1
+    }
     const newBlueprint: ChapterBlueprint = {
-      chapterNumber: maxNum + 1,
+      chapterNumber: newChapterNumber,
       title: '',
       role: '发展',
       purpose: '',
@@ -235,8 +314,9 @@ export default function ChapterCardEditor() {
       notesUpdatedAt: '',
       targetWords: 0,
     }
-    setBlueprints(prev => [...prev, newBlueprint])
-    setSelectedIdx(blueprints.length)
+    const nextBlueprints = [...blueprints, newBlueprint].sort((a, b) => a.chapterNumber - b.chapterNumber)
+    setBlueprints(nextBlueprints)
+    setSelectedIdx(nextBlueprints.findIndex(b => b.chapterNumber === newChapterNumber))
     markDirty()
   }
 
@@ -249,9 +329,9 @@ export default function ChapterCardEditor() {
       danger: true,
     })
     if (!ok) return
-    const newList = blueprints.filter((_, i) => i !== selectedIdx)
+    const newList = blueprints.filter((_, i) => i !== effectiveSelectedIdx)
     setBlueprints(newList)
-    setSelectedIdx(Math.max(0, selectedIdx - 1))
+    setSelectedIdx(Math.max(0, effectiveSelectedIdx - 1))
     markDirty()
   }
 
@@ -398,10 +478,10 @@ export default function ChapterCardEditor() {
         <div className="flex items-center gap-1.5">
           <BookOpen size={13} style={{ color: 'var(--color-text-muted)' }} />
           <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
-            章节蓝图
-            {blueprints.length > 0 && (
+            {editorTitle}
+            {visibleBlueprintCount > 0 && (
               <span style={{ color: 'var(--color-text-muted)' }} className="ml-1 font-normal">
-                ({blueprints.length} 章)
+                ({visibleBlueprintCount} 章)
               </span>
             )}
           </span>
@@ -409,36 +489,40 @@ export default function ChapterCardEditor() {
         </div>
         <div className="flex items-center gap-1">
           {/* 写作入口 — 仅下一章可写时显示 */}
-          {nextWriteChapter !== null && (
+          {scopedNextWriteChapter !== null && (
             <Button
               variant="ai"
               size="sm"
               onClick={() => {
-                const bp = blueprints.find(b => b.chapterNumber === nextWriteChapter)
+                const bp = blueprints.find(b => b.chapterNumber === scopedNextWriteChapter)
                 if (bp) handleWriteChapter(bp)
               }}
             >
               <PenLine size={12} />
-              写作第{nextWriteChapter}章
+              写作第{scopedNextWriteChapter}章
             </Button>
           )}
           {/* AI 生成蓝图 → 弹出 DirectoryConfigDialog；生成中显示 loading 并禁用 */}
-          <Button
-            variant="ai"
-            size="sm"
-            onClick={() => setShowBlueprintDialog(true)}
-            disabled={isGenerating}
-            title={isGenerating ? '正在生成章节蓝图...' : 'AI 生成章节蓝图（选择范围和模式）'}
-          >
-            {isGenerating ? <RefreshCw size={12} className="animate-spin" /> : <Sparkles size={12} />}
-            {isGenerating ? '生成中...' : 'AI 生成蓝图'}
-          </Button>
+          {chapterScope !== 'unassigned' && (volumeNumber === undefined || targetVolume !== null) && (
+            <Button
+              variant="ai"
+              size="sm"
+              onClick={() => setShowBlueprintDialog(true)}
+              disabled={isGenerating}
+              title={isGenerating ? '正在生成章节蓝图...' : 'AI 生成章节蓝图（选择范围和模式）'}
+            >
+              {isGenerating ? <RefreshCw size={12} className="animate-spin" /> : <Sparkles size={12} />}
+              {isGenerating ? '生成中...' : 'AI 生成蓝图'}
+            </Button>
+          )}
           <Button variant="ghost" size="icon" onClick={() => loadBlueprints()} title="重新加载" disabled={loading}>
             <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
           </Button>
-          <Button variant="ghost" size="icon" onClick={handleAddChapter} title="新建章节">
-            <Plus size={14} />
-          </Button>
+          {chapterScope !== 'unassigned' && (volumeNumber === undefined || targetVolume !== null) && (
+            <Button variant="ghost" size="icon" onClick={handleAddChapter} title="新建章节">
+              <Plus size={14} />
+            </Button>
+          )}
           {dirty && (
             <Button variant="outline" size="sm" onClick={handleSaveAll} disabled={saving}>
               <Save size={12} /> {saving ? '保存中...' : '保存全部'}
@@ -456,6 +540,7 @@ export default function ChapterCardEditor() {
         onClose={() => setShowBlueprintDialog(false)}
         existingCount={blueprints.length}
         existingMaxChapter={blueprints.reduce((m, b) => Math.max(m, b.chapterNumber), 0)}
+        volumeNumber={volumeNumber}
         onConfirm={handleBatchGenerate}
       />}
 
@@ -469,7 +554,7 @@ export default function ChapterCardEditor() {
           {/* ⚠️ 只有「**零卷**且无蓝图」才走全局空态。
               分了卷但一条蓝图都还没生成时，仍要把各卷的分组头渲染出来——
               那些组头在说「这一卷还没生成蓝图」，一并藏掉等于把分卷这件事也藏了 */}
-          {blueprints.length === 0 && !grouped ? (
+          {visibleBlueprintCount === 0 && !grouped ? (
             <div className="flex flex-col items-center justify-center flex-1 gap-3 opacity-40 p-4">
               <BookOpen size={28} />
               <span className="text-xs text-center">暂无蓝图，点击「AI 生成」开始</span>
@@ -505,7 +590,7 @@ export default function ChapterCardEditor() {
                 {/* 空卷也保留分组头：它在说「这一卷还没生成蓝图」 */}
                 {grouped && g.items.length === 0 && (
                   <div className="px-2.5 py-1.5 text-[0.68rem]" style={{ color: 'var(--color-text-muted)' }}>
-                    本卷还没有章节蓝图
+                    {chapterScope === 'unassigned' ? '没有未归卷的章节蓝图' : '本卷还没有章节蓝图'}
                   </div>
                 )}
                 {g.items.map(({ bp, idx }) => (
@@ -513,7 +598,7 @@ export default function ChapterCardEditor() {
                   key={bp.chapterNumber}
                   className={cn(
                     'group relative px-2.5 py-2 rounded-md text-xs cursor-pointer mb-0.5 transition-colors',
-                    selectedIdx === idx
+                    effectiveSelectedIdx === idx
                       ? 'bg-[var(--color-active)] text-[var(--color-text)]'
                       : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-hover)]'
                   )}

@@ -50,8 +50,8 @@ export default function ProjectTree() {
 
   // 存储各架构文件是否有实际内容（已生成）
   const [archStatus, setArchStatus] = useState<Record<string, boolean>>({})
-  // 章节蓝图数量
-  const [blueprintCount, setBlueprintCount] = useState<number>(-1)
+  // 章节蓝图章号：数量用于全局徽章，具体章号用于按卷统计与未归卷判定
+  const [blueprintChapterNumbers, setBlueprintChapterNumbers] = useState<number[]>([])
 
   /** 统一刷新：文件树 + 架构状态 + 草稿列表 + 蓝图数量 */
   // ✅ 用 getState() 获取最新的 action，不作为依赖项，避免重建导致 useEffect 循环
@@ -60,13 +60,13 @@ export default function ProjectTree() {
     useProjectStore.getState().refreshFileTree()
     useDraftStore.getState().loadAllDrafts()
     // 通过 Service 层获取架构状态和蓝图数量（避免直接 IPC）
-    const { checkArchStatus, getBlueprintCount } = await import('../../../services/architecture-service')
-    const [status, count] = await Promise.all([
+    const { checkArchStatus, getBlueprintChapterNumbers } = await import('../../../services/architecture-service')
+    const [status, chapterNumbers] = await Promise.all([
       checkArchStatus(),
-      getBlueprintCount(),
+      getBlueprintChapterNumbers(),
     ])
     setArchStatus(status)
-    setBlueprintCount(count)
+    setBlueprintChapterNumbers(chapterNumbers)
   }, [])  // ✅ 空依赖：内部用 getState() 获取最新 action，不依赖闭包
 
   // 项目切换时刷新
@@ -155,6 +155,8 @@ export default function ProjectTree() {
   const effectiveTotal = volumeStatus === 'ready'
     ? computeEffectiveTotalChapters(volumes, nc.totalChapters)
     : nc.totalChapters
+  const blueprintCount = blueprintChapterNumbers.length
+  const volumeNavigation = volumeStatus === 'ready' && volumes.length > 0
   const configDone = !!(nc.coreOutline?.trim() || nc.protagonistProfile?.trim())
 
   // 故事架构进度
@@ -207,38 +209,48 @@ export default function ProjectTree() {
       <WorldBuildingGroup archStatus={archStatus} archDone={archDone} />
 
       {/* 2.5 分卷 — 挂在架构四件之下（设计稿 27/28）。零卷项目显示单卷模式说明 */}
-      <VolumeGroup />
-
-      {/* 3. 章节蓝图 — 点击打开编辑器页 */}
-      <LeafItem
-        iconName="layout-list"
-        label="章节蓝图"
-        desc="AI 生成的章节目录，可编辑"
-        badge={blueprintCount > 0 ? `${blueprintCount}/${effectiveTotal} 章` : '待生成'}
-        badgeColor={
-          blueprintCount >= effectiveTotal
-            ? 'var(--color-success)'
-            : blueprintCount > 0
-              ? 'var(--color-warning, #eab308)'
-              : undefined
-        }
-        badgeDone={blueprintCount >= effectiveTotal}
-        onClick={() => openBuiltinEditor('chapter-card-editor', '章节蓝图', 'chapter-card')}
-        onContextMenu={e => showSidebarMenu([
-          {
-            key: 'open',
-            label: '打开章节蓝图',
-            icon: <FolderOpen size={13} />,
-            onClick: () => openBuiltinEditor('chapter-card-editor', '章节蓝图', 'chapter-card'),
-          },
-        ], e)}
+      <VolumeGroup
+        blueprintChapterNumbers={blueprintChapterNumbers}
+        draftsByChapter={draftsByChapter}
+        manuscriptFiles={manuscriptFiles}
+        projectPath={p}
       />
 
-      {/* 4. 草稿箱 — 独立分区，按章节分组展示草稿 */}
-      <DraftBoxGroup draftsByChapter={draftsByChapter} />
+      {/* 零卷项目保持原有一级入口；已有卷时由 VolumeGroup 收进各卷子菜单。 */}
+      {!volumeNavigation && (
+        <>
+          {/* 3. 章节蓝图 — 点击打开编辑器页 */}
+          <LeafItem
+            iconName="layout-list"
+            label="章节蓝图"
+            desc="AI 生成的章节目录，可编辑"
+            badge={blueprintCount > 0 ? `${blueprintCount}/${effectiveTotal} 章` : '待生成'}
+            badgeColor={
+              blueprintCount >= effectiveTotal
+                ? 'var(--color-success)'
+                : blueprintCount > 0
+                  ? 'var(--color-warning, #eab308)'
+                  : undefined
+            }
+            badgeDone={blueprintCount >= effectiveTotal}
+            onClick={() => openBuiltinEditor('chapter-card-editor', '章节蓝图', 'chapter-card')}
+            onContextMenu={e => showSidebarMenu([
+              {
+                key: 'open',
+                label: '打开章节蓝图',
+                icon: <FolderOpen size={13} />,
+                onClick: () => openBuiltinEditor('chapter-card-editor', '章节蓝图', 'chapter-card'),
+              },
+            ], e)}
+          />
 
-      {/* 5. 正文章节 — 仅显示已定稿 */}
-      <ManuscriptGroup files={manuscriptFiles} projectPath={p} />
+          {/* 4. 草稿箱 — 独立分区，按章节分组展示草稿 */}
+          <DraftBoxGroup draftsByChapter={draftsByChapter} />
+
+          {/* 5. 正文章节 — 仅显示已定稿 */}
+          <ManuscriptGroup files={manuscriptFiles} projectPath={p} />
+        </>
+      )}
     </div>
   )
 }

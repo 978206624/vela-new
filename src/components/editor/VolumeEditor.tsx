@@ -14,9 +14,9 @@
  *
  * ## 未保存的编辑必须活过标签页切换
  *
- * `EditorArea` 只渲染**当前活动 Tab**，切走就卸载本组件。表单状态若只在本地
- * state 里，用户「写了半卷大纲 → 切去看一眼章节蓝图 → 切回来」就会发现编辑没了，
- * 且没有任何提示。故每次编辑都写一份草稿到 `volume-draft-store`
+ * 已打开的卷详情 Tab 会保持挂载以加快切换，但关闭 Tab、离开 Tab 系统或关闭项目
+ * 仍会卸载本组件；保存与生成的异步回包也可能发生在旧实例已销毁之后。
+ * 故每次编辑都写一份草稿到 `volume-draft-store`
  * （按 `projectToken:volumeNumber` 归属），并把 Tab 标脏——后者还顺带让
  * 关闭 Tab / ⌘W / 批量关闭的既有未保存确认对本编辑器生效。
  *
@@ -28,8 +28,8 @@
  *
  * ## 后台刷新不许覆盖未保存的编辑
  *
- * `volume-store.loadAll()` 会被 `REFRESH_RESOURCE` 事件驱动（续卷提交、定稿
- * 触发的卷状态流转都会发），而它每次都先把 status 打回 `loading`。
+ * `volume-store.loadAll()` 会在续卷提交、定稿触发的卷状态流转成功后直接调用，
+ * 而它每次都先把 status 打回 `loading`。
  * 故两道：① 顶层分支「有卷就渲染表单」优先于看 status，不让加载态卸载表单；
  * ② 表单内用「渲染期调整 state」在**不脏时**才同步库里的新值。
  *
@@ -39,7 +39,7 @@
  * await 回来后还要再核一次才动 UI。中途现取会拿到切换后那个项目的**合法** token，
  * 主进程守卫看不出异常。
  */
-import { useState, useId, useMemo } from 'react'
+import { memo, useState, useId, useMemo } from 'react'
 import { Layers, Save, Trash2, Plus, RefreshCw, Sparkles, Square } from 'lucide-react'
 import { Button } from '../ui/Button'
 import { Input } from '../ui/Input'
@@ -92,7 +92,7 @@ interface Props {
   volumeNumber?: number
 }
 
-export default function VolumeEditor({ volumeNumber }: Props) {
+function VolumeEditor({ volumeNumber }: Props) {
   const volumes = useVolumeStore(s => s.volumes)
   const status = useVolumeStore(s => s.status)
 
@@ -128,6 +128,9 @@ export default function VolumeEditor({ volumeNumber }: Props) {
   return <CenterNotice text={`第 ${volumeNumber} 卷已不存在（可能已被删除）。可以关闭这个标签页。`} />
 }
 
+// EditorArea 会同时保留多个已打开的卷页；只切 activeTabId 时不要重渲染隐藏表单。
+export default memo(VolumeEditor)
+
 function CenterNotice({ text }: { text: string }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-3" style={{ color: 'var(--color-text-muted)' }}>
@@ -154,8 +157,8 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
   const removeOne = useVolumeStore(s => s.removeOne)
 
   /**
-   * 已有的未保存草稿。初始化时**优先用它**——`EditorArea` 只渲染当前活动 Tab，
-   * 切走再切回会让本组件卸载重建；只从 `volume` 初始化的话，用户的编辑就没了。
+   * 已有的未保存草稿。初始化时**优先用它**——卷页通常会保持挂载，但离开 Tab 系统
+   * 等路径仍会让本组件卸载重建；只从 `volume` 初始化的话，用户的编辑就没了。
    *
    * ⚠️ 只在**首次挂载**读一次（`useState` 的惰性初值），之后草稿由本组件单向写出。
    * 每次渲染都读会把 store 当成真值源，与本地 state 打架。
@@ -197,7 +200,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
   /**
    * `dirty` 与 `touched` **不放组件本地 state**，直接从共享草稿 store 派生。
    *
-   * 放本地会产生一个跨实例的竞态：保存在途时切走再切回会换一个新实例，
+   * 放本地会产生一个跨实例的竞态：保存在途时若组件被卸载再重建，会换一个新实例，
    * 而回包善后（清 dirty / 清 touched）跑在**旧实例**的闭包里——它能清掉
    * 共享草稿与 Tab 脏标，却清不动当前这个实例的 state。结果是
    * 「组件显示未保存、Tab 显示已保存、草稿已经没了」三者不一致；
@@ -214,7 +217,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
   const touched: VolumeDetailField[] = draft?.touched ?? []
 
   /**
-   * 保存占用同样是**共享**的。做成组件本地 state 的话，保存在途切走再切回
+   * 保存占用同样是**共享**的。做成组件本地 state 的话，保存在途卸载再重建
    * 会换出一个 `saving=false` 的新实例、保存按钮重新可用，同一份旧 patch
    * 能被提交两次；两次事务之间若有后台写入，第二次就会覆盖它。
    */
@@ -325,7 +328,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
    * 草稿由 service 在 settle 之前就写好了，这里只是把它显示出来。
    *
    * `adoptedRegenIdState` 保证同一条 result 只灌一次：灌完之后用户手改大纲，
-   * 不会在下一次渲染被 result 覆盖回去。组件卸载重挂载（切 Tab 再切回）时
+   * 不会在下一次渲染被 result 覆盖回去。组件卸载重挂载时
    * state 归零、会重新灌一次——那时草稿仍在，灌的还是同一份，无害。
    */
   if (regenAdopted && regenResult !== null && adoptedRegenIdState !== regenResult.regenId) {
@@ -373,12 +376,12 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
    * ① 置脏，并把本次改动的字段记进 `touched`——保存只提交这些列
    *    （`status` / `openThreads` 后台也会写，整表提交会撤销用户没看过的新值）；
    * ② 递增**存在 store 里**的编辑版本号。放 store 而不是组件 ref：
-   *    「保存在途 → 切走 → 切回（新实例，ref 从 0 重来）→ 继续输入 → 旧实例回包」时，
+   *    「保存在途 → 组件卸载重建（新实例，ref 从 0 重来）→ 继续输入 → 旧实例回包」时，
    *    旧实例会拿自己那份没动过的 ref 判定「保存期间没人改过」，
    *    把新实例刚写的草稿和 Tab 脏标一起清掉；
    * ③ 让 Tab 亮起未保存圆点——不这么做的话，关闭 Tab / ⌘W / 批量关闭的既有
    *    未保存确认对本编辑器**完全不生效**；
-   * ④ 把当前表单快照写进草稿 store，好让切走再切回时还在。
+   * ④ 把当前表单快照写进草稿 store，好让组件重建后还在。
    *
    * ⚠️ 快照取的是**本次改动后的值**，故各调用点必须先 setXxx 再 touch(...)，
    * 且要把新值显式传进来——直接读闭包里的 state 拿到的是**改动前**的值，
@@ -421,7 +424,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
     const drafts = useVolumeDraftStore.getState()
 
     // single-flight 走**共享**租约，不是组件本地的 saving：
-    // 保存在途切走再切回会换实例，本地 saving 从 false 重来，
+    // 保存在途卸载再重建会换实例，本地 saving 从 false 重来，
     // 同一份旧 patch 就能被提交两次
     const leaseId = drafts.beginSave(actionToken, volume.volumeNumber)
     if (leaseId === null) return
@@ -456,7 +459,7 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
     // **逐字段**确认：只摘掉「自发起保存以来没再被改过」的那些。
     // 保存期间又改过的字段继续留在 touched 里等下一次保存；
     // 全部摘完才算干净，那时才清 Tab 脏标。
-    // 只动**共享**状态——包括「保存在途切走再切回」换出来的那个新实例，
+    // 只动**共享**状态——包括「保存在途卸载再重建」换出来的那个新实例，
     // 它订阅的是同一份草稿
     const wentClean = useVolumeDraftStore.getState()
       .acknowledgeSave(actionToken, volume.volumeNumber, savedFields, stampsAtSave)
@@ -857,7 +860,15 @@ function VolumeForm({ volume, volumes }: { volume: VolumeData; volumes: VolumeDa
             ) : (
               <div className="space-y-1.5">
                 {threads.map((t, i) => (
-                  <div key={t._id} className="rounded-md p-2 space-y-1.5" style={{ background: 'var(--color-bg-elevated)' }}>
+                  <div
+                    key={t._id}
+                    className="rounded-md p-2 space-y-1.5"
+                    style={{
+                      background: 'var(--color-bg-elevated)',
+                      contentVisibility: 'auto',
+                      containIntrinsicSize: '112px',
+                    }}
+                  >
                     <div className="flex items-center gap-1.5">
                       <label className="sr-only" htmlFor={`${uid}-th-ch-${t._id}`}>第 {i + 1} 条伏笔的埋设章号</label>
                       <Input

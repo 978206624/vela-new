@@ -522,6 +522,8 @@ async function main(): Promise<void> {
         assert(res.success, `提交应成功，实际：${res.error}`)
 
         assertEq(VolumeRepository.getAll().length, 2, '应有首卷 + 新卷两卷')
+        assertEq(useVolumeStore.getState().volumes.map(v => v.volumeNumber), [1, 2],
+            '提交返回前应直接刷新渲染层卷表，无需依赖未初始化的事件监听或重开项目')
         assertEq(VolumeRepository.get(1)!.closingState, '主角拿下北境', '收卷状态应写进首卷')
         assertEq(VolumeRepository.get(2)!.title, '第二卷 · 南征', '新卷名')
         // 结转不变量：新卷台账必须**深等于**收卷报告的未回收清单，开卷状态同理。
@@ -1235,9 +1237,13 @@ ${prompt.slice(0, 500)}`)
 
         await runVolumeStatusStep(11)
         assertEq(VolumeRepository.get(2)!.status, 'writing', '首章定稿应流转为写作中')
+        assertEq(useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)?.status, 'writing',
+            '状态流转步骤返回前应刷新渲染层卷表')
 
         await runVolumeStatusStep(20)
         assertEq(VolumeRepository.get(2)!.status, 'done', '末章定稿应流转为已完成')
+        assertEq(useVolumeStore.getState().volumes.find(v => v.volumeNumber === 2)?.status, 'done',
+            '末章定稿后渲染层应立即显示已完成')
     })
 
     await testCase('X2 单章卷（start === end）→ 落在 done 而不是 writing', async () => {
@@ -1873,6 +1879,43 @@ ${prompt.slice(0, 500)}`)
         // 这条不是锦上添花：「跳过已预览」写歪了就会变成「漏写」，而漏写比覆盖更难发现
         assertEq(BlueprintRepository.getByChapter(14)?.title, 'MODEL-14',
             '只在 onDone 出现的章节必须由整批保存补写')
+    })
+
+    await testCase('X20b2 跨批次：用户修改已预览蓝图后，下一批 prompt 必须读取数据库最新值', async () => {
+        freshEnv()
+        seedArchitecture()
+        setVolumes([vol(1, 1, 100, { title: '第一卷' })])
+        const makeBlueprint = (n: number) => ({
+            chapterNumber: n, title: `MODEL-${n}`, role: '发展', purpose: 'p',
+            characters: [], keyEvents: `MODEL-OLD-${n}`, suspenseHook: 'h',
+        })
+        // 默认测试模型每批 12 章：11–22 为首批，23–24 为第二批。
+        const firstBatch = JSON.stringify({
+            blueprints: Array.from({ length: 12 }, (_, i) => makeBlueprint(11 + i)),
+        })
+        const secondBatch = JSON.stringify({ blueprints: [makeBlueprint(23), makeBlueprint(24)] })
+        let edited = false
+        const llm = stubLLM([firstBatch, secondBatch], {
+            afterCall: n => {
+                if (n !== 1) return
+                // 模拟用户在首批蓝图出现后立即保存编辑；下一批尚未构建 prompt。
+                const result = getProjectDb()!.prepare(
+                    `UPDATE blueprints SET notes = ?, key_events = ? WHERE chapter_number = 11`
+                ).run('USER-LATEST-11', 'USER-KEY-11')
+                edited = result.changes === 1
+            },
+        })
+
+        await useWorkflowStore.getState().startWorkflow(
+            createDirectoryWorkflow({ mode: 'append', startChapter: 11, count: 14 })
+        )
+
+        assert(edited, '前置条件不成立：首批预览蓝图未在第二批 prompt 构建前落库')
+        assertEq(llm.prompts.length, 2, '应恰好生成两批')
+        assert(llm.prompts[1].includes('USER-LATEST-11'),
+            '下一批 prompt 应使用用户保存后的最新 notes')
+        assert(!llm.prompts[1].includes('MODEL-OLD-11'),
+            '下一批 prompt 不得继续引用工作流内存中的模型旧 keyEvents')
     })
 
     await testCase('X20c 预览写入失败的章节，必须由整批保存补上（跳过≠漏写）', async () => {

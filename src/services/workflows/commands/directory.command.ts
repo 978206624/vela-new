@@ -1,8 +1,9 @@
 import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
-import { useVolumeStore } from '../../../stores/volume-store'
+import { getProjectToken, useVolumeStore } from '../../../stores/volume-store'
 import { getPromptTemplate } from '../../prompt-templates'
 import { DirectoryPromptBuilder } from '../../prompts/prompt-builder'
+import { ipc } from '../../ipc-client'
 import { DirectoryWorkflowParams, ChapterBlueprint, parseTextBlueprints, saveAllBlueprints } from '../directory-workflow'
 import { globalEventBus } from '../../../shared/event-bus'
 import { coerceChapterRole } from '../../../shared/chapter-roles'
@@ -268,7 +269,14 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
         const template = getPromptTemplate('chapter_blueprint_chunk')
         if (!template) throw new Error('模板丢失')
 
-        const prevAll = [...existingBlueprints, ...newBlueprints]
+        // 流式预览一旦落库，用户就能立刻在编辑器里修改。工作流内的 newBlueprints
+        // 仍是模型最初返回的旧快照，不能拿它给下一批续写；每批构建 prompt 前重读
+        // 数据库，确保 notes / keyEvents 等上下文与用户刚保存的内容一致。
+        const latestBlueprints = await ipc.invoke('db:blueprint-get-all')
+        if (getProjectToken() !== capturedToken) {
+          throw new Error('项目已切换，本次目录生成已中止')
+        }
+        const prevAll = latestBlueprints.filter(c => c.chapterNumber < cursor)
         // 优先取 notes（定稿后处理由 AI 从**正文**提炼的实际要点），
         // 回落 keyEvents（当初的计划）。接着事实续，不接着计划续——
         // 计划与写成的正文往往已经分叉，喂计划会让新章节接到一条不存在的剧情线上

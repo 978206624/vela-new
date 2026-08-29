@@ -1,6 +1,7 @@
 import { BaseWorkflowCommand, CommandExecuteParams, WORKFLOW_TOKEN_KEY } from './base-command'
 import { useProjectStore } from '../../../stores/project-store'
 import { useLLMStore } from '../../../stores/llm-store'
+import { getProjectToken, useVolumeStore } from '../../../stores/volume-store'
 import { getPromptTemplate } from '../../prompt-templates'
 import { PostProcessPromptBuilder } from '../../prompts/prompt-builder'
 import { ipc } from '../../ipc-client'
@@ -298,8 +299,11 @@ export function buildFinalizePostProcessSteps(
 
       const label = res.changed.status === 'done' ? '已完成' : '写作中'
       callbacks.log(`✅ 「${res.changed.title}」状态流转为「${label}」`)
-      const { globalEventBus } = await import('../../../shared/event-bus')
-      globalEventBus.emit('REFRESH_RESOURCE', { resources: ['volumes'] })
+      // 状态写入由当前渲染进程发起，成功后直接刷新卷表，避免依赖跨进程并不共享的
+      // 内存 EventBus。若期间已切项目，新项目由自己的打开流程负责加载。
+      if (getProjectToken() === capturedToken) {
+        await useVolumeStore.getState().loadAll()
+      }
     },
   })
 

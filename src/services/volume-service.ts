@@ -292,10 +292,12 @@ export function checkRangeCoverage(
 // ===== 展示用 helper：收数组即可，失败模式是安全默认值 =====
 
 /**
- * 「有定稿」的判据。抽出来是因为侧栏卷卡片、分卷总览大卡两处都要用，
+ * 「有定稿」的判据。抽出来放在一处——侧栏卷卡片、分卷总览页大卡、目录生成、卷详情编辑器的
+ * 「已写 N 章」指示都吃这一份。**导出**而非模块内私有，是为 `VolumeOverview` 那张
+ * 一次遍历所有卷的优化用得上（见该文件 `useMemo` 注释）。
  * 各写一份迟早分叉（其中一份会漏掉 `finalized` 之外的状态判断）。
  */
-const hasFinalized = (drafts: Array<{ status: string }> | undefined): boolean =>
+export const hasFinalized = (drafts: Array<{ status: string }> | undefined): boolean =>
     !!drafts?.some(d => d.status === 'finalized')
 
 /**

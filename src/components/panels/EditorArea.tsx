@@ -210,7 +210,7 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
   const activeTabRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (activeTabRef.current && tabBarRef.current) {
-      activeTabRef.current.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' })
+      activeTabRef.current.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'auto' })
     }
   }, [activeTabId])
 
@@ -623,7 +623,7 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
 
 
       {/* 编辑区主体 */}
-      <div className="flex-1 overflow-hidden">
+      <div className="relative flex-1 overflow-hidden">
         {activeTab?.type === 'chapter' && activeTab.filePath?.startsWith('vela://draft/') && (
           // 草稿文件：使用 DraftEditor（工具栏含修稿/审稿/定稿按鈕）
           <DraftEditor
@@ -657,7 +657,10 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
           <CharacterEditor />
         )}
         {activeTab?.type === 'chapter-card' && (
-          <ChapterCardEditor />
+          <ChapterCardEditor
+            volumeNumber={activeTab.volumeNumber}
+            chapterScope={activeTab.chapterScope}
+          />
         )}
         {activeTab?.type === 'world-building' && (
           <WorldBuildingEditor />
@@ -675,9 +678,21 @@ export default function EditorArea({ onNewProject }: EditorAreaProps) {
         {activeTab?.type === 'volume-overview' && (
           <VolumeOverview />
         )}
-        {activeTab?.type === 'volume' && (
-          <VolumeEditor key={activeTab.id} volumeNumber={activeTab.volumeNumber} />
-        )}
+        {/* 卷详情首次打开时按需挂载；Tab 关闭前只切换可见性，避免切卷时重建整份表单。 */}
+        {tabs.filter(tab => tab.type === 'volume').map(tab => (
+          <div
+            key={tab.id}
+            className="absolute inset-0"
+            style={{
+              visibility: tab.id === activeTabId ? 'visible' : 'hidden',
+              pointerEvents: tab.id === activeTabId ? 'auto' : 'none',
+            }}
+            aria-hidden={tab.id !== activeTabId}
+            inert={tab.id !== activeTabId}
+          >
+            <VolumeEditor volumeNumber={tab.volumeNumber} />
+          </div>
+        ))}
         {activeTab?.type === 'review-report' && activeTab.content && (
           <ReviewReport
             key={activeTab.id}

@@ -85,6 +85,16 @@ export async function getBlueprintCount(): Promise<number> {
   }
 }
 
+/** 获取已有蓝图的章号，供侧栏按卷统计与未归卷判定 */
+export async function getBlueprintChapterNumbers(): Promise<number[]> {
+  try {
+    const blueprints = await ipc.invoke('db:blueprint-get-all')
+    return blueprints.map(bp => bp.chapterNumber).sort((a, b) => a - b)
+  } catch {
+    return []
+  }
+}
+
 /**
  * 获取具体架构块的内容
  */

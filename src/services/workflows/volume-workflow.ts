@@ -23,7 +23,7 @@
 import { useWorkflowStore, type WorkflowDefinition } from '../../stores/workflow-store'
 import { MAX_VOLUME_CHAPTERS } from '../../shared/volume-limits'
 import { useProjectStore } from '../../stores/project-store'
-import { getProjectToken } from '../../stores/volume-store'
+import { getProjectToken, useVolumeStore } from '../../stores/volume-store'
 import { ipc } from '../ipc-client'
 import { globalEventBus } from '../../shared/event-bus'
 import { getLastVolume } from '../volume-service'
@@ -381,6 +381,13 @@ export async function commitNextVolume(
             }
         }
 
+        // 提交发生在本渲染进程发起的 IPC 链路里，成功后直接刷新权威卷表。
+        // 这里不走 EventBus：它只会增加一层异步间接调用，也无法让主进程与
+        // 渲染进程共享同一个内存事件实例。切项目后则由新项目自己的打开流程加载。
+        if (getProjectToken() === capturedToken) {
+            await useVolumeStore.getState().loadAll()
+        }
+
         // 延迟的 llm_calls 统计在此 flush：取消预览则永不执行，落实「取消 = 零副作用」。
         // 带 capturedToken 防止统计写进已切换的另一个项目库。
         //
@@ -401,7 +408,6 @@ export async function commitNextVolume(
             }
         }
 
-        globalEventBus.emit('REFRESH_RESOURCE', { resources: ['volumes'] })
         return { success: true }
     } catch (err) {
         return { success: false, error: String(err) }

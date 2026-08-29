@@ -70,8 +70,17 @@ async function readChapterTitle(filePath: string, fallback: string, chapterNumbe
 
 // ===== 正文章节组件 =====
 
-export default function ManuscriptGroup({ files }: { files: FileNode[]; projectPath: string }) {
-  const [open, setOpen] = useState(true)
+export default function ManuscriptGroup({
+  files,
+  indent = 10,
+  defaultOpen = true,
+}: {
+  files: FileNode[]
+  projectPath: string
+  indent?: number
+  defaultOpen?: boolean
+}) {
+  const [open, setOpen] = useState(defaultOpen)
   // 文件路径 → 显示名称的映射（异步加载）
   const [titleMap, setTitleMap] = useState<Record<string, string>>({})
 
@@ -112,10 +121,12 @@ export default function ManuscriptGroup({ files }: { files: FileNode[]; projectP
 
   return (
     <div>
-      <div
-        className="tree-item gap-1.5 cursor-pointer select-none"
-        style={{ paddingLeft: 10 }}
+      <button
+        type="button"
+        className="tree-item gap-1.5 cursor-pointer select-none w-full text-left rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+        style={{ paddingLeft: indent }}
         onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
       >
         {open
           ? <ChevronDown size={12} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
@@ -128,11 +139,11 @@ export default function ManuscriptGroup({ files }: { files: FileNode[]; projectP
             {chapterFiles.length} 章
           </span>
         )}
-      </div>
+      </button>
       {open && (
         <div>
           {chapterFiles.length === 0 ? (
-            <div className="text-xs py-1" style={{ paddingLeft: 34, color: 'var(--color-text-muted)' }}>
+            <div className="text-xs py-1" style={{ paddingLeft: indent + 24, color: 'var(--color-text-muted)' }}>
               暂无定稿章节
             </div>
           ) : (
@@ -142,7 +153,7 @@ export default function ManuscriptGroup({ files }: { files: FileNode[]; projectP
                 <div
                   key={f.path}
                   className="tree-item gap-1.5 cursor-pointer"
-                  style={{ paddingLeft: 30 }}
+                  style={{ paddingLeft: indent + 20 }}
                   onClick={() => openChapterFile(f.path, displayName)}
                   onContextMenu={e => showSidebarMenu([
                     {

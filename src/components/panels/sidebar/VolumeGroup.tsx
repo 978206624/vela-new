@@ -5,14 +5,15 @@
  * - **加载中**：骨架条。不能拿「空数组」当零卷渲染——`volumes: []` 在
  *   `status !== 'ready'` 时只代表「还没读到」，那时显示「尚未分卷」是假消息。
  * - **零卷**：说明块（当前为单卷模式），不列任何卷。
- * - **有卷**：卷卡片列表（卷名 / 状态徽章 / 章号范围 / 已写 / 进度条）。
+ * - **有卷**：卷卡片列表（卷名 / 状态徽章 / 章号范围 / 已写 / 进度条），
+ *   展开后按卷显示章节蓝图、草稿箱和正文章节。
  *
  * 右上角 `+` 触发续卷向导；点击分组标题打开「分卷总览」页，
  * 点击卷卡片打开该卷的**详情 Tab**（`type:'volume'`，由 `EditorArea` 渲染
- * `VolumeEditor`）。本组件只负责路由，不关心详情页内部。
+ * `VolumeEditor`）；子菜单按章号范围过滤，范围外资产归入「未归卷章节」。
  */
-import { useEffect } from 'react'
-import { Plus, Layers } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Plus, Layers, ChevronRight, ChevronDown, LayoutList } from 'lucide-react'
 import { useVolumeStore } from '../../../stores/volume-store'
 import { useProjectStore } from '../../../stores/project-store'
 import { useDraftStore } from '../../../stores/draft-store'
@@ -21,6 +22,10 @@ import { VOLUME_STATUS_LABELS, countFinalizedInRange } from '../../../services/v
 import { startNextVolumeFlow, describeStartFlowResult } from '../../../services/volume-flow'
 import { openVolumeOverview, openVolumeDetail, volumeTabId } from '../../../services/volume-tabs'
 import { toast } from '../../ui/Toast'
+import DraftBoxGroup from './DraftBoxGroup'
+import ManuscriptGroup from './ManuscriptGroup'
+import type { DraftMeta } from '../../../stores/draft-store'
+import type { FileNode } from '../../../shared/ipc-channels'
 import type { VolumeData, VolumeStatus } from '../../../../electron/repositories/volume-repository'
 
 /** 状态徽章配色。与 Spec §4.11 的三态一一对应 */
@@ -30,7 +35,19 @@ const STATUS_COLOR: Record<VolumeStatus, string> = {
   done: 'var(--color-success)',
 }
 
-export default function VolumeGroup() {
+interface VolumeGroupProps {
+  blueprintChapterNumbers?: number[]
+  draftsByChapter?: Record<number, DraftMeta[]>
+  manuscriptFiles?: FileNode[]
+  projectPath?: string
+}
+
+export default function VolumeGroup({
+  blueprintChapterNumbers = [],
+  draftsByChapter = {},
+  manuscriptFiles = [],
+  projectPath: artifactProjectPath = '',
+}: VolumeGroupProps) {
   const volumes = useVolumeStore(s => s.volumes)
   const status = useVolumeStore(s => s.status)
   const loadAll = useVolumeStore(s => s.loadAll)
@@ -91,10 +108,71 @@ export default function VolumeGroup() {
           ? <LoadingBlock status={status} />
           : volumes.length === 0
             ? <ZeroVolumeBlock totalChapters={totalChapters} />
-            : volumes.map(v => <VolumeCard key={v.volumeNumber} volume={v} />)}
+            : (
+              <>
+                {volumes.map(v => (
+                  <VolumeCard
+                    key={v.volumeNumber}
+                    volume={v}
+                    blueprintChapterNumbers={blueprintChapterNumbers.filter(ch => isInVolume(ch, v))}
+                    draftsByChapter={filterDrafts(draftsByChapter, ch => isInVolume(ch, v))}
+                    manuscriptFiles={manuscriptFiles.filter(file => {
+                      const chapter = getManuscriptChapter(file)
+                      return chapter !== null && isInVolume(chapter, v)
+                    })}
+                    projectPath={artifactProjectPath}
+                  />
+                ))}
+                <UnassignedChapterGroup
+                  blueprintChapterNumbers={blueprintChapterNumbers.filter(ch => !volumes.some(v => isInVolume(ch, v)))}
+                  draftsByChapter={filterDrafts(draftsByChapter, ch => !volumes.some(v => isInVolume(ch, v)))}
+                  manuscriptFiles={manuscriptFiles.filter(file => {
+                    const chapter = getManuscriptChapter(file)
+                    return chapter !== null && !volumes.some(v => isInVolume(chapter, v))
+                  })}
+                  projectPath={artifactProjectPath}
+                />
+              </>
+            )}
       </div>
     </div>
   )
+}
+
+function isInVolume(chapterNumber: number, volume: VolumeData): boolean {
+  return chapterNumber >= volume.startChapter && chapterNumber <= volume.endChapter
+}
+
+function filterDrafts(
+  draftsByChapter: Record<number, DraftMeta[]>,
+  predicate: (chapterNumber: number) => boolean,
+): Record<number, DraftMeta[]> {
+  return Object.fromEntries(
+    Object.entries(draftsByChapter).filter(([chapter, drafts]) => drafts.length > 0 && predicate(Number(chapter))),
+  )
+}
+
+function getManuscriptChapter(file: FileNode): number | null {
+  const match = file.name.replace(/\.[^.]+$/, '').match(/^chapter_(\d+)$/)
+  return match ? Number(match[1]) : null
+}
+
+function openVolumeBlueprints(volume: VolumeData): void {
+  useEditorStore.getState().openFile({
+    id: 'chapter-card-editor',
+    name: `第${volume.volumeNumber}卷 · 章节蓝图`,
+    type: 'chapter-card',
+    volumeNumber: volume.volumeNumber,
+  })
+}
+
+function openUnassignedBlueprints(): void {
+  useEditorStore.getState().openFile({
+    id: 'chapter-card-editor',
+    name: '未归卷章节 · 蓝图',
+    type: 'chapter-card',
+    chapterScope: 'unassigned',
+  })
 }
 
 /** 加载中 / 失败。**不复用零卷态**——那会把「没读到」说成「没有卷」 */
@@ -128,7 +206,20 @@ function ZeroVolumeBlock({ totalChapters }: { totalChapters: number }) {
   )
 }
 
-function VolumeCard({ volume }: { volume: VolumeData }) {
+function VolumeCard({
+  volume,
+  blueprintChapterNumbers,
+  draftsByChapter,
+  manuscriptFiles,
+  projectPath,
+}: {
+  volume: VolumeData
+  blueprintChapterNumbers: number[]
+  draftsByChapter: Record<number, DraftMeta[]>
+  manuscriptFiles: FileNode[]
+  projectPath: string
+}) {
+  const [open, setOpen] = useState(false)
   // 已写章数 = 该卷区间内有定稿的章数。取自 draft-store（定稿优先），
   // 不额外发 IPC——侧栏是高频渲染区。统计口径与分卷总览页共用
   // `countFinalizedInRange`（它按**实际存在的章**遍历，不按区间循环，
@@ -145,49 +236,160 @@ function VolumeCard({ volume }: { volume: VolumeData }) {
 
   return (
     <div
-      role="button"
-      tabIndex={0}
-      className="rounded-md p-2.5 mb-1.5 cursor-pointer transition-colors"
+      className="rounded-md mb-1.5 transition-colors overflow-hidden"
       style={{
         border: `1px solid ${active ? 'var(--color-accent)' : 'var(--color-border)'}`,
         background: active ? 'var(--color-active)' : 'transparent',
       }}
-      onClick={() => openVolumeDetail(volume.volumeNumber, volume.title)}
-      onKeyDown={e => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          openVolumeDetail(volume.volumeNumber, volume.title)
-        }
-      }}
-      title="打开卷详情"
     >
-      <div className="flex items-center gap-2 mb-1.5">
-        <span className="text-sm flex-1 min-w-0 truncate" style={{ color: 'var(--color-text)' }} title={volume.title}>
-          第{volume.volumeNumber}卷 · {volume.title}
-        </span>
-        <span
-          className="text-[0.68rem] px-1.5 py-0.5 rounded flex-shrink-0"
-          style={{ background: 'var(--color-bg-elevated)', color: STATUS_COLOR[volume.status] }}
+      <div className="flex items-stretch">
+        <button
+          type="button"
+          className="flex-shrink-0 px-1.5 rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+          onClick={() => setOpen(v => !v)}
+          aria-expanded={open}
+          title={open ? '收起本卷章节菜单' : '展开本卷章节菜单'}
         >
-          {VOLUME_STATUS_LABELS[volume.status]}
-        </span>
+          {open
+            ? <ChevronDown size={12} style={{ color: 'var(--color-text-muted)' }} />
+            : <ChevronRight size={12} style={{ color: 'var(--color-text-muted)' }} />}
+        </button>
+        <button
+          type="button"
+          className="flex-1 min-w-0 text-left pr-2.5 py-2.5 rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+          onClick={() => openVolumeDetail(volume.volumeNumber, volume.title)}
+          title="打开卷详情"
+        >
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-sm flex-1 min-w-0 truncate" style={{ color: 'var(--color-text)' }} title={volume.title}>
+              第{volume.volumeNumber}卷 · {volume.title}
+            </span>
+            <span
+              className="text-[0.68rem] px-1.5 py-0.5 rounded flex-shrink-0"
+              style={{ background: 'var(--color-bg-elevated)', color: STATUS_COLOR[volume.status] }}
+            >
+              {VOLUME_STATUS_LABELS[volume.status]}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-xs flex-1 min-w-0 truncate" style={{ color: 'var(--color-text-muted)' }}>
+              第 {volume.startChapter}–{volume.endChapter} 章
+            </span>
+            <span className="text-xs flex-shrink-0 tabular-nums" style={{ color: 'var(--color-text-muted)' }}>
+              {writtenCount} / {total}
+            </span>
+          </div>
+
+          <div className="h-1 rounded-full overflow-hidden" style={{ background: 'var(--color-bg-elevated)' }}>
+            <div
+              className="h-full rounded-full transition-all"
+              style={{ width: `${pct}%`, background: STATUS_COLOR[volume.status] }}
+            />
+          </div>
+        </button>
       </div>
 
-      <div className="flex items-center gap-2 mb-1.5">
-        <span className="text-xs flex-1 min-w-0 truncate" style={{ color: 'var(--color-text-muted)' }}>
-          第 {volume.startChapter}–{volume.endChapter} 章
-        </span>
-        <span className="text-xs flex-shrink-0 tabular-nums" style={{ color: 'var(--color-text-muted)' }}>
-          {writtenCount} / {total}
-        </span>
-      </div>
+      {open && (
+        <div className="pb-1.5" style={{ borderTop: '1px solid var(--color-border)' }}>
+          <BlueprintMenuItem
+            count={blueprintChapterNumbers.length}
+            total={total}
+            onClick={() => openVolumeBlueprints(volume)}
+          />
+          <DraftBoxGroup draftsByChapter={draftsByChapter} indent={34} defaultOpen={false} />
+          <ManuscriptGroup files={manuscriptFiles} projectPath={projectPath} indent={34} defaultOpen={false} />
+        </div>
+      )}
+    </div>
+  )
+}
 
-      <div className="h-1 rounded-full overflow-hidden" style={{ background: 'var(--color-bg-elevated)' }}>
-        <div
-          className="h-full rounded-full transition-all"
-          style={{ width: `${pct}%`, background: STATUS_COLOR[volume.status] }}
-        />
-      </div>
+function BlueprintMenuItem({
+  count,
+  total,
+  onClick,
+  unassigned = false,
+}: {
+  count: number
+  total?: number
+  onClick: () => void
+  unassigned?: boolean
+}) {
+  const badgeColor = unassigned
+    ? 'var(--color-warning, #eab308)'
+    : total !== undefined && count >= total
+      ? 'var(--color-success)'
+      : count > 0
+        ? 'var(--color-warning, #eab308)'
+        : 'var(--color-text-muted)'
+
+  return (
+    <button
+      type="button"
+      className="tree-item gap-1.5 cursor-pointer select-none w-full text-left rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+      style={{ paddingLeft: 34 }}
+      onClick={onClick}
+      title={unassigned ? '打开未归卷章节蓝图' : '打开本卷章节蓝图'}
+    >
+      <span style={{ width: 12, flexShrink: 0 }} />
+      <LayoutList size={14} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+      <span className="text-sm font-medium flex-1 min-w-0 truncate" style={{ color: 'var(--color-text)' }}>
+        章节蓝图
+      </span>
+      <span className="text-[0.7rem] flex-shrink-0 ml-1" style={{ color: badgeColor }}>
+        {count > 0 ? (total === undefined ? `${count} 章` : `${count}/${total} 章`) : '待生成'}
+      </span>
+    </button>
+  )
+}
+
+function UnassignedChapterGroup({
+  blueprintChapterNumbers,
+  draftsByChapter,
+  manuscriptFiles,
+  projectPath,
+}: {
+  blueprintChapterNumbers: number[]
+  draftsByChapter: Record<number, DraftMeta[]>
+  manuscriptFiles: FileNode[]
+  projectPath: string
+}) {
+  const [open, setOpen] = useState(false)
+  const draftChapters = Object.keys(draftsByChapter).map(Number)
+  const manuscriptChapters = manuscriptFiles.map(getManuscriptChapter).filter((v): v is number => v !== null)
+  const chapterCount = new Set([...blueprintChapterNumbers, ...draftChapters, ...manuscriptChapters]).size
+
+  if (chapterCount === 0) return null
+
+  return (
+    <div className="rounded-md mb-1.5 overflow-hidden" style={{ border: '1px solid var(--color-warning, #eab308)' }}>
+      <button
+        type="button"
+        className="tree-item gap-1.5 cursor-pointer select-none w-full text-left rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]"
+        style={{ paddingLeft: 10 }}
+        onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
+        title="这些章节不在任何卷的章号范围内"
+      >
+        {open
+          ? <ChevronDown size={12} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+          : <ChevronRight size={12} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />}
+        <Layers size={14} style={{ color: 'var(--color-warning, #eab308)', flexShrink: 0 }} />
+        <span className="text-sm font-medium flex-1 min-w-0 truncate" style={{ color: 'var(--color-text)' }}>
+          未归卷章节
+        </span>
+        <span className="text-[0.7rem] flex-shrink-0" style={{ color: 'var(--color-warning, #eab308)' }}>
+          {chapterCount} 章
+        </span>
+      </button>
+      {open && (
+        <div className="pb-1.5" style={{ borderTop: '1px solid var(--color-border)' }}>
+          <BlueprintMenuItem count={blueprintChapterNumbers.length} onClick={openUnassignedBlueprints} unassigned />
+          <DraftBoxGroup draftsByChapter={draftsByChapter} indent={34} defaultOpen={false} />
+          <ManuscriptGroup files={manuscriptFiles} projectPath={projectPath} indent={34} defaultOpen={false} />
+        </div>
+      )}
     </div>
   )
 }

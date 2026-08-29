@@ -8,8 +8,8 @@
  * **只有 ready 才携带 volumes**，`[]` 此时才真正意味着单卷模式。
  * 这样「尚未加载」「加载失败」都无法伪装成零卷去触发全书大纲回落。
  *
- * 事件订阅不在本模块做：统一由 `project-service.ts` 的 `REFRESH_RESOURCE`
- * handler 驱动（该处有 disposers 生命周期与重复初始化保护）。
+ * 项目生命周期与通用资源刷新由 `project-service.ts` 驱动；明确的卷写入链路在成功后
+ * 直接调用 `loadAll()`，让调用方返回时界面已经拿到最新卷表。
  */
 import { create } from 'zustand'
 import { ipc } from '../services/ipc-client'
